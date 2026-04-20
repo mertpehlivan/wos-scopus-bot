@@ -323,10 +323,10 @@ $useNssm = $true
 if (Test-Path $nssmExe) {
     Write-Host "    NSSM zaten mevcut." -ForegroundColor Green
 } else {
-    # Once resmi nssm.cc, sonra GitHub mirror dene
     $nssmUrls = @(
         "https://nssm.cc/release/nssm-2.24.zip",
-        "https://github.com/nicholasgasior/nssm-mirror/releases/download/v2.24/nssm-2.24.zip"
+        "https://github.com/kirillkovalenko/nssm/releases/download/nssm-2.24/nssm-2.24.zip",
+        "https://github.com/lehungio/nssm/releases/download/2.24/nssm-2.24.zip"
     )
     $nssmOk = $false
     foreach ($url in $nssmUrls) {
@@ -334,7 +334,7 @@ if (Test-Path $nssmExe) {
             Write-Host "    NSSM deneniyor: $url"
             $nssmZip = Join-Path $env:TEMP "nssm.zip"
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $url -OutFile $nssmZip -UseBasicParsing -TimeoutSec 30
+            Invoke-WebRequest -Uri $url -OutFile $nssmZip -UseBasicParsing -TimeoutSec 45
             Expand-Archive -Path $nssmZip -DestinationPath $InstallDir -Force
             Remove-Item $nssmZip -Force -ErrorAction SilentlyContinue
             $extractedNssm = Get-ChildItem -Path $InstallDir -Directory |
@@ -344,13 +344,22 @@ if (Test-Path $nssmExe) {
                 if (Test-Path $NssmDir) { Remove-Item $NssmDir -Recurse -Force }
                 Rename-Item -Path $extractedNssm.FullName -NewName (Split-Path $NssmDir -Leaf) -Force
             }
-            if (Test-Path $nssmExe) { $nssmOk = $true; break }
+            # nssm-2.24 zip'i win64/ altinda degil, dogrudan nssm.exe icerebilir
+            if (-not (Test-Path $nssmExe)) {
+                $altExe = Get-ChildItem -Path $NssmDir -Filter "nssm.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($altExe) {
+                    $nssmWin64 = Join-Path $NssmDir "win64"
+                    New-Item -ItemType Directory -Path $nssmWin64 -Force | Out-Null
+                    Copy-Item -Path $altExe.FullName -Destination $nssmExe -Force
+                }
+            }
+            if (Test-Path $nssmExe) { $nssmOk = $true; Write-Host "    NSSM indirildi." -ForegroundColor Green; break }
         } catch {
             Write-Host "    Basarisiz: $_" -ForegroundColor Yellow
         }
     }
     if (-not $nssmOk) {
-        Write-Warning "NSSM indirilemedi. Windows sc.exe araci ile servis kurulacak."
+        Write-Warning "NSSM indirilemedi. New-Service ile servis kurulacak."
         $useNssm = $false
     }
 }
@@ -394,18 +403,23 @@ if ($useNssm -and (Test-Path $nssmExe)) {
     & $nssmExe set $ServiceName DependOnService $PgServiceName
     Write-Host "    NSSM ile servis olusturuldu." -ForegroundColor Green
 } else {
-    # sc.exe ile kur: nested quote sorununu onlemek icin wrapper .bat kullan
-    $batFile = Join-Path $ProjectDir "start-service.bat"
-    $batContent = "@echo off`r`n`"$javaExe`" -jar `"$($jarFile.FullName)`" >> `"$logDir\stdout.log`" 2>> `"$logDir\stderr.log`""
-    Set-Content -Path $batFile -Value $batContent -Encoding ASCII
-
-    # sc.exe binPath olarak cmd.exe + batch dosyasini kaydet
-    $binPath = "cmd.exe /c `"$batFile`""
-    cmd /c sc.exe create $ServiceName `"binPath= $binPath`" start= auto DisplayName= $ServiceName
-    cmd /c sc.exe description $ServiceName $ServiceDesc
-    cmd /c sc.exe config $ServiceName depend= $PgServiceName
-    Write-Host "    sc.exe + wrapper batch ile servis olusturuldu." -ForegroundColor Green
-    Write-Host "    Log dosyalari: $logDir\stdout.log / stderr.log" -ForegroundColor Green
+    # NSSM yok: PowerShell New-Service ile kur (quoting sorunsuz)
+    $svcBinPath = "`"$javaExe`" -jar `"$($jarFile.FullName)`""
+    try {
+        New-Service `
+            -Name        $ServiceName `
+            -BinaryPathName $svcBinPath `
+            -DisplayName $ServiceName `
+            -StartupType Automatic `
+            -Description $ServiceDesc `
+            -ErrorAction Stop | Out-Null
+        # PostgreSQL bagimliligi ekle
+        sc.exe config $ServiceName depend= $PgServiceName | Out-Null
+        Write-Host "    New-Service ile servis olusturuldu." -ForegroundColor Green
+    } catch {
+        Write-Error "Servis olusturulamadi: $_"
+        exit 1
+    }
 }
 
 # ============================================================
