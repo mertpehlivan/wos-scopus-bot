@@ -156,7 +156,9 @@ if ($pgSvc) {
     Remove-Item $PgInstaller -Force -ErrorAction SilentlyContinue
 
     if ($proc.ExitCode -ne 0) {
-        Write-Error "PostgreSQL kurulumu basarisiz oldu. Exit code: $($proc.ExitCode)"`n        Write-Host "    Hata detayi icin installer loguna bakin: $env:TEMP\postgresql-*.log" -ForegroundColor Red
+        Write-Host "    HATA: PostgreSQL kurulumu basarisiz oldu. Exit code: $($proc.ExitCode)" -ForegroundColor Red
+        Write-Host "    Log icin: Get-ChildItem `$env:TEMP -Filter 'postgresql-*.log' | Sort LastWriteTime | Select -Last 1 | Get-Content | Select -Last 50" -ForegroundColor Yellow
+        Write-Error "PostgreSQL kurulumu basarisiz oldu. Exit code: $($proc.ExitCode)"
         exit 1
     }
     Write-Host "    PostgreSQL $PgVersion kuruldu." -ForegroundColor Green
