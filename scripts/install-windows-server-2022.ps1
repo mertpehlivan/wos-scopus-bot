@@ -24,7 +24,7 @@ $ProjectDir    = Split-Path $PSScriptRoot -Parent   # scripts klasorunun ust diz
 
 # URL'ler
 $JdkUrl   = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.5%2B11/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.zip"
-$MavenUrl = "https://dlcdn.apache.org/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.zip"
+$MavenUrl = "https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.zip"
 $NssmUrl  = "https://nssm.cc/release/nssm-2.24.zip"
 
 # ---------- Yardimci Fonksiyonlar ----------
