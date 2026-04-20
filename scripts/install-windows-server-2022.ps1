@@ -141,22 +141,24 @@ if ($pgSvc) {
     Invoke-WebRequest -Uri $PgInstallerUrl -OutFile $PgInstaller -UseBasicParsing
 
     Write-Host "    PostgreSQL sessiz kurulum basliyor (birkaç dakika surebilir)..."
+    $pgLogFile = Join-Path $env:TEMP "pg16-install.log"
     $pgArgs = @(
         "--mode", "unattended",
         "--unattendedmodeui", "none",
         "--superpassword", $PgSuperPass,
         "--servicename", $PgServiceName,
-        "--servicepassword", $PgSuperPass,
         "--serverport", $PgPort,
         "--datadir", "$PgDefaultDir\data",
         "--prefix", $PgDefaultDir,
-        "--install_runtimes", "0"
+        "--install_runtimes", "1",
+        "--debuglevel", "2",
+        "--optionfile", ""
     )
-    $proc = Start-Process -FilePath $PgInstaller -ArgumentList $pgArgs -Wait -PassThru -NoNewWindow
+    $proc = Start-Process -FilePath $PgInstaller -ArgumentList $pgArgs -Wait -PassThru -WindowStyle Hidden
     Remove-Item $PgInstaller -Force -ErrorAction SilentlyContinue
 
     if ($proc.ExitCode -ne 0) {
-        Write-Error "PostgreSQL kurulumu basarisiz oldu. Exit code: $($proc.ExitCode)"
+        Write-Error "PostgreSQL kurulumu basarisiz oldu. Exit code: $($proc.ExitCode)"`n        Write-Host "    Hata detayi icin installer loguna bakin: $env:TEMP\postgresql-*.log" -ForegroundColor Red
         exit 1
     }
     Write-Host "    PostgreSQL $PgVersion kuruldu." -ForegroundColor Green
