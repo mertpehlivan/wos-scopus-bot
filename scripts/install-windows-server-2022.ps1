@@ -141,7 +141,6 @@ if ($pgSvc) {
     Invoke-WebRequest -Uri $PgInstallerUrl -OutFile $PgInstaller -UseBasicParsing
 
     Write-Host "    PostgreSQL sessiz kurulum basliyor (birkaç dakika surebilir)..."
-    $pgLogFile = Join-Path $env:TEMP "pg16-install.log"
     $pgArgs = @(
         "--mode", "unattended",
         "--unattendedmodeui", "none",
@@ -151,8 +150,7 @@ if ($pgSvc) {
         "--datadir", "$PgDefaultDir\data",
         "--prefix", $PgDefaultDir,
         "--install_runtimes", "1",
-        "--debuglevel", "2",
-        "--optionfile", ""
+        "--debuglevel", "2"
     )
     $proc = Start-Process -FilePath $PgInstaller -ArgumentList $pgArgs -Wait -PassThru -WindowStyle Hidden
     Remove-Item $PgInstaller -Force -ErrorAction SilentlyContinue
