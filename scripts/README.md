@@ -1,6 +1,6 @@
 # WoS/Scopus Bot — Windows Server 2022 Kurulum Rehberi
 
-Bu rehber, `wos-scopus-bot` (Article Task Broker) uygulamasının Windows Server 2022 ortamına adım adım kurulumunu ve Windows Servisi olarak yapılandırılmasını anlatır.
+Bu rehber, `wos-scopus-bot` (Article Task Broker) uygulamasının Windows Server 2022 ortamına **Docker olmadan**, tek bir script ile kurulumunu anlatır.
 
 ---
 
@@ -8,7 +8,7 @@ Bu rehber, `wos-scopus-bot` (Article Task Broker) uygulamasının Windows Server
 
 1. [Ön Hazırlık](#1-ön-hazırlık)
 2. [Hızlı Kurulum (Otomatik)](#2-hızlı-kurulum-otomatik)
-3. [Manuel Kurulum](#3-manuel-kurulum)
+3. [Temizleme / Sıfırdan Başlama](#3-temizleme--sıfırdan-başlama)
 4. [Yapılandırma](#4-yapılandırma)
 5. [Servis Yönetimi](#5-servis-yönetimi)
 6. [Güncelleme / Yeniden Build](#6-güncelleme--yeniden-build)
@@ -22,21 +22,14 @@ Bu rehber, `wos-scopus-bot` (Article Task Broker) uygulamasının Windows Server
 
 | Bileşen | Minimum Gereksinim |
 |---------|-------------------|
-| İşletim Sistemi | Windows Server 2022 (veya Windows 10/11) |
+| İşletim Sistemi | Windows Server 2022 |
 | PowerShell | 5.1 veya üzeri |
 | RAM | 4 GB |
-| Disk | 2 GB boş alan |
+| Disk | 5 GB boş alan |
 | Ağ | İnternet erişimi (ilk kurulum için) |
 | Yetki | **Yönetici (Administrator)** hakları |
 
-### Bağımlılıklar
-
-Bot çalışmadan önce aşağıdaki hizmetlerin ayakta olması gerekir:
-
-- **PostgreSQL** — `article_broker` veritabanı erişilebilir olmalı
-- **RDL-SIS Backend** — Bot, ana uygulama ile entegre çalışır (varsayılan API adresi: `http://localhost:8080`)
-
-> **Not:** PostgreSQL portunu `application.yml` içinde görebilirsiniz. Varsayılan değer: `5433`.
+> **Not:** PostgreSQL, JDK 21, Maven ve NSSM kurulum scripti tarafından otomatik olarak indirilip kurulur. Önceden hiçbir şey kurmanıza gerek yoktur.
 
 ---
 
@@ -45,308 +38,238 @@ Bot çalışmadan önce aşağıdaki hizmetlerin ayakta olması gerekir:
 PowerShell'i **Yönetici (Run as Administrator)** olarak açın ve şu komutları çalıştırın:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 cd wos-scopus-bot\scripts
 .\install-windows-server-2022.ps1
 ```
 
 ### Script ne yapar?
 
-| Adım | Açıklama | Hedef Dizin |
-|------|----------|-------------|
-| 1 | Eclipse Temurin **JDK 21** indirir ve kurar | `C:\Tools\jdk-21` |
-| 2 | **Apache Maven 3.9.9** indirir ve kurar | `C:\Tools\apache-maven-3.9.9` |
-| 3 | Ortam değişkenlerini (`JAVA_HOME`, `MAVEN_HOME`, `PATH`) tanımlar | Sistem ortam değişkenleri |
-| 4 | Projeyi **Maven** ile derler (`mvn clean package -DskipTests`) | `wos-scopus-bot\target` |
-| 5 | **NSSM** (Non-Sucking Service Manager) indirir ve kurar. İndirilemezse `sc.exe` ile devam eder. | `C:\Tools\nssm-2.24.4` |
-| 6 | `WosScopusBot` adında **Windows Servisi** oluşturur | Windows Services (services.msc) |
-| 7 | Servisi **Otomatik Başlangıç** olarak ayarlar ve çalıştırır | — |
+| Adım | Açıklama | Hedef |
+|------|----------|-------|
+| 1 | **PostgreSQL 16** indirir, sessiz kurar, `article_broker` veritabanını oluşturur | `C:\Program Files\PostgreSQL\16` |
+| 2 | Eclipse Temurin **JDK 21** indirir ve kurar | `C:\Tools\jdk-21` |
+| 3 | **Apache Maven 3.9.9** indirir ve kurar | `C:\Tools\apache-maven-3.9.9` |
+| 4 | `JAVA_HOME`, `MAVEN_HOME`, `PATH` ortam değişkenlerini tanımlar | Sistem ortam değişkenleri |
+| 5 | Projeyi **Maven** ile derler (`mvn clean package -DskipTests`) | `wos-scopus-bot\target` |
+| 6 | **NSSM** indirir ve kurar | `C:\Tools\nssm-2.24.4` |
+| 7 | `WosScopusBot` adında Windows Servisi oluşturur, PostgreSQL servisine bağımlı yapar | `services.msc` |
+| 8 | **Windows Firewall** kuralı ekler: TCP `8081` (API) ve TCP `5433` (PostgreSQL) | Windows Defender Firewall |
+| 9 | Servisi başlatır | — |
 
-Kurulum başarılı olursa aşağıdaki mesajı görürsünüz:
+### Başarılı kurulum çıktısı
 
 ```
 ========================================
   KURULUM TAMAMLANDI
 ========================================
- Servis Adi      : WosScopusBot
- Port            : 8081 (varsayilan)
+ Servis Adi          : WosScopusBot
+ Uygulama Portu      : 8081  (Firewall: acik)
+ PostgreSQL Portu    : 5433  (Firewall: acik)
+ PostgreSQL DB       : article_broker
+========================================
 ```
 
 ---
 
-## 3. Manuel Kurulum
+## 3. Temizleme / Sıfırdan Başlama
 
-Otomatik script kullanmak istemiyorsanız adım adım manuel kurulum yapabilirsiniz.
-
-### 3.1 Java 21 Kurulumu
-
-1. [Eclipse Temurin JDK 21](https://adoptium.net/temurin/releases/?version=21) indirin (`x64 Windows .zip`)
-2. `C:\Tools\jdk-21` dizinine çıkarın
-3. Ortam değişkenlerini ekleyin:
+Tüm bileşenleri kaldırıp kurulumu sıfırlamak için:
 
 ```powershell
-[Environment]::SetEnvironmentVariable("JAVA_HOME", "C:\Tools\jdk-21", "Machine")
-# PATH'e ekle: C:\Tools\jdk-21\bin
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+cd wos-scopus-bot\scripts
+.\uninstall-windows-server-2022.ps1
 ```
 
-Doğrulama:
-```powershell
-java -version
-# openjdk version "21.0.5" ...
-```
+> ⚠️ **Dikkat:** Bu script PostgreSQL veritabanını ve tüm verileri kalıcı olarak siler. Script çalışmadan önce **"evet"** yazarak onay ister.
 
-### 3.2 Maven Kurulumu
+### Uninstall script ne siler?
 
-1. [Apache Maven 3.9.9](https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.zip) indirin
-2. `C:\Tools\apache-maven-3.9.9` dizinine çıkarın
-3. Ortam değişkenlerini ekleyin:
+| Bileşen | Yapılan İşlem |
+|---------|--------------|
+| `WosScopusBot` servisi | Durdurulur ve kaldırılır |
+| PostgreSQL 16 | Uninstaller ile kaldırılır + veri dizini silinir |
+| JDK 21 | `C:\Tools\jdk-21` silinir |
+| Maven 3.9.9 | `C:\Tools\apache-maven-3.9.9` silinir |
+| NSSM | `C:\Tools\nssm-2.24.4` silinir |
+| Ortam değişkenleri | `JAVA_HOME`, `MAVEN_HOME`, PATH kayıtları temizlenir |
+| Firewall kuralları | TCP 8081 ve 5433 kuralları kaldırılır |
+| `target/` dizini | Build çıktıları silinir |
 
-```powershell
-[Environment]::SetEnvironmentVariable("MAVEN_HOME", "C:\Tools\apache-maven-3.9.9", "Machine")
-# PATH'e ekle: C:\Tools\apache-maven-3.9.9\bin
-```
-
-Doğrulama:
-```powershell
-mvn -version
-# Apache Maven 3.9.9 ...
-```
-
-### 3.3 Projeyi Derleme
+Temizleme sonrası kurulumu yeniden başlatmak için:
 
 ```powershell
-cd wos-scopus-bot
-mvn clean package -DskipTests
-```
-
-Başarılı derleme sonrası `target\article-task-broker-*.jar` dosyası oluşur.
-
-### 3.4 Windows Servisi Oluşturma
-
-**NSSM ile (önerilen):**
-
-1. [NSSM 2.24](https://nssm.cc/download) indirin ve `C:\Tools\nssm-2.24` içine çıkarın
-2. Servisi kurun:
-
-```powershell
-$nssm = "C:\Tools\nssm-2.24\win64\nssm.exe"
-$jar  = "C:\rdl-sis\wos-scopus-bot\target\article-task-broker-1.0.0-SNAPSHOT.jar"
-
-& $nssm install WosScopusBot "C:\Tools\jdk-21\bin\java.exe" "-jar `"$jar`""
-& $nssm set WosScopusBot DisplayName "WoS/Scopus Article Task Broker"
-& $nssm set WosScopusBot Description "Task Queue & Worker broker for WoS/Scopus article data"
-& $nssm set WosScopusBot Start SERVICE_AUTO_START
-& $nssm set WosScopusBot AppDirectory "C:\rdl-sis\wos-scopus-bot"
-& $nssm set WosScopusBot AppStdout "C:\rdl-sis\wos-scopus-bot\logs\stdout.log"
-& $nssm set WosScopusBot AppStderr "C:\rdl-sis\wos-scopus-bot\logs\stderr.log"
-
-Start-Service -Name WosScopusBot
-```
-
-**sc.exe ile (NSSM yoksa):**
-
-```powershell
-$jar = "C:\rdl-sis\wos-scopus-bot\target\article-task-broker-1.0.0-SNAPSHOT.jar"
-sc.exe create WosScopusBot binPath= "`"C:\Tools\jdk-21\bin\java.exe`" -jar `"$jar`"" start= auto DisplayName= "WosScopusBot"
-sc.exe description WosScopusBot "WoS/Scopus Article Task Broker"
+.\install-windows-server-2022.ps1
 ```
 
 ---
 
 ## 4. Yapılandırma
 
-Kurulum sonrası **mutlaka** aşağıdaki ayarları kontrol edin.
+Kurulum tamamlandıktan sonra aşağıdaki ayarları kontrol edin.
 
-### 4.1 Veritabanı Bağlantısı (`application.yml`)
+### 4.1 API Anahtarı (`BROKER_API_KEY`) — Zorunlu
+
+```powershell
+[Environment]::SetEnvironmentVariable("BROKER_API_KEY", "gizli-anahtar", "Machine")
+Restart-Service -Name WosScopusBot
+```
+
+### 4.2 Veritabanı Bağlantısı (`src\main\resources\application.yml`)
+
+Script varsayılan değerlerle veritabanını oluşturur. Üretim ortamında parolayı değiştirin:
 
 ```yaml
 spring:
   datasource:
     url: jdbc:postgresql://localhost:5433/article_broker
     username: postgres
-    password: PAROLANIZ
+    password: GUCLU_PAROLA_GIRINIZ   # varsayılan: password
 ```
 
-> **Önemli:** Varsayılan parola (`password`) üretim ortamında kesinlikle değiştirilmelidir.
-
-### 4.2 API Anahtarı (`BROKER_API_KEY`)
-
-Bot, ana RDL-SIS backend ile iletişim kurarken bu anahtarı kullanır. Sistem ortam değişkeni olarak tanımlayın:
-
-```powershell
-[Environment]::SetEnvironmentVariable("BROKER_API_KEY", "cok-gizli-anahtar-degeri", "Machine")
-```
-
-Değişikliğin geçerli olması için servisi yeniden başlatın:
-
-```powershell
-Restart-Service -Name WosScopusBot
-```
+> Parolayı değiştirirseniz PostgreSQL'deki kullanıcı parolasını da güncellemeniz gerekir:
+> ```sql
+> ALTER USER postgres WITH PASSWORD 'GUCLU_PAROLA_GIRINIZ';
+> ```
 
 ### 4.3 Port Değişikliği
 
-`8081` portu başka bir uygulama tarafından kullanılıyorsa `application.yml` içinde değiştirebilirsiniz:
+`8081` portu kullanımda ise:
 
 ```yaml
 server:
   port: 8082
 ```
 
+Değişiklikten sonra yeni port için de firewall kuralı ekleyin ve servisi yeniden başlatın.
+
 ---
 
 ## 5. Servis Yönetimi
 
-`manage-service.ps1` scripti ile servisi kolayca yönetebilirsiniz:
-
 ```powershell
 cd wos-scopus-bot\scripts
 
-# Servis durumunu gör
-.\manage-service.ps1 -Action status
-
-# Başlat
-.\manage-service.ps1 -Action start
-
-# Durdur
-.\manage-service.ps1 -Action stop
-
-# Yeniden başlat
-.\manage-service.ps1 -Action restart
-
-# Logları gör (son 50 satır)
-.\manage-service.ps1 -Action logs
-
-# Servisi tamamen kaldır
-.\manage-service.ps1 -Action remove
+.\manage-service.ps1 -Action status   # Durum
+.\manage-service.ps1 -Action start    # Başlat
+.\manage-service.ps1 -Action stop     # Durdur
+.\manage-service.ps1 -Action restart  # Yeniden başlat
+.\manage-service.ps1 -Action logs     # Son 50 satır log
+.\manage-service.ps1 -Action remove   # Kaldır
 ```
 
-Alternatif olarak Windows'un yerel komutlarını da kullanabilirsiniz:
+Veya doğrudan PowerShell ile:
 
 ```powershell
-# GUI üzerinden yönetmek için
-services.msc
-
-# Komut satırından
-Start-Service -Name WosScopusBot
-Stop-Service  -Name WosScopusBot
+Start-Service   -Name WosScopusBot
+Stop-Service    -Name WosScopusBot
 Restart-Service -Name WosScopusBot
+Get-Service     -Name WosScopusBot
 ```
 
 ### Log Konumları
 
 | Dosya | Açıklama |
 |-------|----------|
-| `wos-scopus-bot\logs\stdout.log` | Standart çıktı (INFO seviyesi loglar) |
-| `wos-scopus-bot\logs\stderr.log` | Hata ve WARN seviyesi loglar |
-
-> **Not:** `sc.exe` ile kurulum yapıldıysa log dosyaları otomatik oluşmayabilir. Bu durumda olay görüntüleyicisini (Event Viewer) kullanın.
+| `wos-scopus-bot\logs\stdout.log` | Uygulama çıktıları (INFO logları) |
+| `wos-scopus-bot\logs\stderr.log` | Hata ve WARN logları |
 
 ---
 
 ## 6. Güncelleme / Yeniden Build
 
-Kodda değişiklik yaptığınızda veya yeni sürüm aldığınızda:
-
 ```powershell
-cd wos-scopus-bot
-
 # 1. Servisi durdur
 Stop-Service -Name WosScopusBot
 
 # 2. Yeniden derle
+cd wos-scopus-bot
 C:\Tools\apache-maven-3.9.9\bin\mvn.cmd clean package -DskipTests
 
 # 3. Servisi başlat
 Start-Service -Name WosScopusBot
 ```
 
-**Tek satırda:**
-
-```powershell
-Stop-Service -Name WosScopusBot; C:\Tools\apache-maven-3.9.9\bin\mvn.cmd -f C:\Users\Administrator\wos-scopus-bot\pom.xml clean package -DskipTests; Start-Service -Name WosScopusBot
-```
-
-> **Not:** Servis her başlatıldığında `target` klasöründeki **en güncel JAR** dosyasını otomatik olarak bulur. Yeni build aldığınızda servis yapılandırmasını değiştirmenize gerek yoktur.
-
 ---
 
 ## 7. Sorun Giderme
 
-### 7.1 Kurulum Scripti Çalışmıyor
+### 7.1 Kurulum Scripti Hatası
 
-| Hata Mesajı | Çözüm |
-|-------------|-------|
-| `Bu script Yonetici olarak calistirilmalidir` | PowerShell'i **Sağ Tık → Run as administrator** ile açın |
-| `Maven build basarisiz oldu` | İnternet bağlantısını kontrol edin; Maven bağımlılıkları ilk seferde indirir |
-| `JAR dosyasi bulunamadi` | `mvn clean package` komutunun hatasız tamamlandığından emin olun |
+| Hata | Çözüm |
+|------|-------|
+| `Bu script Yonetici olarak calistirilmalidir` | PowerShell → **Sağ Tık → Run as Administrator** |
+| `PostgreSQL kurulumu basarisiz oldu` | Disk alanı yeterliliğini ve internet bağlantısını kontrol edin |
+| `Maven build basarisiz oldu` | Maven loguna bakın; bağımlılık indirme sorunu olabilir |
+| `JAR dosyasi bulunamadi` | `mvn clean package` komutunun hatasız tamamlandığını doğrulayın |
 
 ### 7.2 Servis Başlamıyor
 
 ```powershell
-# Logları kontrol edin
 .\manage-service.ps1 -Action logs
 ```
 
 Olası nedenler:
 
-1. **PostgreSQL erişilemiyor** — `application.yml` içindeki DB URL/port/kullanıcı adı/parola yanlış olabilir
-2. **Port çakışması** — `8081` portu başka bir uygulama tarafından kullanılıyor olabilir. `application.yml` içinde `server.port` değiştirin.
-3. **JAVA_HOME eksik** — Yeni bir PowerShell penceresi açarak ortam değişkenlerinin yüklenmesini sağlayın.
-4. **BROKER_API_KEY tanımlı değil** — Uygulama çalışabilir ancak bazı API çağrıları başarısız olabilir.
+1. **PostgreSQL hazır değil** — `Get-Service postgresql-x64-16` komutu ile servis durumunu kontrol edin
+2. **Port çakışması** — `netstat -ano | findstr :8081` ile 8081 portunu kontrol edin
+3. **BROKER_API_KEY tanımlı değil** — Bölüm 4.1'e bakın
+4. **JAVA_HOME eksik** — Yeni bir Yönetici PowerShell penceresi açın
 
-### 7.3 Java / Maven Komutu Bulunamıyor
+### 7.3 Ortam Değişkenleri Tanınmıyor
 
-Yeni bir **Yönetici PowerShell** penceresi açın. Mevcut pencerede PATH değişkenleri yenilenmemiş olabilir.
-
-Doğrulama:
 ```powershell
+# Doğrulama
 $env:JAVA_HOME
 $env:MAVEN_HOME
 java -version
 mvn -version
 ```
 
-### 7.4 Servisi Tamamen Elle Kaldırma
+Tanınmıyorsa yeni bir Yönetici PowerShell penceresi açın (PATH değişikliği mevcut oturuma yansımayabilir).
 
-Eğer `manage-service.ps1 -Action remove` çalışmazsa:
+### 7.4 PostgreSQL'e Bağlanılamıyor
 
 ```powershell
-# 1. Servisi durdur
-Stop-Service -Name WosScopusBot -Force -ErrorAction SilentlyContinue
+# Servis durumu
+Get-Service postgresql-x64-16
 
-# 2. sc.exe ile kaldır
-sc.exe delete WosScopusBot
+# Bağlantı testi
+& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -p 5433 -c "\l"
 ```
 
 ---
 
-## 📁 Dosya Yapısı Özeti
+## 📁 Dosya ve Dizin Yapısı
 
 ```
-C:\Tools
-├── jdk-21\                       # Java 21 (Eclipse Temurin)
-├── apache-maven-3.9.9\            # Maven build aracı
-└── nssm-2.24.4\                   # NSSM (Windows Servis yoneticisi) — istege bagli
-    └── win64\nssm.exe
+C:\Program Files\PostgreSQL\16\     # PostgreSQL 16 (native)
+C:\Tools\
+├── jdk-21\                         # Java 21 (Eclipse Temurin)
+├── apache-maven-3.9.9\             # Maven build aracı
+└── nssm-2.24.4\win64\nssm.exe      # Windows Servis yöneticisi
 
-C:\...\wos-scopus-bot\            # Proje kök dizini
+wos-scopus-bot\
 ├── scripts\
-│   ├── install-windows-server-2022.ps1
-│   ├── manage-service.ps1
-│   └── README.md                  # Bu dosya
-├── src\                          # Kaynak kodlar
-├── target\                        # Build çıktıları (JAR)
-├── logs\                          # Servis logları
-└── application.yml                # Ana yapılandırma dosyası
+│   ├── install-windows-server-2022.ps1    # Tam kurulum (bu script)
+│   ├── uninstall-windows-server-2022.ps1  # Tam temizleme / sıfırlama
+│   ├── manage-service.ps1                 # Servis yönetimi
+│   └── README.md                          # Bu dosya
+├── src\                             # Kaynak kodlar
+├── target\                          # Build çıktıları (JAR)
+├── logs\                            # Servis logları
+└── src\main\resources\application.yml  # Ana yapılandırma
 ```
 
 ---
 
 ## 🔗 Faydalı Bağlantılar
 
-- [Eclipse Temurin İndir](https://adoptium.net/temurin/releases/?version=21)
-- [Apache Maven İndir](https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.zip)
-- [NSSM İndir](https://nssm.cc/download)
-- [Spring Boot Servis Oluşturma](https://docs.spring.io/spring-boot/docs/current/reference/html/deployment.html#deployment.installing.windows-services)
+- [Eclipse Temurin JDK 21](https://adoptium.net/temurin/releases/?version=21)
+- [Apache Maven 3.9.9](https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/)
+- [PostgreSQL Windows İndirme](https://www.enterprisedb.com/downloads/postgres-postgresql-downloads)
+- [NSSM](https://nssm.cc/download)
 
 ---
 
