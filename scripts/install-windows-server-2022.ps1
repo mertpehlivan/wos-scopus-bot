@@ -42,7 +42,7 @@ $PgDataDir      = "$PgDefaultDir\data"
 # Diger URL'ler
 $JdkUrl   = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.5%2B11/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.zip"
 $MavenUrl = "https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.zip"
-$NssmUrl  = "https://github.com/puppetlabs/nssm/releases/download/2.24.4/nssm-2.24.4.zip"
+$NssmUrl  = "https://nssm.cc/release/nssm-2.24.zip"
 
 # ============================================================
 # YARDIMCI FONKSIYONLAR
@@ -323,17 +323,34 @@ $useNssm = $true
 if (Test-Path $nssmExe) {
     Write-Host "    NSSM zaten mevcut." -ForegroundColor Green
 } else {
-    try {
-        Invoke-DownloadAndExtract -Url $NssmUrl -DestDir $NssmDir -Label "nssm"
-        $extractedNssm = Get-ChildItem -Path $InstallDir -Directory |
-                         Where-Object { $_.Name -like "nssm-*" -and $_.FullName -ne $NssmDir } |
-                         Select-Object -First 1
-        if ($extractedNssm) {
-            Rename-Item -Path $extractedNssm.FullName -NewName (Split-Path $NssmDir -Leaf) -Force
+    # Once resmi nssm.cc, sonra GitHub mirror dene
+    $nssmUrls = @(
+        "https://nssm.cc/release/nssm-2.24.zip",
+        "https://github.com/nicholasgasior/nssm-mirror/releases/download/v2.24/nssm-2.24.zip"
+    )
+    $nssmOk = $false
+    foreach ($url in $nssmUrls) {
+        try {
+            Write-Host "    NSSM deneniyor: $url"
+            $nssmZip = Join-Path $env:TEMP "nssm.zip"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $url -OutFile $nssmZip -UseBasicParsing -TimeoutSec 30
+            Expand-Archive -Path $nssmZip -DestinationPath $InstallDir -Force
+            Remove-Item $nssmZip -Force -ErrorAction SilentlyContinue
+            $extractedNssm = Get-ChildItem -Path $InstallDir -Directory |
+                             Where-Object { $_.Name -like "nssm*" -and $_.FullName -ne $NssmDir } |
+                             Select-Object -First 1
+            if ($extractedNssm) {
+                if (Test-Path $NssmDir) { Remove-Item $NssmDir -Recurse -Force }
+                Rename-Item -Path $extractedNssm.FullName -NewName (Split-Path $NssmDir -Leaf) -Force
+            }
+            if (Test-Path $nssmExe) { $nssmOk = $true; break }
+        } catch {
+            Write-Host "    Basarisiz: $_" -ForegroundColor Yellow
         }
-    } catch {
-        Write-Warning "NSSM indirilemedi: $_"
-        Write-Warning "Windows'un yerel sc.exe araci ile servis kurulacak."
+    }
+    if (-not $nssmOk) {
+        Write-Warning "NSSM indirilemedi. Windows sc.exe araci ile servis kurulacak."
         $useNssm = $false
     }
 }
@@ -372,20 +389,23 @@ if ($useNssm -and (Test-Path $nssmExe)) {
     & $nssmExe set $ServiceName AppStderr      "$logDir\stderr.log"
     & $nssmExe set $ServiceName AppRotateFiles  1
     & $nssmExe set $ServiceName AppRotateOnline 0
-    & $nssmExe set $ServiceName AppRotateBytes  10485760   # 10 MB
+    & $nssmExe set $ServiceName AppRotateBytes  10485760
     & $nssmExe set $ServiceName AppDirectory   $ProjectDir
-    # PostgreSQL servisi hazir olmadan baslamasin
     & $nssmExe set $ServiceName DependOnService $PgServiceName
     Write-Host "    NSSM ile servis olusturuldu." -ForegroundColor Green
 } else {
-    $binPath = "`"$javaExe`" -jar `"$($jarFile.FullName)`""
-    $scArgs  = "create $ServiceName binPath= `"$binPath`" start= auto DisplayName= `"$ServiceName`""
-    cmd /c "sc.exe $scArgs"
-    cmd /c "sc.exe description $ServiceName `"$ServiceDesc`""
-    # Bagimliligi ekle
-    cmd /c "sc.exe config $ServiceName depend= $PgServiceName"
-    Write-Host "    sc.exe ile servis olusturuldu." -ForegroundColor Green
-    Write-Warning "Log rotasyonu ve calisma dizini ayarlari sc.exe ile sinirlidir."
+    # sc.exe ile kur: nested quote sorununu onlemek icin wrapper .bat kullan
+    $batFile = Join-Path $ProjectDir "start-service.bat"
+    $batContent = "@echo off`r`n`"$javaExe`" -jar `"$($jarFile.FullName)`" >> `"$logDir\stdout.log`" 2>> `"$logDir\stderr.log`""
+    Set-Content -Path $batFile -Value $batContent -Encoding ASCII
+
+    # sc.exe binPath olarak cmd.exe + batch dosyasini kaydet
+    $binPath = "cmd.exe /c `"$batFile`""
+    cmd /c sc.exe create $ServiceName `"binPath= $binPath`" start= auto DisplayName= $ServiceName
+    cmd /c sc.exe description $ServiceName $ServiceDesc
+    cmd /c sc.exe config $ServiceName depend= $PgServiceName
+    Write-Host "    sc.exe + wrapper batch ile servis olusturuldu." -ForegroundColor Green
+    Write-Host "    Log dosyalari: $logDir\stdout.log / stderr.log" -ForegroundColor Green
 }
 
 # ============================================================
