@@ -17,7 +17,7 @@ $ErrorActionPreference = "Stop"
 $InstallDir    = "C:\Tools"
 $JdkDir        = Join-Path $InstallDir "jdk-21"
 $MavenDir      = Join-Path $InstallDir "apache-maven-3.9.9"
-$NssmDir       = Join-Path $InstallDir "nssm-2.24"
+$NssmDir       = Join-Path $InstallDir "nssm-2.24.4"
 $ServiceName   = "WosScopusBot"
 $ServiceDesc   = "WoS/Scopus Article Task Broker"
 $ProjectDir    = Split-Path $PSScriptRoot -Parent   # scripts klasorunun ust dizini
@@ -25,7 +25,7 @@ $ProjectDir    = Split-Path $PSScriptRoot -Parent   # scripts klasorunun ust diz
 # URL'ler
 $JdkUrl   = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.5%2B11/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.zip"
 $MavenUrl = "https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.zip"
-$NssmUrl  = "https://github.com/kirillkovalenko/nssm/releases/download/2.24/nssm-2.24.zip"
+$NssmUrl  = "https://github.com/puppetlabs/nssm/releases/download/2.24.4/nssm-2.24.4.zip"
 
 # ---------- Yardimci Fonksiyonlar ----------
 function Write-Step {
