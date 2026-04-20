@@ -82,7 +82,7 @@ if ($svc) {
 # ============================================================
 # 2. POSTGRESQL 16 KALDIRMA
 # ============================================================
-Write-Step "PostgreSQL $PgVersion kaldiriliyor..."
+Write-Step "PostgreSQL $PgVersion kaldiriliyor (binary zip yontemi)..."
 
 $pgSvc = Get-Service -Name $PgServiceName -ErrorAction SilentlyContinue
 if ($pgSvc) {
@@ -90,34 +90,28 @@ if ($pgSvc) {
     Start-Sleep -Seconds 3
 }
 
-# Uninstaller'i bul ve calistir
-$pgUninstaller = Get-ChildItem -Path "C:\Program Files\PostgreSQL\$PgVersion" -Filter "uninstall-postgresql.exe" -ErrorAction SilentlyContinue |
-                 Select-Object -First 1
-if (-not $pgUninstaller) {
-    # Alternatif yol
-    $pgUninstaller = Get-ChildItem -Path "${env:ProgramFiles}\PostgreSQL\$PgVersion" -Filter "uninstall-postgresql.exe" -ErrorAction SilentlyContinue |
-                     Select-Object -First 1
+# pg_ctl ile servisi kayit defterinden kaldir (binary zip ile kurulduysa)
+$pgCtl = "C:\Program Files\PostgreSQL\$PgVersion\bin\pg_ctl.exe"
+if (Test-Path $pgCtl) {
+    & $pgCtl unregister -N $PgServiceName 2>$null
+    Start-Sleep -Seconds 2
+    Write-OK "pg_ctl unregister tamamlandi."
 }
 
-if ($pgUninstaller) {
-    Write-Host "    PostgreSQL uninstaller calistiriliyor (sessiz)..."
-    Start-Process -FilePath $pgUninstaller.FullName -ArgumentList "--mode","unattended" -Wait -NoNewWindow
-    Write-OK "PostgreSQL $PgVersion kaldirildi."
-} else {
-    Write-Skip "PostgreSQL uninstaller bulunamadi; klasor elle siliniyor..."
-}
-
-# Veriler dahil klasoru kaldir
-if (Test-Path $PgDefaultDir) {
-    Remove-Item -Path $PgDefaultDir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-OK "PostgreSQL dizini silindi: $PgDefaultDir"
-}
-
-# Servis hala varsa kayit defterinden sil
+# Hala varsa sc.exe ile zorla sil
 $pgSvc2 = Get-Service -Name $PgServiceName -ErrorAction SilentlyContinue
 if ($pgSvc2) {
     cmd /c "sc.exe delete $PgServiceName" | Out-Null
-    Write-OK "PostgreSQL servisi kayit defterinden kaldirildi."
+    Start-Sleep -Seconds 2
+    Write-OK "sc.exe ile servis kaydi silindi."
+}
+
+# Tum PostgreSQL dizinini sil (veri dahil)
+if (Test-Path $PgDefaultDir) {
+    Remove-Item -Path $PgDefaultDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-OK "PostgreSQL dizini silindi: $PgDefaultDir"
+} else {
+    Write-Skip "PostgreSQL dizini bulunamadi: $PgDefaultDir"
 }
 
 # ============================================================

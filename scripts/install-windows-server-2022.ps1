@@ -34,10 +34,10 @@ $PgServiceName = "postgresql-x64-$PgVersion"
 $PgSuperPass   = "password"
 $PgDbName      = "article_broker"
 $PgUser        = "postgres"
-$PgInstallerUrl = "https://get.enterprisedb.com/postgresql/postgresql-16.6-1-windows-x64.exe"
-$PgInstaller    = Join-Path $env:TEMP "pg16-installer.exe"
+$PgBinZipUrl    = "https://get.enterprisedb.com/postgresql/postgresql-16.6-1-windows-x64-binaries.zip"
 $PgDefaultDir   = "C:\Program Files\PostgreSQL\$PgVersion"
 $PgBinDir       = "$PgDefaultDir\bin"
+$PgDataDir      = "$PgDefaultDir\data"
 
 # Diger URL'ler
 $JdkUrl   = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.5%2B11/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.zip"
@@ -130,41 +130,80 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 # ============================================================
 # POSTGRESQL 16 (NATIVE)
 # ============================================================
-Write-Step "PostgreSQL $PgVersion kontrol ediliyor / kuruluyor..."
+Write-Step "PostgreSQL $PgVersion kontrol ediliyor / kuruluyor (binary zip yontemi)..."
 
 $pgSvc = Get-Service -Name $PgServiceName -ErrorAction SilentlyContinue
 if ($pgSvc) {
     Write-Host "    PostgreSQL $PgVersion servisi zaten kurulu ($PgServiceName)." -ForegroundColor Green
 } else {
-    Write-Host "    PostgreSQL $PgVersion indiriliyor: $PgInstallerUrl ..."
+    # 1) Binary zip indir
+    $pgZip = Join-Path $env:TEMP "pg16-binaries.zip"
+    Write-Host "    Binary zip indiriliyor (~130 MB) ..."
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $PgInstallerUrl -OutFile $PgInstaller -UseBasicParsing
+    Invoke-WebRequest -Uri $PgBinZipUrl -OutFile $pgZip -UseBasicParsing
 
-    Write-Host "    PostgreSQL sessiz kurulum basliyor (birkaç dakika surebilir)..."
-    $pgArgs = @(
-        "--mode", "unattended",
-        "--unattendedmodeui", "none",
-        "--superpassword", $PgSuperPass,
-        "--servicename", $PgServiceName,
-        "--serverport", $PgPort,
-        "--datadir", "$PgDefaultDir\data",
-        "--prefix", $PgDefaultDir,
-        "--install_runtimes", "1",
-        "--debuglevel", "2"
-    )
-    $proc = Start-Process -FilePath $PgInstaller -ArgumentList $pgArgs -Wait -PassThru -WindowStyle Hidden
-    Remove-Item $PgInstaller -Force -ErrorAction SilentlyContinue
+    # 2) Zip'i gecici dizine ac (pgsql/ alt klasoru olusur)
+    Write-Host "    Arsiv aciliyor..."
+    $pgExtractTemp = Join-Path $env:TEMP "pg16-extract"
+    if (Test-Path $pgExtractTemp) { Remove-Item $pgExtractTemp -Recurse -Force }
+    Expand-Archive -Path $pgZip -DestinationPath $pgExtractTemp -Force
+    Remove-Item $pgZip -Force
 
-    if ($proc.ExitCode -ne 0) {
-        Write-Host "    HATA: PostgreSQL kurulumu basarisiz oldu. Exit code: $($proc.ExitCode)" -ForegroundColor Red
-        Write-Host "    Log icin: Get-ChildItem `$env:TEMP -Filter 'postgresql-*.log' | Sort LastWriteTime | Select -Last 1 | Get-Content | Select -Last 50" -ForegroundColor Yellow
-        Write-Error "PostgreSQL kurulumu basarisiz oldu. Exit code: $($proc.ExitCode)"
+    # 3) pgsql/ klasorunu hedef dizine tasi
+    $pgSrcDir = Join-Path $pgExtractTemp "pgsql"
+    $pgParent = "C:\Program Files\PostgreSQL"
+    New-Item -ItemType Directory -Path $pgParent -Force | Out-Null
+    if (Test-Path $PgDefaultDir) { Remove-Item $PgDefaultDir -Recurse -Force }
+    Move-Item -Path $pgSrcDir -Destination $PgDefaultDir -Force
+    Remove-Item $pgExtractTemp -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "    Binary dosyalar hazir: $PgDefaultDir" -ForegroundColor Green
+
+    # 4) PATH'e ekle (initdb icin gerekli)
+    Add-ToMachinePath -NewPath $PgBinDir
+    $env:Path = "$env:Path;$PgBinDir"
+
+    # 5) Veri dizinini olustur ve initdb calistir
+    New-Item -ItemType Directory -Path $PgDataDir -Force | Out-Null
+    $pwFile = Join-Path $env:TEMP "pgpw.tmp"
+    Set-Content -Path $pwFile -Value $PgSuperPass -Encoding ASCII
+    Write-Host "    initdb calistiriliyor (veritabani kumu olusturuluyor)..."
+    & "$PgBinDir\initdb.exe" `
+        --pgdata="$PgDataDir" `
+        --username=$PgUser `
+        --pwfile="$pwFile" `
+        --encoding=UTF8 `
+        --locale=C
+    Remove-Item $pwFile -Force -ErrorAction SilentlyContinue
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "initdb basarisiz oldu."
         exit 1
     }
-    Write-Host "    PostgreSQL $PgVersion kuruldu." -ForegroundColor Green
+
+    # 6) postgresql.conf icinde portu guncelle
+    $pgConf = "$PgDataDir\postgresql.conf"
+    (Get-Content $pgConf) `
+        -replace "^#?port\s*=\s*\d+", "port = $PgPort" `
+        | Set-Content $pgConf
+    Write-Host "    PostgreSQL portu $PgPort olarak ayarlandi." -ForegroundColor Green
+
+    # 7) pg_hba.conf: md5 yerine scram-sha-256, yerel erisim
+    # (varsayilan ayarlar yeterli, islem yapma)
+
+    # 8) Windows servisi olarak kaydet
+    Write-Host "    Windows servisi kaydediliyor: $PgServiceName ..."
+    & "$PgBinDir\pg_ctl.exe" register `
+        -N $PgServiceName `
+        -D "$PgDataDir" `
+        -S auto `
+        -w
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "pg_ctl register basarisiz oldu."
+        exit 1
+    }
+    Write-Host "    PostgreSQL $PgVersion kuruldu ve servis olarak kaydedildi." -ForegroundColor Green
 }
 
-# PgBin PATH'e ekle
+# PgBin PATH'e ekle (zaten kurulu durumda PATH'e eklenmemis olabilir)
 Add-ToMachinePath -NewPath $PgBinDir
 $env:Path = "$env:Path;$PgBinDir"
 
@@ -173,7 +212,7 @@ $pgSvcNow = Get-Service -Name $PgServiceName -ErrorAction SilentlyContinue
 if ($pgSvcNow -and $pgSvcNow.Status -ne "Running") {
     Write-Host "    PostgreSQL servisi baslatiliyor..."
     Start-Service -Name $PgServiceName
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 5
 }
 
 # Veritabani olustur (yoksa)
