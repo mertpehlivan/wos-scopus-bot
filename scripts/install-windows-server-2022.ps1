@@ -149,14 +149,21 @@ Write-Host "    Build basarili: $($jarFile.FullName)" -ForegroundColor Green
 # ---------- NSSM (Non-Sucking Service Manager) ----------
 Write-Step "NSSM (Servis Yoneticisi) kontrol ediliyor / kuruluyor..."
 $nssmExe = Join-Path $NssmDir "win64\nssm.exe"
+$useNssm = $true
+
 if (Test-Path $nssmExe) {
     Write-Host "    NSSM zaten mevcut." -ForegroundColor Green
 } else {
-    Invoke-DownloadAndExtract -Url $NssmUrl -DestDir $NssmDir -Label "nssm"
-    # NSSM icindeki alt klasor ismini duzelt
-    $extractedNssm = Get-ChildItem -Path $InstallDir -Directory | Where-Object { $_.Name -like "nssm-*" } | Select-Object -First 1
-    if ($extractedNssm -and ($extractedNssm.FullName -ne $NssmDir)) {
-        Rename-Item -Path $extractedNssm.FullName -NewName $NssmDir -Force
+    try {
+        Invoke-DownloadAndExtract -Url $NssmUrl -DestDir $NssmDir -Label "nssm"
+        $extractedNssm = Get-ChildItem -Path $InstallDir -Directory | Where-Object { $_.Name -like "nssm-*" } | Select-Object -First 1
+        if ($extractedNssm -and ($extractedNssm.FullName -ne $NssmDir)) {
+            Rename-Item -Path $extractedNssm.FullName -NewName $NssmDir -Force
+        }
+    } catch {
+        Write-Warning "NSSM indirilemedi: $_"
+        Write-Warning "Windows'un yerel sc.exe araci ile servis kurulacak."
+        $useNssm = $false
     }
 }
 
@@ -166,7 +173,9 @@ $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "    Eski servis kaldiriliyor..." -ForegroundColor Yellow
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-    & $nssmExe remove $ServiceName confirm 2>$null
+    if ($useNssm -and (Test-Path $nssmExe)) {
+        & $nssmExe remove $ServiceName confirm 2>$null
+    }
     sc.exe delete $ServiceName 2>$null | Out-Null
     Start-Sleep -Seconds 2
 }
@@ -177,20 +186,25 @@ $javaExe = Join-Path $JdkDir "bin\java.exe"
 $logDir  = Join-Path $ProjectDir "logs"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
-& $nssmExe install $ServiceName $javaExe "-jar `"$($jarFile.FullName)`""
-& $nssmExe set $ServiceName Description $ServiceDesc
-& $nssmExe set $ServiceName DisplayName $ServiceName
-& $nssmExe set $ServiceName Start SERVICE_AUTO_START
-& $nssmExe set $ServiceName AppStdout "$logDir\stdout.log"
-& $nssmExe set $ServiceName AppStderr "$logDir\stderr.log"
-& $nssmExe set $ServiceName AppRotateFiles 1
-& $nssmExe set $ServiceName AppRotateOnline 0
-& $nssmExe set $ServiceName AppRotateBytes 10485760   # 10 MB
-
-# Calisma dizinini proje dizini yap
-& $nssmExe set $ServiceName AppDirectory $ProjectDir
-
-Write-Host "    Servis olusturuldu." -ForegroundColor Green
+if ($useNssm -and (Test-Path $nssmExe)) {
+    & $nssmExe install $ServiceName $javaExe "-jar `"$($jarFile.FullName)`""
+    & $nssmExe set $ServiceName Description $ServiceDesc
+    & $nssmExe set $ServiceName DisplayName $ServiceName
+    & $nssmExe set $ServiceName Start SERVICE_AUTO_START
+    & $nssmExe set $ServiceName AppStdout "$logDir\stdout.log"
+    & $nssmExe set $ServiceName AppStderr "$logDir\stderr.log"
+    & $nssmExe set $ServiceName AppRotateFiles 1
+    & $nssmExe set $ServiceName AppRotateOnline 0
+    & $nssmExe set $ServiceName AppRotateBytes 10485760   # 10 MB
+    & $nssmExe set $ServiceName AppDirectory $ProjectDir
+    Write-Host "    NSSM ile servis olusturuldu." -ForegroundColor Green
+} else {
+    $binPath = "`"$javaExe`" -jar `"$($jarFile.FullName)`""
+    sc.exe create $ServiceName binPath= $binPath start= auto DisplayName= "$ServiceName"
+    sc.exe description $ServiceName "$ServiceDesc"
+    Write-Host "    sc.exe ile servis olusturuldu." -ForegroundColor Green
+    Write-Warning "Log rotasyonu ve calisma dizini ayarlari sc.exe ile sinirlidir."
+}
 
 # ---------- Servisi Baslat ----------
 Write-Step "Servis baslatiliyor: $ServiceName"
