@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RDLSIS Bot — Dashboard</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- Ambient glows -->
+  <div class="glow-orb orb-1"></div>
+  <div class="glow-orb orb-2"></div>
+  <div class="glow-orb orb-3"></div>
+
+  <div class="app">
+
+    <!-- ═══ HEADER ════════════════════════════════════════════════ -->
+    <header class="header">
+      <div class="logo">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+          </svg>
+        </div>
+        <div>
+          <div class="logo-title">RDLSIS Bot</div>
+          <div class="logo-sub">Academic Enrichment Worker</div>
+        </div>
+      </div>
+      <div class="status-pill" id="status-pill">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">IDLE</span>
+      </div>
+    </header>
+
+    <!-- ═══ LIVE ACTIVITY STRIP ══════════════════════════════════ -->
+    <div class="activity-strip" id="activity-strip">
+      <div class="activity-empty">Henüz aktif görev yok</div>
+    </div>
+
+    <!-- ═══ TABS ══════════════════════════════════════════════════ -->
+    <nav class="tab-nav">
+      <button class="tab-btn active" data-tab="feed">📋 Akış</button>
+      <button class="tab-btn" data-tab="stats">📊 İstatistik</button>
+      <button class="tab-btn" data-tab="tasks">⚙️ Görevler</button>
+      <button class="tab-btn" data-tab="config">🔑 Ayarlar</button>
+    </nav>
+
+    <!-- ═══ TAB: FEED ══════════════════════════════════════════════ -->
+    <div class="tab-panel active" id="tab-feed">
+      <div class="feed-toolbar">
+        <span class="feed-label">Son Zenginleştirmeler</span>
+        <button class="icon-btn" id="btn-clear-feed" title="Temizle">✕</button>
+      </div>
+      <div class="feed-list" id="feed-list">
+        <div class="feed-empty">Henüz sonuç yok. DOI enrichment taskları tamamlandığında burada görünecek.</div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: STATS ══════════════════════════════════════════════ -->
+    <div class="tab-panel" id="tab-stats">
+      <div class="stats-grid">
+        <div class="stat-card c-wos">
+          <div class="stat-source-badge">WoS</div>
+          <div class="stat-number" id="st-wos-done">0</div>
+          <div class="stat-label">Tamamlanan</div>
+        </div>
+        <div class="stat-card c-scholar">
+          <div class="stat-source-badge">Scholar</div>
+          <div class="stat-number" id="st-sch-done">0</div>
+          <div class="stat-label">Tamamlanan</div>
+        </div>
+        <div class="stat-card c-plumx">
+          <div class="stat-source-badge">PlumX</div>
+          <div class="stat-number" id="st-plumx-done">0</div>
+          <div class="stat-label">Tamamlanan</div>
+        </div>
+        <div class="stat-card c-error">
+          <div class="stat-source-badge">Hata</div>
+          <div class="stat-number" id="st-errors">0</div>
+          <div class="stat-label">Başarısız</div>
+        </div>
+      </div>
+
+      <div class="detail-grid">
+        <div class="detail-row">
+          <span class="detail-icon">📄</span>
+          <span class="detail-label">Abstract çekildi</span>
+          <span class="detail-val" id="st-abstracts">0</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-icon">📖</span>
+          <span class="detail-label">WoS Citation (toplam kazanılan)</span>
+          <span class="detail-val" id="st-wos-cit">0</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-icon">🎓</span>
+          <span class="detail-label">Scholar Citation (toplam kazanılan)</span>
+          <span class="detail-val" id="st-sch-cit">0</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-icon">📊</span>
+          <span class="detail-label">Quartile bilgisi çekildi</span>
+          <span class="detail-val" id="st-quartiles">0</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-icon">📌</span>
+          <span class="detail-label">Mendeley Readers (toplam)</span>
+          <span class="detail-val" id="st-mendeley">0</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-icon">⏱</span>
+          <span class="detail-label">Aktif Tab sayısı</span>
+          <span class="detail-val" id="st-active-tabs">0</span>
+        </div>
+      </div>
+
+      <!-- Progress bars -->
+      <div class="progress-block">
+        <div class="progress-hdr">
+          <span id="prog-label">Bekleniyor</span>
+          <span id="prog-count">—</span>
+        </div>
+        <div class="prog-bar-track">
+          <div class="prog-bar-fill" id="prog-fill" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: TASKS ══════════════════════════════════════════════ -->
+    <div class="tab-panel" id="tab-tasks">
+      <div class="task-table-header">
+        <span>Kaynak</span>
+        <span>DOI / Hedef</span>
+        <span>Durum</span>
+        <span>Süre</span>
+      </div>
+      <div class="task-rows" id="task-rows">
+        <div class="task-empty">Aktif görev yok</div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: CONFIG ══════════════════════════════════════════════ -->
+    <div class="tab-panel" id="tab-config">
+      <div class="config-section">
+        <label class="cfg-label">Broker API Key</label>
+        <div class="cfg-row">
+          <input id="api-key-input" type="password" class="cfg-input" placeholder="change-me-in-production"/>
+          <button id="api-key-save" class="cfg-save-btn">Kaydet</button>
+        </div>
+        <span id="api-key-status" class="cfg-status"></span>
+      </div>
+      <div class="config-section">
+        <label class="cfg-label">Araçlar</label>
+        <button id="btn-diagnostics" class="tool-btn">📊 Diagnostics Aç</button>
+        <button id="btn-force-poll" class="tool-btn">🔄 Şimdi Poll Et</button>
+      </div>
+      <div class="config-section">
+        <label class="cfg-label">Versiyon</label>
+        <div class="cfg-version" id="ext-version">v1.2.0</div>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

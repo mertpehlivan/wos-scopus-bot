@@ -1,0 +1,150 @@
+{
+  "manifest_version": 3,
+  "name": "WoS Task Worker",
+  "description": "Task Queue worker: polls broker API, scrapes WoS author profiles, and enriches publications via DOI-based WoS Smart-Search and Google Scholar lookup.",
+  "version": "1.2.0",
+  "permissions": [
+    "tabs",
+    "alarms",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.webofscience.com/*",
+    "*://*.scopus.com/*",
+    "*://*.plu.mx/*",
+    "*://scholar.google.com/*",
+    "http://localhost:8080/*",
+    "http://localhost:8081/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "WoS Task Worker"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "wos_doi_content.js",
+        "scholar_doi_content.js",
+        "wos_citation_report_content.js"
+      ],
+      "matches": [
+        "*://*.webofscience.com/*",
+        "*://scholar.google.com/*"
+      ]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.webofscience.com/wos/author/*"
+      ],
+      "js": [
+        "stealth-utils.js",
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.webofscience.com/wos/author/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.webofscience.com/wos/woscc/full-record/*"
+      ],
+      "js": [
+        "stealth-utils.js",
+        "article_detail.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.webofscience.com/wos/woscc/full-record/*"
+      ],
+      "js": [
+        "article_detail.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.scopus.com/authid/detail.uri*"
+      ],
+      "js": [
+        "stealth-utils.js",
+        "scopus_content.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.scopus.com/authid/detail.uri*"
+      ],
+      "js": [
+        "scopus_content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.plu.mx/plum/a/*"
+      ],
+      "js": [
+        "stealth-utils.js",
+        "plumx_content.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.plu.mx/plum/a/*"
+      ],
+      "js": [
+        "plumx_content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://scholar.google.com/citations*"
+      ],
+      "js": [
+        "stealth-utils.js",
+        "scholar_content.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://scholar.google.com/citations*"
+      ],
+      "js": [
+        "scholar_content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.webofscience.com/wos/woscc/citation-report*"
+      ],
+      "js": [
+        "wos_citation_report_content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

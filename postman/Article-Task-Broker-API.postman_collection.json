@@ -1,0 +1,130 @@
+{
+  "info": {
+    "name": "Article Task Broker API",
+    "description": "WoS/Scopus makale verisi kuyruğu için broker API'si. Ana sistem görev ekler ve tamamlananları alır; tarayıcı eklentileri (worker) iş çeker ve sonucu iletir.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "taskId",
+      "value": "1"
+    }
+  ],
+  "item": [
+    {
+      "name": "Ana Sistem",
+      "description": "Dış ana sistem tarafından kullanılır: görev ekleme ve tamamlanan görevleri alıp silme.",
+      "item": [
+        {
+          "name": "Görev Ekle",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source\": \"WOS\",\n  \"externalIds\": [\"2413874\", \"1234567\"]\n}"
+            },
+            "url": "{{baseUrl}}/api/tasks",
+            "description": "Yeni WoS veya Scopus yazar ID'lerini kuyruğa ekler. Durum PENDING olarak kaydedilir. Zaten PENDING/PROCESSING olan ID'ler atlanır."
+          }
+        },
+        {
+          "name": "Tamamlanan Görevleri Al ve Sil",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/tasks/consume",
+            "description": "COMPLETED durumundaki tüm görevleri JSON olarak döndürür ve veritabanından hemen siler (geçici depolama). Ana sistem bu endpoint ile biten işleri alır."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Eklenti (Worker)",
+      "description": "Tarayıcı eklentileri (WoS/Scopus worker) tarafından kullanılır: iş talep etme, tamamlama veya hata bildirme.",
+      "item": [
+        {
+          "name": "İş Talep Et - WoS",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/tasks/poll?source=WOS",
+            "description": "Web of Science için bekleyen (PENDING) bir görev talep eder. Varsa tek bir görev döner (taskId, source, externalId) ve durum PROCESSING olur. Yoksa 204 No Content."
+          }
+        },
+        {
+          "name": "İş Talep Et - Scopus",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/tasks/poll?source=SCOPUS",
+            "description": "Scopus için bekleyen (PENDING) bir görev talep eder. Varsa tek bir görev döner; yoksa 204 No Content."
+          }
+        },
+        {
+          "name": "Yazar Metriklerini Kaydet",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"authorMetrics\": {\n    \"hIndex\": 42,\n    \"publications\": 150,\n    \"sumOfTimesCited\": 8500,\n    \"citingArticles\": 7200\n  },\n  \"url\": \"https://www.webofscience.com/wos/author/record/2413874\"\n}"
+            },
+            "url": "{{baseUrl}}/api/tasks/{{taskId}}/author-metrics",
+            "description": "Eklenti yazar profilini açtığında metrikleri bu endpoint ile ayrı olarak kaydeder."
+          }
+        },
+        {
+          "name": "Görevi Tamamla",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rawData\": {\n    \"name\": \"Örnek Yazar\",\n    \"articles\": [\n      {\n        \"title\": \"Örnek Makale Başlığı\",\n        \"abstract\": \"Özet metni...\",\n        \"citations\": 25\n      }\n    ],\n    \"scrapedAt\": \"2025-02-21T12:00:00.000Z\",\n    \"url\": \"https://www.webofscience.com/wos/author/record/2413874\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/api/tasks/{{taskId}}/complete",
+            "description": "Eklenti veriyi kazıdıktan (ve makale detaylarını çektikten) sonra ham JSON'u bu endpoint'e gönderir. Görev durumu COMPLETED olur; rawData JSONB olarak saklanır. taskId poll cevabındaki taskId olmalıdır."
+          }
+        },
+        {
+          "name": "Görevi Başarısız İşaretle",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"Sayfa 30 saniye içinde yüklenemedi\"\n}"
+            },
+            "url": "{{baseUrl}}/api/tasks/{{taskId}}/fail",
+            "description": "Eklenti sayfayı açamazsa veya veri çekemezse bu endpoint ile görevi FAILED olarak işaretler. Timeout veya hata durumunda kullanılır."
+          }
+        }
+      ]
+    }
+  ]
+}

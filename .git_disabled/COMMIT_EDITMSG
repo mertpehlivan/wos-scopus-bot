@@ -1,0 +1,5 @@
+fix(extension): add metadata extraction fallbacks and fix URL matching
+
+Implement regex-based text extraction as a fallback when primary DOM selectors fail for fields like DOI, journal, volume, issue, pages, and ISSNs. This ensures data is captured even if the page structure differs from expected selectors.
+
+Update diagnostic article lookup in background.js to normalize URLs by stripping fragments and checking prefixes, resolving issues where status tracking failed due to URL variations.

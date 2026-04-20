@@ -1,0 +1,42 @@
+spring:
+  application:
+    name: article-task-broker
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+  datasource:
+    url: jdbc:postgresql://localhost:5433/article_broker
+    username: postgres
+    password: password
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+        default_schema: public
+        jdbc:
+          batch_size: 25
+    open-in-view: false
+
+# Timeout: PROCESSING -> PENDING after this many minutes
+broker:
+  processing-timeout-minutes: 120
+  api-key: ${BROKER_API_KEY:change-me-in-production}
+
+server:
+  port: 8081
+  tomcat:
+    max-http-post-size: 50MB
+
+
+logging:
+  level:
+    com.academic.broker: INFO
+    org.hibernate.SQL: WARN
