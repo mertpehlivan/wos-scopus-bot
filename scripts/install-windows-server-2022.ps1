@@ -430,16 +430,37 @@ Add-FirewallRule -RuleName "WosScopusBot-API-$AppPort"      -Port $AppPort -Desc
 Add-FirewallRule -RuleName "WosScopusBot-PostgreSQL-$PgPort" -Port $PgPort  -Description "WoS/Scopus Bot PostgreSQL portu"
 
 # ============================================================
+# SCM TIMEOUT ARTIR (Spring Boot ~33sn'de basliyor, varsayilan 30sn)
+# ============================================================
+Write-Step "Windows SCM servis baslama timeout'u artiriliyor (120 sn)..."
+$scmKey = "HKLM:\SYSTEM\CurrentControlSet\Control"
+$currentTimeout = (Get-ItemProperty -Path $scmKey -Name "ServicesPipeTimeout" -ErrorAction SilentlyContinue).ServicesPipeTimeout
+if (-not $currentTimeout -or $currentTimeout -lt 120000) {
+    Set-ItemProperty -Path $scmKey -Name "ServicesPipeTimeout" -Value 120000 -Type DWord
+    Write-Host "    ServicesPipeTimeout 120000 ms (120 sn) olarak ayarlandi." -ForegroundColor Green
+} else {
+    Write-Host "    ServicesPipeTimeout zaten yeterli: $currentTimeout ms" -ForegroundColor Yellow
+}
+
+# ============================================================
 # SERVISI BASLAT
 # ============================================================
 Write-Step "Servis baslatiliyor: $ServiceName"
 Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 5
+Write-Host "    Baslamasini bekleniyor (60 sn maks)..."
+for ($i = 0; $i -lt 12; $i++) {
+    Start-Sleep -Seconds 5
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq "Running") {
+        Write-Host "    Servis calisiyor! ($($i*5+5) sn)" -ForegroundColor Green
+        break
+    }
+    Write-Host "    Bekleniyor... $($i*5+5) sn" -ForegroundColor Yellow
+}
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($svc -and $svc.Status -eq "Running") {
-    Write-Host "    Servis calisiyor!" -ForegroundColor Green
-} else {
-    Write-Warning "Servis hemen calismaya baslamadi. Loglari kontrol edin: $logDir"
+if (-not ($svc -and $svc.Status -eq "Running")) {
+    Write-Warning "Servis $ServiceName baslamadi. Durum: $($svc.Status)"
+    Write-Warning "Event Log icin: Get-EventLog -LogName Application -Source '*java*' -Newest 10"
 }
 
 # ============================================================
