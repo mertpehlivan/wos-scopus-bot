@@ -51,6 +51,20 @@ function jitteredInterval(baseMs, jitterPercent = 30) {
 // Global profile task slot: only ONE profile scrape (WOS/SCOPUS/SCHOLAR) at a time
 let activeProfileTask = null; // { taskId, source, externalId, taskType }
 
+// Dashboard sync progress tracking (WOS → SCOPUS → SCHOLAR)
+let syncProgress = {
+  WOS: 'PENDING',
+  SCOPUS: 'PENDING',
+  SCHOLAR: 'PENDING',
+};
+
+function updateSyncProgress(source, status) {
+  const src = source?.toUpperCase();
+  if (syncProgress[src] !== undefined) {
+    syncProgress[src] = status;
+  }
+}
+
 // ── DOI Enrichment tab pools (separate from profile scraping) ──
 const pendingWosDoiTabs = new Map();     // tabId → { taskId, doi }
 const pendingScholarDoiTabs = new Map(); // tabId → { taskId, doi }
@@ -211,6 +225,7 @@ function updateState(updates = {}) {
     detailPoolSize,
     plumxPoolSize,
   };
+  appState.syncProgress = { ...syncProgress };
 
   chrome.runtime.sendMessage({ type: 'STATE_UPDATE', state: appState }).catch(() => null);
 }
@@ -394,6 +409,8 @@ async function pollScrape() {
             taskType: taskType || 'FULL_SCRAPE'
           };
 
+          updateSyncProgress(effectiveSource, 'RUNNING');
+
           // Track in diagnostics
           diagAddTask(taskId, effectiveSource, externalId, taskType || 'FULL_SCRAPE');
 
@@ -554,6 +571,10 @@ function clearPendingTab(tabId) {
   chrome.storage.session.remove(String(tabId));
 }
 
+function markSourceComplete(source, failed = false) {
+  updateSyncProgress(source, failed ? 'FAILED' : 'COMPLETED');
+}
+
 async function handleTaskTimeout(tabId) {
   const entry = pendingTabs.get(tabId);
   if (!entry) return;
@@ -633,6 +654,90 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'CLEAR_DIAG_DATA') {
     diagHistory = { tasks: [], plumxResults: [] };
+    sendResponse({ ok: true });
+    return true;
+  }
+
+
+  // ── RESET EVERYTHING ──
+  if (msg.type === 'RESET_ALL') {
+    (async () => {
+      addLog('Resetting all state...', 'warning');
+
+      // Close all profile tabs
+      for (const [tabId] of pendingTabs) {
+        try { await chrome.tabs.remove(tabId); } catch (_) { }
+      }
+      pendingTabs.clear();
+      activeProfileTask = null;
+
+      // Close all detail tabs
+      for (const [taskId, job] of detailJobs) {
+        if (job.activeTabIds) {
+          for (const dtId of job.activeTabIds) {
+            try { await chrome.tabs.remove(dtId); } catch (_) { }
+          }
+        }
+      }
+      detailJobs.clear();
+
+      // Close all PlumX tabs
+      for (const [tabId] of pendingPlumx) {
+        try { await chrome.tabs.remove(tabId); } catch (_) { }
+      }
+      pendingPlumx.clear();
+
+      // Close all WoS DOI tabs
+      for (const [tabId] of pendingWosDoiTabs) {
+        try { await chrome.tabs.remove(tabId); } catch (_) { }
+      }
+      pendingWosDoiTabs.clear();
+
+      // Close all Scholar DOI tabs
+      for (const [tabId] of pendingScholarDoiTabs) {
+        try { await chrome.tabs.remove(tabId); } catch (_) { }
+      }
+      pendingScholarDoiTabs.clear();
+
+      // Close all Citation Report tabs
+      for (const [tabId] of pendingCitationReportTabs) {
+        try { await chrome.tabs.remove(tabId); } catch (_) { }
+      }
+      pendingCitationReportTabs.clear();
+      savedCitationReportLinks.clear();
+
+      // Reset state
+      appState = {
+        status: 'IDLE',
+        taskId: null,
+        targetId: null,
+        progress: { current: 0, total: 0, label: 'Waiting...' },
+        stats: { pagesScanned: 0, articlesFound: 0, detailsExtracted: 0 },
+        activeTabs: {},
+        logs: [],
+        syncProgress: { WOS: 'PENDING', SCOPUS: 'PENDING', SCHOLAR: 'PENDING' }
+      };
+      syncProgress = { WOS: 'PENDING', SCOPUS: 'PENDING', SCHOLAR: 'PENDING' };
+      diagHistory = { tasks: [], plumxResults: [] };
+      enrichmentHistory = [];
+      cumulativeStats = {
+        wosDone: 0, scholarDone: 0, plumxDone: 0, errors: 0,
+        abstracts: 0, wosCit: 0, schCit: 0, quartiles: 0, mendeley: 0,
+      };
+
+      // Reset adaptive pools
+      detailPoolSize = 1;
+      plumxPoolSize = 1;
+      wosDoiPoolSize = 1;
+      detailRateLimited = false;
+      plumxRateLimited = false;
+      detailBackoffUntil = 0;
+      plumxBackoffUntil = 0;
+
+      await chrome.storage.session.clear();
+      addLog('All state reset complete.', 'success');
+      updateState();
+    })();
     sendResponse({ ok: true });
     return true;
   }
@@ -1166,10 +1271,12 @@ async function finalizeAndComplete(taskId) {
     });
     addLog(`Task successfully completed!`, 'success');
     if (diagTask) { diagTask.status = 'COMPLETED'; diagTask.completedAt = new Date().toISOString(); }
+    markSourceComplete(source);
   } catch (err) {
     console.warn('[WoS Worker] Backend API ulaşılamıyor:', err);
     addLog(`Failed to report to backend`, 'error');
     if (diagTask) { diagTask.status = 'ERROR'; diagTask.error = err.message; diagTask.completedAt = new Date().toISOString(); }
+    markSourceComplete(source, true);
   }
 
   // Author tab'ını kapat
@@ -1236,6 +1343,8 @@ async function handleContentResult(tabId, msg) {
     diagTask.error = msg.error || 'Scrape failed';
     diagTask.completedAt = new Date().toISOString();
   }
+
+  markSourceComplete(entry?.source, true);
 
   try {
     const h = await brokerHeaders();

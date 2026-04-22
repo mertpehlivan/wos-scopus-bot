@@ -42,6 +42,28 @@
 
     <!-- ═══ TAB: OVERVIEW ══════════════════════════════════════════════ -->
     <div class="tab-panel active" id="tab-overview">
+      <!-- Sync Progress -->
+      <div class="sync-progress-box">
+        <div class="sync-title">Senkronizasyon Durumu</div>
+        <div class="sync-steps">
+          <div class="sync-step" id="step-wos">
+            <div class="step-icon">🔬</div>
+            <div class="step-name">Web of Science</div>
+            <div class="step-status">Bekliyor</div>
+          </div>
+          <div class="sync-step" id="step-scopus">
+            <div class="step-icon">🔭</div>
+            <div class="step-name">Scopus</div>
+            <div class="step-status">Bekliyor</div>
+          </div>
+          <div class="sync-step" id="step-scholar">
+            <div class="step-icon">🎓</div>
+            <div class="step-name">Google Scholar</div>
+            <div class="step-status">Bekliyor</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Quick Stats -->
       <div class="stats-grid">
         <div class="stat-card c-wos">
@@ -157,7 +179,7 @@
         <label class="cfg-label">Araçlar</label>
         <button id="btn-diagnostics" class="tool-btn">📊 Diagnostics Aç</button>
         <button id="btn-force-poll" class="tool-btn">🔄 Şimdi Poll Et</button>
-        <button id="btn-clear-history" class="tool-btn danger">🗑 İstatistikleri Sıfırla</button>
+        <button id="btn-clear-history" class="tool-btn danger">🗑 Her Şeyi Sıfırla</button>
       </div>
       <div class="config-section">
         <label class="cfg-label">Versiyon</label>

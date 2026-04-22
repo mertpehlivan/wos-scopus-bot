@@ -31,6 +31,13 @@ document.addEventListener('DOMContentLoaded', () => {
   const progCount = document.getElementById('prog-count');
   const progFill = document.getElementById('prog-fill');
 
+  // Sync progress refs
+  const syncSteps = {
+    WOS: document.getElementById('step-wos'),
+    SCOPUS: document.getElementById('step-scopus'),
+    SCHOLAR: document.getElementById('step-scholar'),
+  };
+
   // Stats refs
   const st = {
     wosDone: document.getElementById('st-wos-done'),
@@ -86,15 +93,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Clear history ────────────────────────────────────────────
   document.getElementById('btn-clear-history').addEventListener('click', () => {
-    if (!confirm('Tüm istatistikleri sıfırlamak istediğinize emin misiniz?')) return;
-    enrichmentHistory = [];
-    cumulativeStats = { wosDone: 0, scholarDone: 0, plumxDone: 0, errors: 0, abstracts: 0, wosCit: 0, schCit: 0, quartiles: 0, mendeley: 0 };
-    activeTasks = {};
-    logs = [];
-    renderStats();
-    renderActivityStrip();
-    renderTaskTable();
-    renderLogs();
+    if (!confirm('TÜM state, log, task geçmişi ve açık sekmeler sıfırlanacak. Emin misiniz?')) return;
+    chrome.runtime.sendMessage({ type: 'RESET_ALL' }, () => {
+      enrichmentHistory = [];
+      cumulativeStats = { wosDone: 0, scholarDone: 0, plumxDone: 0, errors: 0, abstracts: 0, wosCit: 0, schCit: 0, quartiles: 0, mendeley: 0 };
+      activeTasks = {};
+      logs = [];
+      renderStats();
+      renderActivityStrip();
+      renderTaskTable();
+      renderLogs();
+      // Refresh state from background
+      chrome.runtime.sendMessage({ type: 'GET_DASHBOARD_STATE' }, (response) => {
+        if (response) applyDashboardState(response);
+      });
+    });
   });
 
   // ── Initial fetch ────────────────────────────────────────────
@@ -196,6 +209,11 @@ document.addEventListener('DOMContentLoaded', () => {
       activeTaskBox.style.display = 'none';
     }
 
+    // Sync progress
+    if (state.syncProgress) {
+      renderSyncProgress(state.syncProgress);
+    }
+
     renderActivityStrip();
     renderTaskTable();
   }
@@ -255,6 +273,28 @@ document.addEventListener('DOMContentLoaded', () => {
     st.schCit.textContent = cumulativeStats.schCit;
     st.quartiles.textContent = cumulativeStats.quartiles;
     st.mendeley.textContent = cumulativeStats.mendeley;
+  }
+
+  function renderSyncProgress(sp) {
+    const labels = { PENDING: 'Bekliyor', RUNNING: 'Çalışıyor', COMPLETED: 'Tamamlandı', FAILED: 'Hata' };
+    Object.entries(sp).forEach(([src, status]) => {
+      const el = syncSteps[src];
+      if (!el) return;
+      el.classList.remove('active', 'completed', 'failed');
+      const statusEl = el.querySelector('.step-status');
+      if (status === 'RUNNING') {
+        el.classList.add('active');
+        statusEl.textContent = labels.RUNNING;
+      } else if (status === 'COMPLETED') {
+        el.classList.add('completed');
+        statusEl.textContent = labels.COMPLETED;
+      } else if (status === 'FAILED') {
+        el.classList.add('failed');
+        statusEl.textContent = labels.FAILED;
+      } else {
+        statusEl.textContent = labels.PENDING;
+      }
+    });
   }
 
   function mergeStats(s) {
