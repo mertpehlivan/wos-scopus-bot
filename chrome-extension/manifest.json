@@ -42,8 +42,7 @@
         "*://*.webofscience.com/wos/author/*"
       ],
       "js": [
-        "stealth-utils.js",
-        "content.js"
+        "stealth-utils.js"
       ],
       "run_at": "document_start",
       "world": "MAIN"
@@ -62,8 +61,7 @@
         "*://*.webofscience.com/wos/woscc/full-record/*"
       ],
       "js": [
-        "stealth-utils.js",
-        "article_detail.js"
+        "stealth-utils.js"
       ],
       "run_at": "document_start",
       "world": "MAIN"
@@ -82,8 +80,7 @@
         "*://*.scopus.com/authid/detail.uri*"
       ],
       "js": [
-        "stealth-utils.js",
-        "scopus_content.js"
+        "stealth-utils.js"
       ],
       "run_at": "document_start",
       "world": "MAIN"
@@ -102,8 +99,7 @@
         "*://*.plu.mx/plum/a/*"
       ],
       "js": [
-        "stealth-utils.js",
-        "plumx_content.js"
+        "stealth-utils.js"
       ],
       "run_at": "document_start",
       "world": "MAIN"
@@ -122,8 +118,7 @@
         "*://scholar.google.com/citations*"
       ],
       "js": [
-        "stealth-utils.js",
-        "scholar_content.js"
+        "stealth-utils.js"
       ],
       "run_at": "document_start",
       "world": "MAIN"

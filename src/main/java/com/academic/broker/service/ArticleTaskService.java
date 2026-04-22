@@ -104,6 +104,12 @@ public class ArticleTaskService {
     public void completeTask(Long taskId, CompleteTaskRequest request) {
         ArticleTask task = repository.findByIdForUpdate(taskId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
+        if (task.getStatus() == TaskStatus.PENDING) {
+            // Task was reset by timeout scheduler before worker could complete.
+            // Reclaim it so the worker can finish.
+            log.warn("Task {} was reset to PENDING by scheduler. Reclaiming and completing.", taskId);
+            task.setStatus(TaskStatus.PROCESSING);
+        }
         if (task.getStatus() != TaskStatus.PROCESSING) {
             throw new TaskNotProcessableException(taskId, task.getStatus(), "complete");
         }
@@ -122,6 +128,10 @@ public class ArticleTaskService {
     public void saveAuthorMetrics(Long taskId, AuthorMetricsRequest request) {
         ArticleTask task = repository.findByIdForUpdate(taskId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
+        if (task.getStatus() == TaskStatus.PENDING) {
+            log.warn("Task {} was reset to PENDING before author-metrics. Reclaiming.", taskId);
+            task.setStatus(TaskStatus.PROCESSING);
+        }
         if (task.getStatus() != TaskStatus.PROCESSING) {
             throw new TaskNotProcessableException(taskId, task.getStatus(), "save author metrics");
         }

@@ -253,6 +253,22 @@ async function brokerHeaders(extra = {}) {
   return { 'Content-Type': 'application/json', 'X-Api-Key': key, ...extra };
 }
 
+function resetScrapeTimeout(tabId) {
+  if (scrapeTimeouts.has(tabId)) {
+    clearTimeout(scrapeTimeouts.get(tabId));
+  }
+  const entry = pendingTabs.get(tabId);
+  if (entry) {
+    const newTimeout = setTimeout(() => {
+      const current = pendingTabs.get(tabId);
+      if (current && current.taskId === entry.taskId) {
+        handleTaskTimeout(tabId);
+      }
+    }, SCRAPE_TIMEOUT_MS);
+    scrapeTimeouts.set(tabId, newTimeout);
+  }
+}
+
 // ═══════════════════════════════════════════════
 //  ADAPTIVE POLLING SYSTEM
 // ═══════════════════════════════════════════════
@@ -542,6 +558,15 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
 
   pendingTabs.set(tabId, { taskId, source, taskType: taskType || 'FULL_SCRAPE', openedAt: Date.now(), readyAt: null });
   addLog(`Opened ${source} tab (focused, ${taskType || 'FULL_SCRAPE'})`, 'info');
+
+  // Start scrape timeout (reset by PROGRESS_UPDATE / SCRAPE_READY)
+  const timeoutId = setTimeout(() => {
+    const current = pendingTabs.get(tabId);
+    if (current && current.taskId === taskId) {
+      handleTaskTimeout(tabId);
+    }
+  }, SCRAPE_TIMEOUT_MS);
+  scrapeTimeouts.set(tabId, timeoutId);
 
   // Pre-ready timeout: if SCRAPE_READY is not received within 60s, fail gracefully
   setTimeout(async () => {
@@ -948,13 +973,14 @@ async function handleAuthorMetrics(msg) {
       method: 'POST', headers: h,
       body: JSON.stringify({ authorMetrics, url }),
     });
+    const respBody = await resp.text().catch(() => '');
     if (!resp.ok) {
-      const errorText = await resp.text().catch(() => 'Unknown error');
-      throw new Error(`HTTP ${resp.status}: ${errorText}`);
+      throw new Error(`HTTP ${resp.status}: ${respBody || 'Empty body'}`);
     }
+    addLog(`Author-metrics endpoint OK (HTTP ${resp.status})`, 'success');
     addLog(`Author metrics saved (h-index: ${authorMetrics.hIndex || 0})`, 'success');
   } catch (err) {
-    console.warn('[WoS Worker] Yazar metrikleri gönderilemedi:', err);
+    console.error('[WoS Worker] Author metrics API error:', err);
     addLog(`Failed to save author metrics: ${err.message}`, 'warning');
   }
 
@@ -1291,25 +1317,41 @@ async function finalizeAndComplete(taskId) {
   // Update diagnostics with final enriched data
   const diagTask = diagGetTask(taskId);
 
-  try {
-    const h = await brokerHeaders();
-    const payload = JSON.stringify({ rawData });
-    console.log(`[WoS Worker] Task ${taskId}: Sending complete payload (${(payload.length/1024).toFixed(1)} KB, ${enrichedArticles.length} articles)`);
-    const resp = await fetch(`${API_BASE}/api/tasks/${taskId}/complete`, {
-      method: 'POST', headers: h,
-      body: payload,
-    });
-    if (!resp.ok) {
-      const errorText = await resp.text().catch(() => 'Unknown error');
-      throw new Error(`HTTP ${resp.status}: ${errorText}`);
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const h = await brokerHeaders();
+      const payload = JSON.stringify({ rawData });
+      if (attempt === 1) {
+        addLog(`Sending complete payload (${(payload.length/1024).toFixed(1)} KB, ${enrichedArticles.length} articles)`, 'info');
+        console.log(`[WoS Worker] Task ${taskId}: Sending complete payload (${(payload.length/1024).toFixed(1)} KB, ${enrichedArticles.length} articles)`);
+      }
+      const resp = await fetch(`${API_BASE}/api/tasks/${taskId}/complete`, {
+        method: 'POST', headers: h,
+        body: payload,
+      });
+      const respBody = await resp.text().catch(() => '');
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}: ${respBody || 'Empty body'}`);
+      }
+      addLog(`Complete endpoint OK (HTTP ${resp.status}, body=${respBody || '(empty)'})`, 'success');
+      console.log(`[WoS Worker] Task ${taskId}: Complete endpoint returned HTTP ${resp.status}, body=${respBody || '(empty)'}`);
+      addLog(`Task successfully completed!`, 'success');
+      if (diagTask) { diagTask.status = 'COMPLETED'; diagTask.completedAt = new Date().toISOString(); }
+      markSourceComplete(source);
+      lastError = null;
+      break;
+    } catch (err) {
+      lastError = err;
+      console.error(`[WoS Worker] Backend API error (attempt ${attempt}):`, err);
+      addLog(`Complete attempt ${attempt} failed: ${err.message}`, attempt < 3 ? 'warning' : 'error');
+      if (attempt < 3) {
+        await new Promise(r => setTimeout(r, 3000));
+      }
     }
-    addLog(`Task successfully completed!`, 'success');
-    if (diagTask) { diagTask.status = 'COMPLETED'; diagTask.completedAt = new Date().toISOString(); }
-    markSourceComplete(source);
-  } catch (err) {
-    console.warn('[WoS Worker] Backend API ulaşılamıyor:', err);
-    addLog(`Failed to report to backend: ${err.message}`, 'error');
-    if (diagTask) { diagTask.status = 'ERROR'; diagTask.error = err.message; diagTask.completedAt = new Date().toISOString(); }
+  }
+  if (lastError) {
+    if (diagTask) { diagTask.status = 'ERROR'; diagTask.error = lastError.message; diagTask.completedAt = new Date().toISOString(); }
     markSourceComplete(source, true);
   }
 
