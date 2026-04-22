@@ -944,14 +944,18 @@ async function handleAuthorMetrics(msg) {
   try {
     console.log(`[WoS Worker] Task ${taskId}: Yazar metrikleri backend'e gönderiliyor...`);
     const h = await brokerHeaders();
-    await fetch(`${API_BASE}/api/tasks/${taskId}/author-metrics`, {
+    const resp = await fetch(`${API_BASE}/api/tasks/${taskId}/author-metrics`, {
       method: 'POST', headers: h,
       body: JSON.stringify({ authorMetrics, url }),
     });
+    if (!resp.ok) {
+      const errorText = await resp.text().catch(() => 'Unknown error');
+      throw new Error(`HTTP ${resp.status}: ${errorText}`);
+    }
     addLog(`Author metrics saved (h-index: ${authorMetrics.hIndex || 0})`, 'success');
   } catch (err) {
     console.warn('[WoS Worker] Yazar metrikleri gönderilemedi:', err);
-    addLog('Failed to save author metrics', 'warning');
+    addLog(`Failed to save author metrics: ${err.message}`, 'warning');
   }
 
   // METRICS_ONLY or SCOPUS short-circuit (Scopus doesn't do detail pages yet)
@@ -1289,16 +1293,22 @@ async function finalizeAndComplete(taskId) {
 
   try {
     const h = await brokerHeaders();
-    await fetch(`${API_BASE}/api/tasks/${taskId}/complete`, {
+    const payload = JSON.stringify({ rawData });
+    console.log(`[WoS Worker] Task ${taskId}: Sending complete payload (${(payload.length/1024).toFixed(1)} KB, ${enrichedArticles.length} articles)`);
+    const resp = await fetch(`${API_BASE}/api/tasks/${taskId}/complete`, {
       method: 'POST', headers: h,
-      body: JSON.stringify({ rawData }),
+      body: payload,
     });
+    if (!resp.ok) {
+      const errorText = await resp.text().catch(() => 'Unknown error');
+      throw new Error(`HTTP ${resp.status}: ${errorText}`);
+    }
     addLog(`Task successfully completed!`, 'success');
     if (diagTask) { diagTask.status = 'COMPLETED'; diagTask.completedAt = new Date().toISOString(); }
     markSourceComplete(source);
   } catch (err) {
     console.warn('[WoS Worker] Backend API ulaşılamıyor:', err);
-    addLog(`Failed to report to backend`, 'error');
+    addLog(`Failed to report to backend: ${err.message}`, 'error');
     if (diagTask) { diagTask.status = 'ERROR'; diagTask.error = err.message; diagTask.completedAt = new Date().toISOString(); }
     markSourceComplete(source, true);
   }
@@ -1406,13 +1416,17 @@ async function handlePlumxDetailComplete(tabId, msg) {
 
     try {
       const h = await brokerHeaders();
-      await fetch(`${API_BASE}/api/plumx-tasks/${taskId}/complete`, {
+      const resp = await fetch(`${API_BASE}/api/plumx-tasks/${taskId}/complete`, {
         method: 'POST', headers: h,
         body: JSON.stringify({ rawData: data }),
       });
+      if (!resp.ok) {
+        const errorText = await resp.text().catch(() => 'Unknown error');
+        throw new Error(`HTTP ${resp.status}: ${errorText}`);
+      }
       addLog(`PlumX Task ${taskId} completed!`, 'success');
     } catch (err) {
-      addLog(`Failed to report PlumX task to backend`, 'error');
+      addLog(`Failed to report PlumX task to backend: ${err.message}`, 'error');
     }
 
     pendingPlumx.delete(tabId);
@@ -1429,13 +1443,17 @@ async function handlePlumxDetailComplete(tabId, msg) {
 
   try {
     const h = await brokerHeaders();
-    await fetch(`${API_BASE}/api/tasks/${taskId}/complete`, {
+    const resp = await fetch(`${API_BASE}/api/tasks/${taskId}/complete`, {
       method: 'POST', headers: h,
       body: JSON.stringify({ rawData: data }),
     });
+    if (!resp.ok) {
+      const errorText = await resp.text().catch(() => 'Unknown error');
+      throw new Error(`HTTP ${resp.status}: ${errorText}`);
+    }
     addLog(`PlumX Task completed!`, 'success');
   } catch (err) {
-    addLog(`Failed to report PlumX task to backend`, 'error');
+    addLog(`Failed to report PlumX task to backend: ${err.message}`, 'error');
   }
 
   clearPendingTab(tabId);
@@ -1534,12 +1552,16 @@ async function handleWosDoiComplete(tabId, msg) {
     pushEnrichmentResult('WOS', doi, data, null);
     try {
       const h = await brokerHeaders();
-      await fetch(`${API_BASE}/api/doi-enrich-tasks/${taskId}/complete`, {
+      const resp = await fetch(`${API_BASE}/api/doi-enrich-tasks/${taskId}/complete`, {
         method: 'POST', headers: h,
         body: JSON.stringify({ source: 'WOS', rawData: { ...data, doi } }),
       });
+      if (!resp.ok) {
+        const errorText = await resp.text().catch(() => 'Unknown error');
+        throw new Error(`HTTP ${resp.status}: ${errorText}`);
+      }
     } catch (err) {
-      addLog(`Failed to report WoS DOI result to backend`, 'error');
+      addLog(`Failed to report WoS DOI result to backend: ${err.message}`, 'error');
     }
   }
 
@@ -1636,12 +1658,16 @@ async function handleScholarDoiComplete(tabId, msg) {
     pushEnrichmentResult('SCHOLAR', doi, data, null);
     try {
       const h = await brokerHeaders();
-      await fetch(`${API_BASE}/api/doi-enrich-tasks/${taskId}/scholar-complete`, {
+      const resp = await fetch(`${API_BASE}/api/doi-enrich-tasks/${taskId}/scholar-complete`, {
         method: 'POST', headers: h,
         body: JSON.stringify({ source: 'SCHOLAR', rawData: { ...data, doi } }),
       });
+      if (!resp.ok) {
+        const errorText = await resp.text().catch(() => 'Unknown error');
+        throw new Error(`HTTP ${resp.status}: ${errorText}`);
+      }
     } catch (err) {
-      addLog(`Failed to report Scholar DOI result to backend`, 'error');
+      addLog(`Failed to report Scholar DOI result to backend: ${err.message}`, 'error');
     }
   }
 
