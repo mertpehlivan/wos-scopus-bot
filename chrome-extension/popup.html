@@ -7,13 +7,7 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <!-- Ambient glows -->
-  <div class="glow-orb orb-1"></div>
-  <div class="glow-orb orb-2"></div>
-  <div class="glow-orb orb-3"></div>
-
   <div class="app">
-
     <!-- ═══ HEADER ════════════════════════════════════════════════ -->
     <header class="header">
       <div class="logo">
@@ -40,25 +34,15 @@
 
     <!-- ═══ TABS ══════════════════════════════════════════════════ -->
     <nav class="tab-nav">
-      <button class="tab-btn active" data-tab="feed">📋 Akış</button>
-      <button class="tab-btn" data-tab="stats">📊 İstatistik</button>
+      <button class="tab-btn active" data-tab="overview">📊 Genel</button>
       <button class="tab-btn" data-tab="tasks">⚙️ Görevler</button>
+      <button class="tab-btn" data-tab="logs">📋 Loglar</button>
       <button class="tab-btn" data-tab="config">🔑 Ayarlar</button>
     </nav>
 
-    <!-- ═══ TAB: FEED ══════════════════════════════════════════════ -->
-    <div class="tab-panel active" id="tab-feed">
-      <div class="feed-toolbar">
-        <span class="feed-label">Son Zenginleştirmeler</span>
-        <button class="icon-btn" id="btn-clear-feed" title="Temizle">✕</button>
-      </div>
-      <div class="feed-list" id="feed-list">
-        <div class="feed-empty">Henüz sonuç yok. DOI enrichment taskları tamamlandığında burada görünecek.</div>
-      </div>
-    </div>
-
-    <!-- ═══ TAB: STATS ══════════════════════════════════════════════ -->
-    <div class="tab-panel" id="tab-stats">
+    <!-- ═══ TAB: OVERVIEW ══════════════════════════════════════════════ -->
+    <div class="tab-panel active" id="tab-overview">
+      <!-- Quick Stats -->
       <div class="stats-grid">
         <div class="stat-card c-wos">
           <div class="stat-source-badge">WoS</div>
@@ -82,6 +66,25 @@
         </div>
       </div>
 
+      <!-- Active Task Info -->
+      <div class="active-task-box" id="active-task-box" style="display:none;">
+        <div class="at-header">
+          <span class="at-source" id="at-source">—</span>
+          <span class="at-id" id="at-id">#—</span>
+        </div>
+        <div class="at-target" id="at-target">—</div>
+        <div class="progress-block">
+          <div class="progress-hdr">
+            <span id="prog-label">Bekleniyor</span>
+            <span id="prog-count">—</span>
+          </div>
+          <div class="prog-bar-track">
+            <div class="prog-bar-fill" id="prog-fill" style="width:0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Detail rows -->
       <div class="detail-grid">
         <div class="detail-row">
           <span class="detail-icon">📄</span>
@@ -90,12 +93,12 @@
         </div>
         <div class="detail-row">
           <span class="detail-icon">📖</span>
-          <span class="detail-label">WoS Citation (toplam kazanılan)</span>
+          <span class="detail-label">WoS Citation (toplam)</span>
           <span class="detail-val" id="st-wos-cit">0</span>
         </div>
         <div class="detail-row">
           <span class="detail-icon">🎓</span>
-          <span class="detail-label">Scholar Citation (toplam kazanılan)</span>
+          <span class="detail-label">Scholar Citation (toplam)</span>
           <span class="detail-val" id="st-sch-cit">0</span>
         </div>
         <div class="detail-row">
@@ -110,19 +113,8 @@
         </div>
         <div class="detail-row">
           <span class="detail-icon">⏱</span>
-          <span class="detail-label">Aktif Tab sayısı</span>
-          <span class="detail-val" id="st-active-tabs">0</span>
-        </div>
-      </div>
-
-      <!-- Progress bars -->
-      <div class="progress-block">
-        <div class="progress-hdr">
-          <span id="prog-label">Bekleniyor</span>
-          <span id="prog-count">—</span>
-        </div>
-        <div class="prog-bar-track">
-          <div class="prog-bar-fill" id="prog-fill" style="width:0%"></div>
+          <span class="detail-label">Aktif Tab / Pool</span>
+          <span class="detail-val" id="st-active-tabs">0 / —</span>
         </div>
       </div>
     </div>
@@ -131,12 +123,23 @@
     <div class="tab-panel" id="tab-tasks">
       <div class="task-table-header">
         <span>Kaynak</span>
-        <span>DOI / Hedef</span>
+        <span>Hedef</span>
         <span>Durum</span>
         <span>Süre</span>
       </div>
       <div class="task-rows" id="task-rows">
         <div class="task-empty">Aktif görev yok</div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: LOGS ══════════════════════════════════════════════ -->
+    <div class="tab-panel" id="tab-logs">
+      <div class="feed-toolbar">
+        <span class="feed-label">Canlı Log Akışı</span>
+        <button class="icon-btn" id="btn-clear-logs" title="Temizle">✕</button>
+      </div>
+      <div class="log-list" id="log-list">
+        <div class="log-empty">Henüz log kaydı yok.</div>
       </div>
     </div>
 
@@ -154,6 +157,7 @@
         <label class="cfg-label">Araçlar</label>
         <button id="btn-diagnostics" class="tool-btn">📊 Diagnostics Aç</button>
         <button id="btn-force-poll" class="tool-btn">🔄 Şimdi Poll Et</button>
+        <button id="btn-clear-history" class="tool-btn danger">🗑 İstatistikleri Sıfırla</button>
       </div>
       <div class="config-section">
         <label class="cfg-label">Versiyon</label>

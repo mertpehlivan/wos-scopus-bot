@@ -48,41 +48,37 @@ function jitteredInterval(baseMs, jitterPercent = 30) {
 //  CONFIGURATION — Adaptive & Anti-detection aware
 // ═══════════════════════════════════════════════
 
-// Source-based parallel scraping: each source gets its own slot
-const sourceSlots = {
-  WOS: { active: null, maxConcurrent: 1 },       // WoS is strict — 1 at a time
-  SCOPUS: { active: null, maxConcurrent: 1 },    // Scopus — 1 at a time
-  SCHOLAR: { active: null, maxConcurrent: 1 },   // Scholar — 1 at a time
-};
+// Global profile task slot: only ONE profile scrape (WOS/SCOPUS/SCHOLAR) at a time
+let activeProfileTask = null; // { taskId, source, externalId, taskType }
 
 // ── DOI Enrichment tab pools (separate from profile scraping) ──
 const pendingWosDoiTabs = new Map();     // tabId → { taskId, doi }
 const pendingScholarDoiTabs = new Map(); // tabId → { taskId, doi }
-let wosDoiPoolSize = 2;
-let scholarDoiPoolSize = 1; // SLOW DOWN SCHOLAR TO AVOID BOT BLOCKS
+let wosDoiPoolSize = 1;     // Conservative: 1 at a time
+let scholarDoiPoolSize = 1; // Strict: 1 at a time
 
 // Handshake: Pre-ready timeout (60s) — if SCRAPE_READY not received, fail gracefully
 const PRE_READY_TIMEOUT_MS = 60_000;
 const SCRAPE_TIMEOUT_MS = 300_000; // 5 minutes after SCRAPE_READY
 
 // Adaptive detail tab pool
-let detailPoolSize = 2;          // Start conservative
+let detailPoolSize = 1;          // Conservative: 1 at a time
 const DETAIL_POOL_MIN = 1;
-const DETAIL_POOL_MAX = 4;
+const DETAIL_POOL_MAX = 2;
 let detailRateLimited = false;
 let detailBackoffUntil = 0;
 
 // Adaptive PlumX tab pool
-let plumxPoolSize = 3;
+let plumxPoolSize = 1;      // Conservative: 1 at a time
 const PLUMX_POOL_MIN = 1;
-const PLUMX_POOL_MAX = 5;
+const PLUMX_POOL_MAX = 2;
 let plumxRateLimited = false;
 let plumxBackoffUntil = 0;
 
 // Polling intervals (adaptive)
 const POLL_INTERVAL_IDLE_MS = 30000;       // 30s when idle
-const POLL_INTERVAL_ACTIVE_MS = 5000;      // 5s when tasks are active
-const POLL_INTERVAL_RATE_LIMITED_MS = 60000; // 60s when rate limited
+const POLL_INTERVAL_ACTIVE_MS = 8000;      // 8s when tasks are active (conservative)
+const POLL_INTERVAL_RATE_LIMITED_MS = 120000; // 120s when rate limited
 let currentPollMode = 'idle'; // 'idle' | 'active' | 'rate_limited'
 
 const pendingTabs = new Map(); // authorTabId → { taskId, source, taskType }
@@ -205,11 +201,8 @@ function updateState(updates = {}) {
   for (const job of detailJobs.values()) {
     if (job.activeTabIds) totalActiveTabs += job.activeTabIds.size;
   }
-  // Count source slots
-  let activeSourceCount = 0;
-  for (const s of Object.values(sourceSlots)) {
-    if (s.active) activeSourceCount++;
-  }
+  // Count active profile source
+  let activeSourceCount = activeProfileTask !== null ? 1 : 0;
 
   appState.stats = {
     ...appState.stats,
@@ -267,13 +260,12 @@ async function runPriorityOrchestrator() {
   }
 
   // Count active tasks for Phase 1 (Yayın Bulma / Detay Doldurma)
-  let activeAuthorTasks = 0;
-  for (const s of Object.values(sourceSlots)) if (s.active) activeAuthorTasks++;
+  let activeAuthorTasks = activeProfileTask !== null ? 1 : 0;
   let activeDetailJobs = detailJobs.size;
 
   // PRIORITY 1: YAYIN BULMA VE DETAY ÇEKME (WOS/SCOPUS/SCHOLAR Author Scrapes + Detail Extraction)
-  const hasEmptySourceSlots = Object.values(sourceSlots).some(s => s.active === null);
-  if (hasEmptySourceSlots) {
+  const hasEmptyProfileSlot = activeProfileTask === null;
+  if (hasEmptyProfileSlot) {
     const pickedAuthorTask = await pollScrape();
     if (pickedAuthorTask) {
       scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
@@ -373,62 +365,54 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 // ═══════════════════════════════════════════════
 
 async function pollScrape() {
-  // Poll each source independently — allows parallel scraping across sources
-  const sources = ['WOS', 'SCOPUS', 'SCHOLAR'];
-  const availableSources = sources.filter(src => !sourceSlots[src].active);
-
-  if (availableSources.length === 0) {
-    return false; // All source slots occupied
+  // Only one profile task at a time (serial across WOS/SCOPUS/SCHOLAR)
+  if (activeProfileTask !== null) {
+    return false;
   }
+
+  const sources = ['WOS', 'SCOPUS', 'SCHOLAR'];
 
   try {
     const headers = await brokerHeaders();
-    let pickedAny = false;
 
-    // Poll all available sources in parallel
-    const results = await Promise.allSettled(
-      availableSources.map(src =>
-        fetch(`${API_BASE}/api/tasks/poll?source=${src}`, { headers })
-          .then(async r => {
-            if (r.status === 204 || !r.ok) return null;
-            const data = await r.json();
-            return data?.taskId ? { ...data, _pollSource: src } : null;
-          })
-      )
-    );
+    for (const src of sources) {
+      const res = await fetch(`${API_BASE}/api/tasks/poll?source=${src}`, { headers });
+      if (res.status === 204 || !res.ok) continue;
 
-    // Process all returned tasks — each gets its own source slot
-    for (const result of results) {
-      if (result.status !== 'fulfilled' || !result.value) continue;
+      const data = await res.json();
+      if (data?.taskId) {
+        const { taskId, externalId, source, redirectUrl, taskType } = data;
+        const effectiveSource = source || src;
 
-      const task = result.value;
-      const { taskId, externalId, source, redirectUrl, taskType } = task;
-      const effectiveSource = source || task._pollSource;
+        if (taskId != null && externalId) {
+          console.log(`[WoS Worker] New ${effectiveSource} task. ID: ${taskId}, ExtID: ${externalId}, Type: ${taskType || 'FULL_SCRAPE'}`);
 
-      if (taskId != null && externalId && !sourceSlots[effectiveSource]?.active) {
-        pickedAny = true;
-        console.log(`[WoS Worker] New ${effectiveSource} task. ID: ${taskId}, ExtID: ${externalId}, Type: ${taskType || 'FULL_SCRAPE'}`);
+          activeProfileTask = {
+            taskId,
+            source: effectiveSource,
+            externalId,
+            taskType: taskType || 'FULL_SCRAPE'
+          };
 
-        sourceSlots[effectiveSource].active = taskId;
+          // Track in diagnostics
+          diagAddTask(taskId, effectiveSource, externalId, taskType || 'FULL_SCRAPE');
 
-        // Track in diagnostics
-        diagAddTask(taskId, effectiveSource, externalId, taskType || 'FULL_SCRAPE');
+          updateState({
+            status: 'INITIALIZING',
+            taskId,
+            targetId: externalId,
+            progress: { current: 0, total: 0, label: `Initializing ${effectiveSource} task...` },
+            stats: { pagesScanned: 0, articlesFound: 0, detailsExtracted: 0 }
+          });
+          addLog(`New ${effectiveSource} Task (ID: ${taskId}, Type: ${taskType || 'FULL_SCRAPE'})`, 'success');
 
-        updateState({
-          status: 'INITIALIZING',
-          taskId,
-          targetId: externalId,
-          progress: { current: 0, total: 0, label: `Initializing ${effectiveSource} task...` },
-          stats: { pagesScanned: 0, articlesFound: 0, detailsExtracted: 0 }
-        });
-        addLog(`New ${effectiveSource} Task (ID: ${taskId}, Type: ${taskType || 'FULL_SCRAPE'})`, 'success');
-
-        // Human-like delay between opening tabs for different sources
-        await humanDelay(800, 2500);
-        await openTaskTab(taskId, externalId, effectiveSource, redirectUrl || null, taskType || 'FULL_SCRAPE');
+          await humanDelay(800, 2500);
+          await openTaskTab(taskId, externalId, effectiveSource, redirectUrl || null, taskType || 'FULL_SCRAPE');
+          return true;
+        }
       }
     }
-    return pickedAny;
+    return false;
   } catch (err) {
     if (appState.status !== 'IDLE') {
       console.warn('[WoS Worker] Scrape poll failed:', err);
@@ -527,19 +511,17 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
     url = `${baseUrl}#wos-task-id=${taskId}`;
   }
 
-  // Open in a new tab instead of a new window
-  const isActive = source === 'SCOPUS'; // User request: make Scopus active
-
+  // Always open as ACTIVE tab so the content script can navigate properly
   const tab = await chrome.tabs.create({
     url,
-    active: isActive,
+    active: true,
   });
 
   const tabId = tab.id;
   await chrome.storage.session.set({ [tabId]: { taskId, externalId, source, taskType: taskType || 'FULL_SCRAPE' } });
 
   pendingTabs.set(tabId, { taskId, source, taskType: taskType || 'FULL_SCRAPE', openedAt: Date.now(), readyAt: null });
-  addLog(`Opened ${source} tab (${isActive ? 'focused' : 'background'}, ${taskType || 'FULL_SCRAPE'})`, 'info');
+  addLog(`Opened ${source} tab (focused, ${taskType || 'FULL_SCRAPE'})`, 'info');
 
   // Pre-ready timeout: if SCRAPE_READY is not received within 60s, fail gracefully
   setTimeout(async () => {
@@ -563,10 +545,9 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
 function clearPendingTab(tabId) {
   const entry = pendingTabs.get(tabId);
   if (entry) {
-    // Free the source slot
-    const src = entry.source;
-    if (sourceSlots[src] && sourceSlots[src].active === entry.taskId) {
-      sourceSlots[src].active = null;
+    // Free the global profile task slot
+    if (activeProfileTask && activeProfileTask.taskId === entry.taskId) {
+      activeProfileTask = null;
     }
     pendingTabs.delete(tabId);
   }
