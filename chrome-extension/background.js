@@ -71,9 +71,12 @@ const pendingScholarDoiTabs = new Map(); // tabId → { taskId, doi }
 let wosDoiPoolSize = 1;     // Conservative: 1 at a time
 let scholarDoiPoolSize = 1; // Strict: 1 at a time
 
-// Handshake: Pre-ready timeout (60s) — if SCRAPE_READY not received, fail gracefully
-const PRE_READY_TIMEOUT_MS = 60_000;
-const SCRAPE_TIMEOUT_MS = 300_000; // 5 minutes after SCRAPE_READY
+// Handshake: Pre-ready timeout (90s) — if SCRAPE_READY not received, fail gracefully
+const PRE_READY_TIMEOUT_MS = 90_000;
+const SCRAPE_TIMEOUT_MS = 600_000; // 10 minutes after SCRAPE_READY (extended on progress)
+
+// Active scrape timeout trackers (tabId → timeoutId)
+const scrapeTimeouts = new Map();
 
 // Adaptive detail tab pool
 let detailPoolSize = 1;          // Conservative: 1 at a time
@@ -568,6 +571,11 @@ function clearPendingTab(tabId) {
     }
     pendingTabs.delete(tabId);
   }
+  // Clear scrape timeout if exists
+  if (scrapeTimeouts.has(tabId)) {
+    clearTimeout(scrapeTimeouts.get(tabId));
+    scrapeTimeouts.delete(tabId);
+  }
   chrome.storage.session.remove(String(tabId));
 }
 
@@ -581,8 +589,9 @@ async function handleTaskTimeout(tabId) {
   const { taskId } = entry;
 
   console.error(`[WoS Worker] Task ID: ${taskId} zaman aşımı.`);
-  addLog(`Task timed out`, 'error');
+  addLog(`Task timed out after ${SCRAPE_TIMEOUT_MS/60000} min of inactivity`, 'error');
   updateState({ status: 'TIMEOUT' });
+  scrapeTimeouts.delete(tabId);
   clearPendingTab(tabId);
 
   for (const [jTaskId, job] of detailJobs.entries()) {
@@ -766,6 +775,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'PROGRESS_UPDATE') {
+    const tabId = sender.tab?.id;
+    // Extend scrape timeout on any progress (prevent false timeout on long scrapes)
+    if (tabId != null && scrapeTimeouts.has(tabId)) {
+      clearTimeout(scrapeTimeouts.get(tabId));
+      const entry = pendingTabs.get(tabId);
+      if (entry) {
+        const newTimeout = setTimeout(() => {
+          const current = pendingTabs.get(tabId);
+          if (current && current.taskId === entry.taskId) {
+            handleTaskTimeout(tabId);
+          }
+        }, SCRAPE_TIMEOUT_MS);
+        scrapeTimeouts.set(tabId, newTimeout);
+      }
+    }
     if (msg.stats) {
       updateState({ stats: { ...appState.stats, ...msg.stats } });
     }
