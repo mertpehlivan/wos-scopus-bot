@@ -35,39 +35,56 @@
         return null;
     }
 
-    function setNativeValue(element, value) {
-        console.log('[WoS Session] Setting value for', element.name || element.id);
+    async function setNativeValue(element, value) {
+        console.log('[WoS Session] Typing value for', element.name || element.id);
         
-        // Focus and click to activate MDC floating label
-        element.focus();
+        element.scrollIntoView({ block: 'center', behavior: 'instant' });
+        await _humanDelay(50, 150);
+
+        // Simulate click and focus
+        element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
         element.click();
-        element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-        element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        element.focus();
+        element.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
 
-        // Clear existing value
-        element.value = '';
+        await _humanDelay(100, 200);
+
+        // Clear existing value safely
+        try {
+            let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(element, '');
+        } catch (e) {
+            element.value = '';
+        }
         element.dispatchEvent(new Event('input', { bubbles: true }));
+        await _humanDelay(50, 100);
 
-        // Use execCommand for real browser text insertion (best for Angular Reactive Forms)
-        document.execCommand('insertText', false, value);
-
-        // Fallback if execCommand failed
-        if (element.value !== value) {
-            console.log('[WoS Session] execCommand failed, using fallback setter');
+        // Type character by character
+        for (let i = 0; i < value.length; i++) {
+            const char = value[i];
             try {
-                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                nativeSetter.call(element, value);
+                let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(element, element.value + char);
             } catch (e) {
-                element.value = value;
+                element.value += char;
             }
-            element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: value }));
+            element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+            element.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
+            element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: char }));
             element.dispatchEvent(new Event('input', { bubbles: true }));
-            element.dispatchEvent(new Event('change', { bubbles: true }));
+            element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+            await _humanDelay(10, 40); // Fast human typing
         }
 
-        // Blur to trigger Angular touched/dirty validation
-        element.dispatchEvent(new Event('blur', { bubbles: true }));
-        console.log('[WoS Session] Value set. Current value:', element.value);
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        await _humanDelay(100, 200);
+
+        // Blur to trigger final validation
+        element.blur();
+        element.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+
+        console.log('[WoS Session] Typing complete. Current value:', element.value);
     }
 
     // ── Step 1: Dismiss Pendo popup ──
@@ -163,24 +180,17 @@
         console.log('[WoS Session] Filling login credentials (Angular-aware)');
 
         // Fill email
-        emailInput.click();
-        emailInput.focus();
-        await _humanDelay(100, 300);
-        setNativeValue(emailInput, CONFIG.email);
-        await _humanDelay(200, 500);
+        await setNativeValue(emailInput, CONFIG.email);
+        await _humanDelay(200, 400);
 
         // Fill password
-        passwordInput.click();
-        passwordInput.focus();
-        await _humanDelay(100, 300);
-        setNativeValue(passwordInput, CONFIG.password);
+        await setNativeValue(passwordInput, CONFIG.password);
         await _humanDelay(400, 800);
 
         // Submit — click button + dispatch form submit for Angular
         const form = document.querySelector('form[name="loginForm"], form.steam-login-panel');
         if (submitBtn) {
             console.log('[WoS Session] Clicking Sign In submit button');
-            submitBtn.click();
             submitBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
             await _humanDelay(200, 400);
             submitBtn.click();
