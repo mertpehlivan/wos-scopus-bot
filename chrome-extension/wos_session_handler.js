@@ -36,25 +36,38 @@
     }
 
     function setNativeValue(element, value) {
-        // Dispatch mouse events first
+        console.log('[WoS Session] Setting value for', element.name || element.id);
+        
+        // Focus and click to activate MDC floating label
+        element.focus();
+        element.click();
         element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
         element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-        element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-        element.dispatchEvent(new FocusEvent('focusin', { bubbles: true, cancelable: true }));
 
-        try {
-            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            nativeSetter.call(element, value);
-        } catch (e) {
-            element.value = value;
+        // Clear existing value
+        element.value = '';
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+
+        // Use execCommand for real browser text insertion (best for Angular Reactive Forms)
+        document.execCommand('insertText', false, value);
+
+        // Fallback if execCommand failed
+        if (element.value !== value) {
+            console.log('[WoS Session] execCommand failed, using fallback setter');
+            try {
+                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                nativeSetter.call(element, value);
+            } catch (e) {
+                element.value = value;
+            }
+            element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: value }));
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
         }
 
-        element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: value }));
-        element.dispatchEvent(new Event('input', { bubbles: true }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-        // Simulate keystrokes so Angular material marks it dirty/touched
-        element.dispatchEvent(new KeyboardEvent('keydown', { key: value.slice(-1) || 'a', bubbles: true }));
-        element.dispatchEvent(new KeyboardEvent('keyup', { key: value.slice(-1) || 'a', bubbles: true }));
+        // Blur to trigger Angular touched/dirty validation
+        element.dispatchEvent(new Event('blur', { bubbles: true }));
+        console.log('[WoS Session] Value set. Current value:', element.value);
     }
 
     // ── Step 1: Dismiss Pendo popup ──
