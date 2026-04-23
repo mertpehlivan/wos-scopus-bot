@@ -14,6 +14,7 @@
     "*://*.scopus.com/*",
     "*://*.plu.mx/*",
     "*://scholar.google.com/*",
+    "*://*.clarivate.com/*",
     "http://localhost:8080/*",
     "http://localhost:8081/*"
   ],
@@ -143,12 +144,14 @@
     },
     {
       "matches": [
-        "*://*.webofscience.com/*"
+        "*://*.webofscience.com/*",
+        "*://*.clarivate.com/*"
       ],
       "js": [
         "wos_session_handler.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "world": "MAIN"
     }
   ]
 }
