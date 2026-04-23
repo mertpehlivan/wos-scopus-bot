@@ -35,6 +35,22 @@
         return null;
     }
 
+    // Angular-aware value setter — triggers change detection properly
+    function setNativeValue(element, value) {
+        try {
+            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeSetter.call(element, value);
+        } catch (e) {
+            element.value = value;
+        }
+        element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: value }));
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        // Simulate keystrokes so Angular material marks it dirty/touched
+        element.dispatchEvent(new KeyboardEvent('keydown', { key: value.slice(-1) || 'a', bubbles: true }));
+        element.dispatchEvent(new KeyboardEvent('keyup', { key: value.slice(-1) || 'a', bubbles: true }));
+    }
+
     // ── Step 1: Dismiss Pendo popup ──
     async function dismissPendoPopup() {
         const pendoContainer = document.querySelector('[id^="pendo-g-"]');
@@ -117,56 +133,39 @@
 
     // ── Step 3: Fill credentials and submit ──
     async function fillAndSubmitLogin() {
-        const emailInput = getVisibleElement([
-            'input#mat-input-1',
-            'input[name="email"]',
-            'input[formcontrolname="email"]',
-            'input[type="email"]'
-        ]);
-        const passwordInput = getVisibleElement([
-            'input#mat-input-0',
-            'input[name="password"]',
-            'input[formcontrolname="password"]'
-        ]);
-        const submitBtn = getVisibleElement([
-            'button#signIn-btn',
-            'button[type="submit"][name="login-btn"]',
-            'form[name="loginForm"] button[type="submit"]'
-        ]);
+        const emailInput = document.querySelector('input#mat-input-1, input[name="email"], input[formcontrolname="email"], input[type="email"]');
+        const passwordInput = document.querySelector('input#mat-input-0, input[name="password"], input[formcontrolname="password"]');
+        const submitBtn = document.querySelector('button#signIn-btn, button[type="submit"][name="login-btn"], form[name="loginForm"] button[type="submit"]');
 
         if (!emailInput || !passwordInput) {
             return false;
         }
 
-        console.log('[WoS Session] Filling login credentials');
+        console.log('[WoS Session] Filling login credentials (Angular-aware)');
 
         // Fill email
         emailInput.focus();
         await _humanDelay(100, 300);
-        emailInput.value = CONFIG.email;
-        emailInput.dispatchEvent(new Event('input', { bubbles: true }));
-        emailInput.dispatchEvent(new Event('change', { bubbles: true }));
+        setNativeValue(emailInput, CONFIG.email);
         await _humanDelay(200, 500);
 
         // Fill password
         passwordInput.focus();
         await _humanDelay(100, 300);
-        passwordInput.value = CONFIG.password;
-        passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
-        passwordInput.dispatchEvent(new Event('change', { bubbles: true }));
+        setNativeValue(passwordInput, CONFIG.password);
         await _humanDelay(400, 800);
 
-        // Submit
+        // Submit — click button + dispatch form submit for Angular
+        const form = document.querySelector('form[name="loginForm"], form.steam-login-panel');
         if (submitBtn) {
             console.log('[WoS Session] Clicking Sign In submit button');
             submitBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
             await _humanDelay(200, 400);
             submitBtn.click();
-        } else {
-            const form = document.querySelector('form[name="loginForm"], form.steam-login-panel');
-            if (form) {
-                form.dispatchEvent(new Event('submit', { bubbles: true }));
-            }
+        }
+        if (form) {
+            console.log('[WoS Session] Dispatching form submit event');
+            form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
         }
         await _humanDelay(1000, 2000);
         return true;
@@ -180,7 +179,7 @@
 
             // 2. If login form is already visible, fill & submit
             const emailInput = document.querySelector('input[name="email"], input[formcontrolname="email"], input#mat-input-1');
-            if (isVisible(emailInput)) {
+            if (emailInput) {
                 await fillAndSubmitLogin();
                 return true;
             }
