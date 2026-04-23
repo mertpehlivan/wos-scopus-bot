@@ -72,7 +72,7 @@ let wosDoiPoolSize = 1;     // Conservative: 1 at a time
 let scholarDoiPoolSize = 1; // Strict: 1 at a time
 
 // Handshake: Pre-ready timeout (90s) — if SCRAPE_READY not received, fail gracefully
-const PRE_READY_TIMEOUT_MS = 90_000;
+const PRE_READY_TIMEOUT_MS = 180_000;
 const SCRAPE_TIMEOUT_MS = 600_000; // 10 minutes after SCRAPE_READY (extended on progress)
 
 // Active scrape timeout trackers (tabId → timeoutId)
@@ -295,6 +295,8 @@ async function runPriorityOrchestrator() {
 
   // Count active tasks for Phase 1 (Yayın Bulma / Detay Doldurma)
   let activeAuthorTasks = activeProfileTask !== null ? 1 : 0;
+  // Citation Report tabs count as active author work — don't start SCOPUS until they finish
+  activeAuthorTasks += pendingCitationReportTabs.size;
   let activeDetailJobs = detailJobs.size;
 
   // PRIORITY 1: YAYIN BULMA VE DETAY ÇEKME (WOS/SCOPUS/SCHOLAR Author Scrapes + Detail Extraction)

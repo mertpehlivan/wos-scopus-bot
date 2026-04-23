@@ -140,6 +140,15 @@
         "wos_citation_report_content.js"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.webofscience.com/*"
+      ],
+      "js": [
+        "wos_session_handler.js"
+      ],
+      "run_at": "document_idle"
     }
   ]
 }
