@@ -293,14 +293,13 @@ async function runPriorityOrchestrator() {
     return;
   }
 
-  // Count active tasks for Phase 1 (Yayın Bulma / Detay Doldurma)
   let activeAuthorTasks = activeProfileTask !== null ? 1 : 0;
   // Citation Report tabs count as active author work — don't start SCOPUS until they finish
   activeAuthorTasks += pendingCitationReportTabs.size;
   let activeDetailJobs = detailJobs.size;
 
   // PRIORITY 1: YAYIN BULMA VE DETAY ÇEKME (WOS/SCOPUS/SCHOLAR Author Scrapes + Detail Extraction)
-  const hasEmptyProfileSlot = activeProfileTask === null;
+  const hasEmptyProfileSlot = activeAuthorTasks === 0;
   if (hasEmptyProfileSlot) {
     const pickedAuthorTask = await pollScrape();
     if (pickedAuthorTask) {
@@ -1357,20 +1356,22 @@ async function finalizeAndComplete(taskId) {
     markSourceComplete(source, true);
   }
 
-  // Author tab'ını kapat
-  clearPendingTab(authorTabId);
-  try { await chrome.tabs.remove(authorTabId); } catch (_) { }
-
   // ── Citation Report Tab'ını Aç (detay scraping'den sonra) ──
   // Eğer bu task için kaydedilmiş bir Citation Report linki varsa aç
   const savedLink = savedCitationReportLinks.get(taskId);
   if (savedLink) {
     addLog(`Opening Citation Report tab for task ${taskId}...`, 'info');
-    // Citation Report tab'ını aç (asenkron, beklemiyoruz)
-    openCitationReportTab(taskId).catch(err => {
+    // Await so the tab is created and added to pendingCitationReportTabs BEFORE we clear activeProfileTask
+    try {
+      await openCitationReportTab(taskId);
+    } catch (err) {
       console.warn('[WoS Worker] Failed to open Citation Report tab:', err);
-    });
+    }
   }
+
+  // Author tab'ını kapat (bu işlem activeProfileTask'i null yapar)
+  clearPendingTab(authorTabId);
+  try { await chrome.tabs.remove(authorTabId); } catch (_) { }
 
   updateState({
     status: 'IDLE', taskId: null, targetId: null,
