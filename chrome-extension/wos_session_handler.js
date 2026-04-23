@@ -35,14 +35,20 @@
         return null;
     }
 
-    // Angular-aware value setter — triggers change detection properly
     function setNativeValue(element, value) {
+        // Dispatch mouse events first
+        element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        element.dispatchEvent(new FocusEvent('focusin', { bubbles: true, cancelable: true }));
+
         try {
             const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
             nativeSetter.call(element, value);
         } catch (e) {
             element.value = value;
         }
+
         element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: value }));
         element.dispatchEvent(new Event('input', { bubbles: true }));
         element.dispatchEvent(new Event('change', { bubbles: true }));
@@ -144,12 +150,14 @@
         console.log('[WoS Session] Filling login credentials (Angular-aware)');
 
         // Fill email
+        emailInput.click();
         emailInput.focus();
         await _humanDelay(100, 300);
         setNativeValue(emailInput, CONFIG.email);
         await _humanDelay(200, 500);
 
         // Fill password
+        passwordInput.click();
         passwordInput.focus();
         await _humanDelay(100, 300);
         setNativeValue(passwordInput, CONFIG.password);
@@ -159,6 +167,7 @@
         const form = document.querySelector('form[name="loginForm"], form.steam-login-panel');
         if (submitBtn) {
             console.log('[WoS Session] Clicking Sign In submit button');
+            submitBtn.click();
             submitBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
             await _humanDelay(200, 400);
             submitBtn.click();
