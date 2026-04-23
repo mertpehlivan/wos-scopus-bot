@@ -76,7 +76,7 @@
         return false;
     }
 
-    // ── Step 2: Click header "Sign In" button ──
+    // ── Step 2: Click header "Sign In" button (opens dropdown menu) ──
     async function clickHeaderSignIn() {
         const btns = Array.from(document.querySelectorAll('button, a'));
         const signInBtn = btns.find(b => {
@@ -88,6 +88,27 @@
             signInBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
             await _humanDelay(200, 500);
             signInBtn.click();
+            await _humanDelay(800, 1500);
+            return true;
+        }
+        return false;
+    }
+
+    // ── Step 2b: Click "Sign In" inside the opened dropdown menu ──
+    async function clickMenuSignIn() {
+        const menuPanel = document.querySelector('.mat-mdc-menu-panel');
+        if (!menuPanel || !isVisible(menuPanel)) return false;
+
+        const signInItem = Array.from(menuPanel.querySelectorAll('a[role="menuitem"], button[role="menuitem"], .mat-mdc-menu-item')).find(el => {
+            const text = (el.textContent || '').trim().toLowerCase();
+            return text === 'sign in';
+        });
+
+        if (signInItem) {
+            console.log('[WoS Session] Clicking Sign In menu item');
+            signInItem.scrollIntoView({ block: 'center', behavior: 'instant' });
+            await _humanDelay(200, 400);
+            signInItem.click();
             await _humanDelay(800, 1500);
             return true;
         }
@@ -164,7 +185,20 @@
                 return true;
             }
 
-            // 3. If header "Sign In" button is visible, click it to reveal the form
+            // 3. If a dropdown menu is open with Sign In inside, click it
+            const menuPanel = document.querySelector('.mat-mdc-menu-panel');
+            if (menuPanel && isVisible(menuPanel)) {
+                const menuSignIn = Array.from(menuPanel.querySelectorAll('a[role="menuitem"], button[role="menuitem"], .mat-mdc-menu-item')).find(el => {
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    return text === 'sign in';
+                });
+                if (menuSignIn) {
+                    await clickMenuSignIn();
+                    return true;
+                }
+            }
+
+            // 4. If header "Sign In" button is visible, click it to open the dropdown
             const signInBtn = Array.from(document.querySelectorAll('button, a')).find(b => {
                 const text = (b.textContent || '').trim().toLowerCase();
                 return text === 'sign in' && isVisible(b);
