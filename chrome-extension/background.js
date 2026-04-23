@@ -293,28 +293,19 @@ async function runPriorityOrchestrator() {
     return;
   }
 
+  // Count active tasks for Phase 1 (Yayın Bulma / Detay Doldurma / Atıf Raporu)
   let activeAuthorTasks = activeProfileTask !== null ? 1 : 0;
-  // Citation Report tabs count as active author work — don't start SCOPUS until they finish
   activeAuthorTasks += pendingCitationReportTabs.size;
   let activeDetailJobs = detailJobs.size;
 
-  // PRIORITY 1: YAYIN BULMA VE DETAY ÇEKME (WOS/SCOPUS/SCHOLAR Author Scrapes + Detail Extraction)
-  const hasEmptyProfileSlot = activeAuthorTasks === 0;
-  if (hasEmptyProfileSlot) {
-    const pickedAuthorTask = await pollScrape();
-    if (pickedAuthorTask) {
-      scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-      return;
-    }
-  }
-
-  // Do not start Phase 2 or 3 until Phase 1 is idle to enforce "bulma/doldurma önce, atıf sonra"
+  // PRIORITY 1: Mevcut Profil veya Detay/Atıf Raporu işlemi varsa, bitmesini bekle
   if (activeAuthorTasks > 0 || activeDetailJobs > 0) {
     scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
     return;
   }
 
   // PRIORITY 2: WOS DOI ENRICHMENT (Özet / Q Değeri / IF Doldurma)
+  // Profil çekimi bittikten sonra sıraya giren makalelerin WOS DOI işlemlerini tamamla
   const activeWosDoi = pendingWosDoiTabs.size;
   if (activeWosDoi < wosDoiPoolSize) {
     const pickedWosDoi = await pollWosDoi();
@@ -330,6 +321,7 @@ async function runPriorityOrchestrator() {
   }
 
   // PRIORITY 3: PLUMX & SCHOLAR DOI (Atıfları Bulma)
+  // WOS DOI bittikten sonra eğer bekleyen atıf güncelleme görevleri varsa onları tamamla
   const activeScholar = pendingScholarDoiTabs.size;
   const activePlumx = pendingPlumx.size;
   let pickedCitationTask = false;
@@ -343,8 +335,16 @@ async function runPriorityOrchestrator() {
   }
 
   if (pickedCitationTask || activeScholar > 0 || activePlumx > 0) {
-    // Much slower polling for Citations to prevent Google Scholar IP bans
+    // Daha yavaş polling (Google Scholar IP ban riskine karşı)
     scheduleOrchestrator(jitteredInterval(25000, 25));
+    return;
+  }
+
+  // PRIORITY 4: YENİ PROFİL ÇEKME (WOS -> SCOPUS -> SCHOLAR)
+  // Bütün alt görevler (DOI, PlumX vb.) tamamen bittikten SONRA yeni kaynak ara!
+  const pickedAuthorTask = await pollScrape();
+  if (pickedAuthorTask) {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
     return;
   }
 
