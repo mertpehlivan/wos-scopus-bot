@@ -7,6 +7,7 @@ import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -20,6 +21,13 @@ public interface ArticleTaskRepository extends JpaRepository<ArticleTask, Long> 
             TargetSource targetSource,
             String externalId,
             List<TaskStatus> statuses);
+
+    @Modifying
+    @Query("DELETE FROM ArticleTask t WHERE t.targetSource = :targetSource AND t.externalId = :externalId AND t.status IN :statuses")
+    void deleteByTargetSourceAndExternalIdAndStatusIn(
+            @Param("targetSource") TargetSource targetSource,
+            @Param("externalId") String externalId,
+            @Param("statuses") List<TaskStatus> statuses);
 
     /**
      * Worker poll: select one PENDING task for the given source and lock it
@@ -35,7 +43,13 @@ public interface ArticleTaskRepository extends JpaRepository<ArticleTask, Long> 
     @Query("SELECT t FROM ArticleTask t WHERE t.id = :id")
     Optional<ArticleTask> findByIdForUpdate(@Param("id") Long id);
 
-    List<ArticleTask> findByStatusOrderByCreatedAtAsc(TaskStatus status);
+    /**
+     * Claim all COMPLETED tasks atomically — PESSIMISTIC_WRITE prevents two concurrent
+     * consume() calls from returning the same tasks (race condition fix).
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT t FROM ArticleTask t WHERE t.status = com.academic.broker.domain.TaskStatus.COMPLETED ORDER BY t.createdAt ASC")
+    List<ArticleTask> findCompletedForConsume();
 
     /**
      * Find tasks stuck in PROCESSING longer than the given cutoff (for timeout
@@ -51,4 +65,16 @@ public interface ArticleTaskRepository extends JpaRepository<ArticleTask, Long> 
     Optional<ArticleTask> findTopByTargetSourceAndExternalIdOrderByIdDesc(
             TargetSource targetSource,
             String externalId);
+
+    @Modifying
+    @Query("UPDATE ArticleTask t SET t.status = 'PENDING', t.updatedAt = CURRENT_TIMESTAMP WHERE t.targetSource = :source AND t.status = 'FAILED'")
+    int resetFailedToPendingBySource(@Param("source") TargetSource source);
+
+    @Modifying
+    @Query("DELETE FROM ArticleTask t WHERE t.targetSource = :source")
+    int deleteAllBySource(@Param("source") TargetSource source);
+
+    @Modifying
+    @Query("DELETE FROM ArticleTask t")
+    int deleteAllTasks();
 }

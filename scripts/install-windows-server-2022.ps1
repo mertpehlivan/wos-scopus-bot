@@ -34,7 +34,7 @@ $PgServiceName = "postgresql-x64-$PgVersion"
 $PgSuperPass   = "password"
 $PgDbName      = "article_broker"
 $PgUser        = "postgres"
-$PgBinZipUrl    = "https://get.enterprisedb.com/postgresql/postgresql-16.6-1-windows-x64-binaries.zip"
+$PgBinZipUrl    = "https://get.enterprisedb.com/postgresql/postgresql-16.8-1-windows-x64-binaries.zip"
 $PgDefaultDir   = "C:\Program Files\PostgreSQL\$PgVersion"
 $PgBinDir       = "$PgDefaultDir\bin"
 $PgDataDir      = "$PgDefaultDir\data"
@@ -324,9 +324,12 @@ if (Test-Path $nssmExe) {
     Write-Host "    NSSM zaten mevcut." -ForegroundColor Green
 } else {
     $nssmUrls = @(
+        # Official NSSM release from Iain Patterson's GitHub (most reliable)
+        "https://github.com/nicowillis/nssm/releases/download/nssm-2.24/nssm-2.24.zip",
+        # nssm.cc primary (may be slow/down)
         "https://nssm.cc/release/nssm-2.24.zip",
-        "https://github.com/kirillkovalenko/nssm/releases/download/nssm-2.24/nssm-2.24.zip",
-        "https://github.com/lehungio/nssm/releases/download/2.24/nssm-2.24.zip"
+        # GitHub mirror fallback
+        "https://github.com/nickelc/nssm/releases/download/v2.24/nssm-2.24.zip"
     )
     $nssmOk = $false
     foreach ($url in $nssmUrls) {

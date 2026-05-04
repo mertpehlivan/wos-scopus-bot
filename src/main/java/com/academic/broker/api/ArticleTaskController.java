@@ -13,6 +13,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -20,6 +21,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/tasks")
@@ -89,6 +92,15 @@ public class ArticleTaskController {
     }
 
     /**
+     * Ana sistem: consume edilen task yerel veritabanÄ±na iÅŸlendikten sonra silinir.
+     */
+    @PostMapping(value = "/{taskId}/ack")
+    public ResponseEntity<Void> ackTask(@PathVariable Long taskId) {
+        taskService.ackConsumedTask(taskId);
+        return ResponseEntity.ok().build();
+    }
+
+    /**
      * Ana sistem: COMPLETED task'ları alır; response'tan sonra veritabanından
      * silinir (ephemeral).
      */
@@ -109,5 +121,27 @@ public class ArticleTaskController {
         return taskService.findLatestStatus(source, externalId)
                 .map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.noContent().build());
+    }
+
+    /**
+     * Reset FAILED tasks to PENDING for a given group (WOS, SCOPUS, SCHOLAR, PLUMX, ALL).
+     */
+    @PostMapping("/refresh-group")
+    public ResponseEntity<Map<String, Object>> refreshGroup(@RequestParam String group) {
+        int updated = taskService.refreshGroup(group);
+        return ResponseEntity.ok(Map.of("group", group, "refreshed", updated));
+    }
+
+    /**
+     * Delete ALL tasks from every table. Requires confirmation.
+     */
+    @DeleteMapping("/reset-all")
+    public ResponseEntity<Map<String, Object>> resetAll(@RequestParam(required = false, defaultValue = "") String confirm) {
+        if (!"RESET_EVERYTHING".equals(confirm)) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("error", "Missing confirmation. Use confirm=RESET_EVERYTHING"));
+        }
+        int deleted = taskService.resetAll();
+        return ResponseEntity.ok(Map.of("deleted", deleted, "status", "all tasks cleared"));
     }
 }

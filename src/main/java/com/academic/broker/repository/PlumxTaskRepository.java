@@ -6,6 +6,7 @@ import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -28,10 +29,23 @@ public interface PlumxTaskRepository extends JpaRepository<PlumxTask, Long> {
     @Query("SELECT t FROM PlumxTask t WHERE t.id = :id")
     Optional<PlumxTask> findByIdForUpdate(@Param("id") Long id);
 
-    List<PlumxTask> findByStatusOrderByCreatedAtAsc(TaskStatus status);
+    /**
+     * Claim all COMPLETED PlumX tasks atomically — race condition fix.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT t FROM PlumxTask t WHERE t.status = com.academic.broker.domain.TaskStatus.COMPLETED ORDER BY t.createdAt ASC")
+    List<PlumxTask> findCompletedForConsume();
 
     @Query("SELECT t FROM PlumxTask t WHERE t.status = com.academic.broker.domain.TaskStatus.PROCESSING AND t.updatedAt < :cutoff")
     List<PlumxTask> findStuckProcessing(@Param("cutoff") Instant cutoff);
 
     Optional<PlumxTask> findTopByDoiOrderByIdDesc(String doi);
+
+    @Modifying
+    @Query("UPDATE PlumxTask t SET t.status = 'PENDING', t.updatedAt = CURRENT_TIMESTAMP WHERE t.status = 'FAILED'")
+    int resetAllFailedToPending();
+
+    @Modifying
+    @Query("DELETE FROM PlumxTask")
+    int deleteAllPlumx();
 }

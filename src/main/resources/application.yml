@@ -6,9 +6,9 @@ spring:
       max-file-size: 50MB
       max-request-size: 50MB
   datasource:
-    url: jdbc:postgresql://localhost:5433/article_broker
-    username: postgres
-    password: password
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/article_broker}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:password}
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 10
@@ -29,12 +29,16 @@ spring:
 broker:
   processing-timeout-minutes: 120
   api-key: ${BROKER_API_KEY:change-me-in-production}
+  # URL of the main backend system that receives Citation Report data
+  backend-url: ${BACKEND_URL:http://localhost:8080}
+  # Chrome extension origin for CORS (set to exact extension ID in production)
+  # Example: BROKER_EXTENSION_ORIGIN=chrome-extension://abcdefghijklmnopabcdefghijklmnop
+  extension-origin: ${BROKER_EXTENSION_ORIGIN:chrome-extension://*}
 
 server:
   port: 8081
   tomcat:
     max-http-post-size: 50MB
-
 
 logging:
   level:

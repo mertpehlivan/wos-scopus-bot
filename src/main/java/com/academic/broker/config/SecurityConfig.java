@@ -27,6 +27,14 @@ public class SecurityConfig {
     @Value("${broker.api-key}")
     private String brokerApiKey;
 
+    /**
+     * Chrome extension origin is read from config — supports any installed extension ID
+     * without requiring a code change or redeploy.
+     * Set via env: BROKER_EXTENSION_ORIGIN=chrome-extension://<extension-id>
+     */
+    @Value("${broker.extension-origin:chrome-extension://*}")
+    private String extensionOrigin;
+
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
@@ -42,13 +50,17 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();
-        // Allow the specific extension origin or all origins for development
-        configuration.setAllowedOrigins(
-                List.of("chrome-extension://mcmkjkiikpglcdefdogomjaehhlkocii", "http://localhost:3000", "*"));
+        // Use allowedOriginPatterns (supports wildcards) instead of setAllowedOrigins
+        // so we don't need to hardcode extension IDs and allowCredentials can be toggled.
+        configuration.setAllowedOriginPatterns(List.of(
+                "chrome-extension://*",  // All Chrome extensions (development-friendly)
+                "http://localhost:*",    // Local development
+                extensionOrigin          // Specific extension ID from config (production override)
+        ));
         configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         configuration.setAllowedHeaders(Arrays.asList("authorization", "content-type", "x-auth-token", "X-Api-Key"));
         configuration.setExposedHeaders(List.of("X-Api-Key"));
-        configuration.setAllowCredentials(false); // Can't be true if allowed origins is *
+        configuration.setAllowCredentials(false);
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", configuration);

@@ -14,6 +14,7 @@ import com.academic.broker.exception.TaskNotFoundException;
 import com.academic.broker.exception.TaskNotProcessableException;
 import com.academic.broker.domain.PlumxTask;
 import com.academic.broker.repository.ArticleTaskRepository;
+import com.academic.broker.repository.DoiEnrichTaskRepository;
 import com.academic.broker.repository.PlumxTaskRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -35,11 +36,14 @@ public class ArticleTaskService {
 
     private final ArticleTaskRepository repository;
     private final PlumxTaskRepository plumxRepository;
+    private final DoiEnrichTaskRepository doiEnrichRepository;
 
     @Value("${broker.processing-timeout-minutes:5}")
     private int processingTimeoutMinutes;
 
-    private static final List<TaskStatus> ACTIVE_STATUSES = List.of(TaskStatus.PENDING, TaskStatus.PROCESSING);
+    private static final List<TaskStatus> ACTIVE_STATUSES = List.of(
+            TaskStatus.PENDING,
+            TaskStatus.PROCESSING);
 
     /**
      * Ana sistem: WoS/Scopus ID'lerini PENDING olarak ekler. Zaten
@@ -51,8 +55,10 @@ public class ArticleTaskService {
         TaskType resolvedType = taskType != null ? taskType : TaskType.FULL_SCRAPE;
         List<String> addedIds = new ArrayList<>();
         for (String externalId : externalIds) {
-            if (!force
-                    && repository.existsByTargetSourceAndExternalIdAndStatusIn(source, externalId, ACTIVE_STATUSES)) {
+            if (force) {
+                // Remove existing active tasks for this externalId to prevent duplicate processing
+                repository.deleteByTargetSourceAndExternalIdAndStatusIn(source, externalId, ACTIVE_STATUSES);
+            } else if (repository.existsByTargetSourceAndExternalIdAndStatusIn(source, externalId, ACTIVE_STATUSES)) {
                 continue;
             }
             ArticleTask task = ArticleTask.builder()
@@ -88,6 +94,7 @@ public class ArticleTaskService {
         task.setStatus(TaskStatus.PROCESSING);
         task.touch();
         repository.save(task);
+        log.info("Task {} polled by extension (source={}, externalId={})", task.getId(), task.getTargetSource(), task.getExternalId());
         return PollTaskResponse.builder()
                 .taskId(task.getId())
                 .source(task.getTargetSource())
@@ -117,6 +124,7 @@ public class ArticleTaskService {
         task.setStatus(TaskStatus.COMPLETED);
         task.touch();
         repository.save(task);
+        log.info("Task {} completed by extension (source={}, externalId={})", taskId, task.getTargetSource(), task.getExternalId());
     }
 
     /**
@@ -138,7 +146,7 @@ public class ArticleTaskService {
         task.setAuthorMetricsData(request.getAuthorMetrics());
         task.touch();
         repository.save(task);
-        log.info("Author metrics saved for task {}", taskId);
+        log.info("Author metrics saved for task {} (source={})", taskId, task.getTargetSource());
     }
 
     /**
@@ -158,15 +166,34 @@ public class ArticleTaskService {
 
     /**
      * Ana sistem: COMPLETED task'ları döndürür ve hemen siler (ephemeral).
+     * PESSIMISTIC_WRITE lock ile aynı anda gelen iki consume çağrısı aynı task'ları alamaz.
      */
     @Transactional
     public ConsumeTasksResponse consumeCompletedTasks() {
-        List<ArticleTask> completed = repository.findByStatusOrderByCreatedAtAsc(TaskStatus.COMPLETED);
+        List<ArticleTask> completed = repository.findCompletedForConsume();
         List<ConsumedTaskDto> dtos = completed.stream()
                 .map(this::toConsumedDto)
                 .collect(Collectors.toList());
-        repository.deleteAll(completed);
+        for (ArticleTask task : completed) {
+            task.setStatus(TaskStatus.PROCESSING);
+            task.touch();
+            repository.save(task);
+        }
         return ConsumeTasksResponse.builder().tasks(dtos).build();
+    }
+
+    /**
+     * Main backend acknowledges that a consumed task has been persisted locally.
+     */
+    @Transactional
+    public void ackConsumedTask(Long taskId) {
+        ArticleTask task = repository.findByIdForUpdate(taskId)
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
+        if (task.getStatus() != TaskStatus.PROCESSING && task.getStatus() != TaskStatus.COMPLETED) {
+            throw new TaskNotProcessableException(taskId, task.getStatus(), "ack");
+        }
+        repository.delete(task);
+        log.info("Task {} acknowledged by backend and deleted", taskId);
     }
 
     /**
@@ -178,15 +205,18 @@ public class ArticleTaskService {
     public void resetStuckProcessingTasks() {
         Instant cutoff = Instant.now().minusSeconds(processingTimeoutMinutes * 60L);
         List<ArticleTask> stuck = repository.findStuckProcessing(cutoff);
-        if (stuck.isEmpty()) {
-            return;
+        if (!stuck.isEmpty()) {
+            for (ArticleTask task : stuck) {
+                if (task.getRawData() != null) {
+                    task.setStatus(TaskStatus.COMPLETED);
+                } else {
+                    task.setStatus(TaskStatus.PENDING);
+                }
+                task.touch();
+                repository.save(task);
+            }
+            log.info("Reset {} stuck PROCESSING task(s) to PENDING", stuck.size());
         }
-        for (ArticleTask task : stuck) {
-            task.setStatus(TaskStatus.PENDING);
-            task.touch();
-            repository.save(task);
-        }
-        log.info("Reset {} stuck PROCESSING task(s) to PENDING", stuck.size());
     }
 
     private ConsumedTaskDto toConsumedDto(ArticleTask t) {
@@ -215,6 +245,55 @@ public class ArticleTaskService {
                         "externalId", t.getExternalId(),
                         "status", t.getStatus().name(),
                         "updatedAt", t.getUpdatedAt() != null ? t.getUpdatedAt().toString() : ""));
+    }
+
+    /**
+     * Reset FAILED tasks to PENDING for a given source group.
+     */
+    @Transactional
+    public int refreshGroup(String group) {
+        int updated = 0;
+        switch (group.toUpperCase()) {
+            case "WOS":
+                updated = repository.resetFailedToPendingBySource(TargetSource.WOS);
+                doiEnrichRepository.resetFailedToPendingBySource("WOS");
+                break;
+            case "SCOPUS":
+                updated = repository.resetFailedToPendingBySource(TargetSource.SCOPUS);
+                break;
+            case "SCHOLAR":
+                updated = repository.resetFailedToPendingBySource(TargetSource.SCHOLAR);
+                doiEnrichRepository.resetFailedToPendingBySource("SCHOLAR");
+                break;
+            case "PLUMX":
+                updated = plumxRepository.resetAllFailedToPending();
+                break;
+            case "ALL":
+                updated += repository.resetFailedToPendingBySource(TargetSource.WOS);
+                updated += repository.resetFailedToPendingBySource(TargetSource.SCOPUS);
+                updated += repository.resetFailedToPendingBySource(TargetSource.SCHOLAR);
+                updated += plumxRepository.resetAllFailedToPending();
+                doiEnrichRepository.resetFailedToPendingBySource("WOS");
+                doiEnrichRepository.resetFailedToPendingBySource("SCHOLAR");
+                break;
+            default:
+                log.warn("Unknown refresh group: {}", group);
+        }
+        log.info("Refreshed {} task(s) for group: {}", updated, group);
+        return updated;
+    }
+
+    /**
+     * Delete ALL tasks from every table. Use with extreme caution.
+     */
+    @Transactional
+    public int resetAll() {
+        int deleted = 0;
+        deleted += repository.deleteAllTasks();
+        deleted += plumxRepository.deleteAllPlumx();
+        deleted += doiEnrichRepository.deleteAllTasks();
+        log.warn("RESET-ALL executed: {} total task records deleted", deleted);
+        return deleted;
     }
 
     /*
@@ -298,7 +377,7 @@ public class ArticleTaskService {
 
     @Transactional
     public ConsumeTasksResponse consumeCompletedPlumxTasks() {
-        List<PlumxTask> completed = plumxRepository.findByStatusOrderByCreatedAtAsc(TaskStatus.COMPLETED);
+        List<PlumxTask> completed = plumxRepository.findCompletedForConsume();
         List<ConsumedTaskDto> dtos = completed.stream()
                 .map(t -> ConsumedTaskDto.builder()
                         .taskId(t.getId())
@@ -307,8 +386,23 @@ public class ArticleTaskService {
                         .rawData(t.getRawData())
                         .build())
                 .collect(Collectors.toList());
-        plumxRepository.deleteAll(completed);
+        for (PlumxTask task : completed) {
+            task.setStatus(TaskStatus.PROCESSING);
+            task.touch();
+            plumxRepository.save(task);
+        }
         return ConsumeTasksResponse.builder().tasks(dtos).build();
+    }
+
+    @Transactional
+    public void ackConsumedPlumxTask(Long taskId) {
+        PlumxTask task = plumxRepository.findByIdForUpdate(taskId)
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
+        if (task.getStatus() != TaskStatus.PROCESSING && task.getStatus() != TaskStatus.COMPLETED) {
+            throw new TaskNotProcessableException(taskId, task.getStatus(), "ack");
+        }
+        plumxRepository.delete(task);
+        log.info("PlumX task {} acknowledged by backend and deleted", taskId);
     }
 
     /**
@@ -319,13 +413,17 @@ public class ArticleTaskService {
     public void resetStuckPlumxTasks() {
         Instant cutoff = Instant.now().minusSeconds(processingTimeoutMinutes * 60L);
         List<PlumxTask> stuck = plumxRepository.findStuckProcessing(cutoff);
-        if (stuck.isEmpty())
-            return;
-        for (PlumxTask task : stuck) {
-            task.setStatus(TaskStatus.PENDING);
-            task.touch();
-            plumxRepository.save(task);
+        if (!stuck.isEmpty()) {
+            for (PlumxTask task : stuck) {
+                if (task.getRawData() != null) {
+                    task.setStatus(TaskStatus.COMPLETED);
+                } else {
+                    task.setStatus(TaskStatus.PENDING);
+                }
+                task.touch();
+                plumxRepository.save(task);
+            }
+            log.info("Reset {} stuck PlumX PROCESSING task(s) to PENDING", stuck.size());
         }
-        log.info("Reset {} stuck PlumX PROCESSING task(s) to PENDING", stuck.size());
     }
 }

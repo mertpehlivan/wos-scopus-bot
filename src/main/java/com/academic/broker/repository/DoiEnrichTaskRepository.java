@@ -3,6 +3,7 @@ package com.academic.broker.repository;
 import com.academic.broker.domain.DoiEnrichTask;
 import com.academic.broker.domain.TaskStatus;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
@@ -30,4 +31,16 @@ public interface DoiEnrichTaskRepository extends JpaRepository<DoiEnrichTask, Lo
     Optional<DoiEnrichTask> findByDoiAndSource(String doi, String source);
 
     List<DoiEnrichTask> findByStatus(TaskStatus status);
+
+    @Modifying
+    @Query("UPDATE DoiEnrichTask t SET t.status = 'PENDING', t.updatedAt = CURRENT_TIMESTAMP WHERE t.source = :source AND t.status = 'FAILED'")
+    int resetFailedToPendingBySource(@Param("source") String source);
+
+    @Modifying
+    @Query("DELETE FROM DoiEnrichTask t WHERE t.source = :source")
+    int deleteAllBySource(@Param("source") String source);
+
+    @Modifying
+    @Query("DELETE FROM DoiEnrichTask")
+    int deleteAllTasks();
 }

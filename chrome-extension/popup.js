@@ -14,6 +14,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let activeTasks = {};
   let logs = [];
   let currentState = null;
+  let groupConfig = { wos: true, scopusPlumx: true, scholar: true };
 
   // ── DOM Refs ─────────────────────────────────────────────────
   const statusPill = document.getElementById('status-pill');
@@ -51,6 +52,11 @@ document.addEventListener('DOMContentLoaded', () => {
     mendeley: document.getElementById('st-mendeley'),
     activeTabs: document.getElementById('st-active-tabs'),
   };
+
+  // Group toggle refs
+  const toggleWos = document.getElementById('toggle-wos');
+  const toggleScopusPlumx = document.getElementById('toggle-scopus-plumx');
+  const toggleScholar = document.getElementById('toggle-scholar');
 
   // ── Tab routing ──────────────────────────────────────────────
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -91,7 +97,36 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.runtime.sendMessage({ type: 'FORCE_POLL' });
   });
 
-  // ── Clear history ────────────────────────────────────────────
+  // ── Group Toggles ────────────────────────────────────────────
+  function loadGroupConfig() {
+    chrome.storage.local.get(['groupConfig'], (r) => {
+      if (r.groupConfig) {
+        groupConfig = r.groupConfig;
+        toggleWos.checked = groupConfig.wos !== false;
+        toggleScopusPlumx.checked = groupConfig.scopusPlumx !== false;
+        toggleScholar.checked = groupConfig.scholar !== false;
+      }
+    });
+  }
+  loadGroupConfig();
+
+  function saveGroupConfig() {
+    groupConfig = {
+      wos: toggleWos.checked,
+      scopusPlumx: toggleScopusPlumx.checked,
+      scholar: toggleScholar.checked,
+    };
+    chrome.storage.local.set({ groupConfig }, () => {
+      // Notify background immediately
+      chrome.runtime.sendMessage({ type: 'GROUP_CONFIG_CHANGED', config: groupConfig });
+    });
+  }
+
+  toggleWos.addEventListener('change', saveGroupConfig);
+  toggleScopusPlumx.addEventListener('change', saveGroupConfig);
+  toggleScholar.addEventListener('change', saveGroupConfig);
+
+  // ── Clear history (Extension only) ───────────────────────────
   document.getElementById('btn-clear-history').addEventListener('click', () => {
     if (!confirm('TÜM state, log, task geçmişi ve açık sekmeler sıfırlanacak. Emin misiniz?')) return;
     chrome.runtime.sendMessage({ type: 'RESET_ALL' }, () => {
@@ -108,6 +143,48 @@ document.addEventListener('DOMContentLoaded', () => {
         if (response) applyDashboardState(response);
       });
     });
+  });
+
+  // ── Reset Backend ────────────────────────────────────────────
+  document.getElementById('btn-reset-backend').addEventListener('click', async () => {
+    if (!confirm('⚠️ DİKKAT: Backend\'deki TÜM task\'lar ve extension state tamamen silinecek. Bu işlem geri alınamaz! Emin misiniz?')) return;
+    if (!confirm('Son teyit: GERÇEKTEN tüm veriyi silmek istiyor musunuz?')) return;
+
+    try {
+      const stored = await chrome.storage.local.get(['brokerApiKey']);
+      const apiKey = stored.brokerApiKey || 'change-me-in-production';
+      const apiBase = 'http://localhost:8081'; // Same as background.js
+
+      // 1. Reset backend
+      const resp = await fetch(`${apiBase}/api/tasks/reset-all?confirm=RESET_EVERYTHING`, {
+        method: 'DELETE',
+        headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' }
+      });
+      let backendResult = {};
+      if (resp.ok) {
+        backendResult = await resp.json();
+      } else {
+        console.warn('[Popup] Backend reset failed:', resp.status);
+      }
+
+      // 2. Reset extension state
+      chrome.runtime.sendMessage({ type: 'RESET_ALL' }, () => {
+        enrichmentHistory = [];
+        cumulativeStats = { wosDone: 0, scholarDone: 0, plumxDone: 0, errors: 0, abstracts: 0, wosCit: 0, schCit: 0, quartiles: 0, mendeley: 0 };
+        activeTasks = {};
+        logs = [];
+        renderStats();
+        renderActivityStrip();
+        renderTaskTable();
+        renderLogs();
+        alert(`✅ Sıfırlama tamamlandı.\nBackend: ${backendResult.deleted || 0} kayıt silindi.`);
+        chrome.runtime.sendMessage({ type: 'GET_DASHBOARD_STATE' }, (response) => {
+          if (response) applyDashboardState(response);
+        });
+      });
+    } catch (err) {
+      alert('❌ Sıfırlama hatası: ' + err.message);
+    }
   });
 
   // ── Initial fetch ────────────────────────────────────────────

@@ -62,6 +62,12 @@ public class PlumxTaskController {
         return ResponseEntity.ok().build();
     }
 
+    @PostMapping(value = "/{taskId}/ack")
+    public ResponseEntity<Void> ackPlumxTask(@PathVariable Long taskId) {
+        taskService.ackConsumedPlumxTask(taskId);
+        return ResponseEntity.ok().build();
+    }
+
     @GetMapping(value = "/consume", produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<ConsumeTasksResponse> consumeCompletedPlumxTasks() {
         ConsumeTasksResponse response = taskService.consumeCompletedPlumxTasks();

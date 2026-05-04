@@ -1,3 +1,10 @@
+# WoS/Scopus Bot — Local Development Database
+# Note: This is NOT for production deployment. The full application stack is deployed
+# natively on Windows Server using scripts/install-windows-server-2022.ps1.
+# This file is used strictly for spinning up a local PostgreSQL 16 instance during development.
+
+version: '3.8'
+
 services:
   postgres:
     image: postgres:16-alpine

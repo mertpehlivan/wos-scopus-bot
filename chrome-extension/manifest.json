@@ -15,7 +15,6 @@
     "*://*.plu.mx/*",
     "*://scholar.google.com/*",
     "*://*.clarivate.com/*",
-    "http://localhost:8080/*",
     "http://localhost:8081/*"
   ],
   "background": {
@@ -144,8 +143,11 @@
     },
     {
       "matches": [
-        "*://*.webofscience.com/*",
-        "*://*.clarivate.com/*"
+        "*://*.webofscience.com/wos/author/*",
+        "*://*.webofscience.com/wos/alldb/basic-search*",
+        "*://*.webofscience.com/wos/woscc/basic-search*",
+        "*://*.clarivate.com/login*",
+        "*://*.clarivate.com/auth/login*"
       ],
       "js": [
         "wos_session_handler.js"

@@ -4,16 +4,23 @@ import com.academic.broker.api.dto.DoiPollResponse;
 import com.academic.broker.domain.DoiEnrichTask;
 import com.academic.broker.domain.TaskStatus;
 import com.academic.broker.repository.DoiEnrichTaskRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
-import java.time.Instant;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 /**
@@ -45,6 +52,11 @@ import java.util.stream.Collectors;
 public class DoiEnrichTaskController {
 
     private final DoiEnrichTaskRepository repository;
+    /** Spring-managed ObjectMapper — uses global serialization config (dates, nulls, etc.) */
+    private final ObjectMapper objectMapper;
+
+    @Value("${broker.backend-url:http://localhost:8080}")
+    private String backendUrl;
 
     // ═══════════════════════════════════════════════
     // Backend → Broker: Queue new tasks
@@ -213,62 +225,70 @@ public class DoiEnrichTaskController {
     // ═══════════════════════════════════════════════
 
     /**
-     * Forwards the completed task result to the main backend Spring Boot service.
-     * The backend URL is hardcoded to localhost:8080 for internal communication.
-     * In production this should be externalized to configuration.
+     * Forwards the completed task result to the main backend Spring Boot service asynchronously.
+     * Using CompletableFuture so the Tomcat request thread is never blocked.
      */
     private void forwardToBackend(Long taskId, Map<String, Object> body, String source) {
-        try {
-            java.net.http.HttpClient client = java.net.http.HttpClient.newHttpClient();
-            String endpoint = "SCHOLAR".equals(source)
-                    ? "http://localhost:8080/api/doi-enrich-tasks/" + taskId + "/scholar-complete"
-                    : "http://localhost:8080/api/doi-enrich-tasks/" + taskId + "/complete";
+        CompletableFuture.runAsync(() -> {
+            try {
+                String endpoint = "SCHOLAR".equals(source)
+                        ? backendUrl + "/api/doi-enrich-tasks/" + taskId + "/scholar-complete"
+                        : backendUrl + "/api/doi-enrich-tasks/" + taskId + "/complete";
 
-            String json = new com.fasterxml.jackson.databind.ObjectMapper()
-                    .writeValueAsString(body);
+                // Use Spring-injected ObjectMapper for consistent serialization
+                String json = objectMapper.writeValueAsString(body);
 
-            java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
-                    .uri(java.net.URI.create(endpoint))
-                    .header("Content-Type", "application/json")
-                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(json))
-                    .timeout(java.time.Duration.ofSeconds(10))
-                    .build();
+                HttpClient client = HttpClient.newBuilder()
+                        .connectTimeout(Duration.ofSeconds(10))
+                        .build();
 
-            java.net.http.HttpResponse<String> response = client.send(request,
-                    java.net.http.HttpResponse.BodyHandlers.ofString());
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(endpoint))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(json))
+                        .timeout(Duration.ofSeconds(15))
+                        .build();
 
-            if (response.statusCode() >= 400) {
-                log.warn("[DoiEnrich Broker] Backend returned {} for task {}", response.statusCode(), taskId);
+                HttpResponse<String> response = client.send(request,
+                        HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() >= 400) {
+                    log.warn("[DoiEnrich Broker] Backend returned {} for task {}", response.statusCode(), taskId);
+                }
+            } catch (Exception e) {
+                log.warn("[DoiEnrich Broker] Failed to forward task {} to backend: {}", taskId, e.getMessage());
             }
-        } catch (Exception e) {
-            log.warn("[DoiEnrich Broker] Failed to forward task {} to backend: {}", taskId, e.getMessage());
-        }
+        });
     }
 
     private void forwardFailureToBackend(Long taskId, String doi, String error, String source) {
-        try {
-            java.net.http.HttpClient client = java.net.http.HttpClient.newHttpClient();
-            String endpoint = "http://localhost:8080/api/doi-enrich-tasks/" + taskId + "/fail";
+        CompletableFuture.runAsync(() -> {
+            try {
+                String endpoint = backendUrl + "/api/doi-enrich-tasks/" + taskId + "/fail";
 
-            Map<String, Object> body = Map.of(
-                    "doi", doi != null ? doi : "",
-                    "error", error != null ? error : "Unknown",
-                    "source", source != null ? source : "Unknown");
+                Map<String, Object> body = Map.of(
+                        "doi", doi != null ? doi : "",
+                        "error", error != null ? error : "Unknown",
+                        "source", source != null ? source : "Unknown");
 
-            String json = new com.fasterxml.jackson.databind.ObjectMapper()
-                    .writeValueAsString(body);
+                String json = objectMapper.writeValueAsString(body);
 
-            java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
-                    .uri(java.net.URI.create(endpoint))
-                    .header("Content-Type", "application/json")
-                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(json))
-                    .timeout(java.time.Duration.ofSeconds(10))
-                    .build();
+                HttpClient client = HttpClient.newBuilder()
+                        .connectTimeout(Duration.ofSeconds(10))
+                        .build();
 
-            client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(endpoint))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(json))
+                        .timeout(Duration.ofSeconds(10))
+                        .build();
 
-        } catch (Exception e) {
-            log.warn("[DoiEnrich Broker] Failed to forward failure for task {} to backend: {}", taskId, e.getMessage());
-        }
+                client.send(request, HttpResponse.BodyHandlers.ofString());
+
+            } catch (Exception e) {
+                log.warn("[DoiEnrich Broker] Failed to forward failure for task {} to backend: {}", taskId, e.getMessage());
+            }
+        });
     }
 }

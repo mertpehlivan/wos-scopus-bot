@@ -71,9 +71,15 @@ const pendingScholarDoiTabs = new Map(); // tabId → { taskId, doi }
 let wosDoiPoolSize = 1;     // Conservative: 1 at a time
 let scholarDoiPoolSize = 1; // Strict: 1 at a time
 
-// Handshake: Pre-ready timeout (90s) — if SCRAPE_READY not received, fail gracefully
-const PRE_READY_TIMEOUT_MS = 180_000;
-const SCRAPE_TIMEOUT_MS = 600_000; // 10 minutes after SCRAPE_READY (extended on progress)
+// ─── Timeout Configuration ────────────────────────────────────────────────────
+// IMPORTANT: These must be shorter than broker.processing-timeout-minutes (120min = 7_200_000ms)
+// so the extension always reports fail/complete BEFORE the broker resets the task.
+//
+// PRE_READY_TIMEOUT_MS  — If content script never signals SCRAPE_READY, give up after 3 min.
+// SCRAPE_TIMEOUT_MS     — Maximum time allowed after SCRAPE_READY. Extended on PROGRESS_UPDATE.
+//                         Must be < broker timeout so extension fails tasks before broker resets them.
+const PRE_READY_TIMEOUT_MS = 180_000;   // 3 minutes  (broker: 120 min)
+const SCRAPE_TIMEOUT_MS    = 3_600_000; // 60 minutes — raised from 10 min to allow large profiles
 
 // Active scrape timeout trackers (tabId → timeoutId)
 const scrapeTimeouts = new Map();
@@ -86,9 +92,9 @@ let detailRateLimited = false;
 let detailBackoffUntil = 0;
 
 // Adaptive PlumX tab pool
-let plumxPoolSize = 1;      // Conservative: 1 at a time
+let plumxPoolSize = 3;      // 3 at a time for faster PlumX scraping
 const PLUMX_POOL_MIN = 1;
-const PLUMX_POOL_MAX = 2;
+const PLUMX_POOL_MAX = 3;
 let plumxRateLimited = false;
 let plumxBackoffUntil = 0;
 
@@ -103,6 +109,46 @@ const pendingPlumx = new Map(); // plumxTabId → { taskId, doi }
 
 // Detay scraping durumu: taskId → { authorData, articles, pendingUrls, results, authorTabId }
 const detailJobs = new Map();
+
+// ═══════════════════════════════════════════════
+//  PHASE-BASED ORCHESTRATOR CONFIGURATION
+// ═══════════════════════════════════════════════
+
+let currentPhase = 1; // 1=WOS, 2=SCOPUS_PLUMX, 3=SCHOLAR, 4=IDLE
+
+let GROUP_CONFIG = {
+  wos: true,
+  scopusPlumx: true,
+  scholar: true,
+};
+
+// WOS group tracking
+const activeWosJobs = {
+  profileTab: null,      // { tabId, taskId }
+  detailTabs: new Set(), // article_detail.js tab ids
+  citationReportTab: null // { tabId, taskId }
+};
+
+// Scopus group tracking
+const activeScopusJobs = {
+  profileTab: null,
+};
+
+// Load group config from storage on startup
+chrome.storage.local.get(['groupConfig'], (r) => {
+  if (r.groupConfig) {
+    GROUP_CONFIG = { ...GROUP_CONFIG, ...r.groupConfig };
+    console.log('[Orchestrator] Loaded group config:', GROUP_CONFIG);
+  }
+});
+
+// Listen for group config changes from popup
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.groupConfig) {
+    GROUP_CONFIG = { ...GROUP_CONFIG, ...changes.groupConfig.newValue };
+    console.log('[Orchestrator] Group config updated:', GROUP_CONFIG);
+  }
+});
 
 // ═══════════════════════════════════════════════
 //  GLOBAL DASHBOARD STATE
@@ -235,7 +281,7 @@ function updateState(updates = {}) {
 
 function addLog(text, type = 'info') {
   appState.logs.push({ text, type, time: Date.now() });
-  if (appState.logs.length > 30) appState.logs.shift();
+  if (appState.logs.length > 150) appState.logs.shift();  // Increased from 30 to 150
   updateState();
 }
 
@@ -287,69 +333,169 @@ chrome.runtime.onInstalled.addListener(() => {
   scheduleOrchestrator(2000); // Start after 2s
 });
 
+// ═══════════════════════════════════════════════
+//  PHASE-BASED ORCHESTRATOR (WOS → SCOPUS+PLUMX → SCHOLAR)
+// ═══════════════════════════════════════════════
+
+function isWosPhaseActive() {
+  return activeWosJobs.profileTab !== null
+      || activeWosJobs.detailTabs.size > 0
+      || activeWosJobs.citationReportTab !== null;
+}
+
+function isScopusPhaseActive() {
+  return activeProfileTask !== null && activeProfileTask.source === 'SCOPUS';
+}
+
+function isPlumxPhaseActive() {
+  return pendingPlumx.size > 0;
+}
+
+function isScholarPhaseActive() {
+  return activeProfileTask !== null && activeProfileTask.source === 'SCHOLAR';
+}
+
+async function pollScrapeSource(source) {
+  if (activeProfileTask !== null) {
+    return false;
+  }
+  try {
+    const headers = await brokerHeaders();
+    const res = await fetch(`${API_BASE}/api/tasks/poll?source=${source}`, { headers });
+    if (res.status === 204 || !res.ok) return false;
+
+    const data = await res.json();
+    if (data?.taskId) {
+      const { taskId, externalId, source: respSource, redirectUrl, taskType } = data;
+      const effectiveSource = respSource || source;
+
+      if (taskId != null && externalId) {
+        console.log(`[Orchestrator] New ${effectiveSource} task. ID: ${taskId}, ExtID: ${externalId}`);
+
+        activeProfileTask = {
+          taskId,
+          source: effectiveSource,
+          externalId,
+          taskType: taskType || 'FULL_SCRAPE'
+        };
+
+        updateSyncProgress(effectiveSource, 'RUNNING');
+        diagAddTask(taskId, effectiveSource, externalId, taskType || 'FULL_SCRAPE');
+
+        updateState({
+          status: 'INITIALIZING',
+          taskId,
+          targetId: externalId,
+          progress: { current: 0, total: 0, label: `Initializing ${effectiveSource} task...` },
+          stats: { pagesScanned: 0, articlesFound: 0, detailsExtracted: 0 }
+        });
+        addLog(`New ${effectiveSource} Task (ID: ${taskId})`, 'success');
+
+        await humanDelay(800, 2500);
+        await openTaskTab(taskId, externalId, effectiveSource, redirectUrl || null, taskType || 'FULL_SCRAPE');
+        return true;
+      }
+    }
+    return false;
+  } catch (err) {
+    console.warn(`[Orchestrator] ${source} poll failed:`, err);
+    return false;
+  }
+}
+
+async function runWosPhase() {
+  if (!GROUP_CONFIG.wos) {
+    currentPhase++;
+    return;
+  }
+
+  if (isWosPhaseActive()) {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+
+  const picked = await pollScrapeSource('WOS');
+  if (picked) {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+
+  // WOS phase complete
+  console.log('[Orchestrator] WOS phase fully drained. Moving to SCOPUS+PLUMX.');
+  currentPhase++;
+  scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+}
+
+async function runScopusPlumxPhase() {
+  if (!GROUP_CONFIG.scopusPlumx) {
+    currentPhase++;
+    return;
+  }
+
+  let busy = false;
+  if (isScopusPhaseActive()) busy = true;
+  if (isPlumxPhaseActive()) busy = true;
+
+  if (busy) {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+
+  const pickedScopus = await pollScrapeSource('SCOPUS');
+  const pickedPlumx = await pollPlumx();
+
+  if (!pickedScopus && !pickedPlumx) {
+    console.log('[Orchestrator] SCOPUS+PLUMX phase fully drained. Moving to SCHOLAR.');
+    currentPhase++;
+  }
+
+  scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+}
+
+async function runScholarPhase() {
+  if (!GROUP_CONFIG.scholar) {
+    currentPhase++;
+    return;
+  }
+
+  if (isScholarPhaseActive()) {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+
+  const picked = await pollScrapeSource('SCHOLAR');
+  if (picked) {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+
+  console.log('[Orchestrator] SCHOLAR phase fully drained. All phases complete.');
+  currentPhase++;
+  scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_IDLE_MS, 20));
+}
+
 async function runPriorityOrchestrator() {
   if (detailRateLimited || plumxRateLimited) {
     scheduleOrchestrator(jitteredInterval(30000, 20));
     return;
   }
 
-  // Count active tasks for Phase 1 (Yayın Bulma / Detay Doldurma / Atıf Raporu)
-  let activeAuthorTasks = activeProfileTask !== null ? 1 : 0;
-  activeAuthorTasks += pendingCitationReportTabs.size;
-  let activeDetailJobs = detailJobs.size;
-
-  // PRIORITY 1: Mevcut Profil veya Detay/Atıf Raporu işlemi varsa, bitmesini bekle
-  if (activeAuthorTasks > 0 || activeDetailJobs > 0) {
-    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-    return;
+  switch (currentPhase) {
+    case 1:
+      await runWosPhase();
+      break;
+    case 2:
+      await runScopusPlumxPhase();
+      break;
+    case 3:
+      await runScholarPhase();
+      break;
+    case 4:
+    default:
+      currentPhase = 1;
+      scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_IDLE_MS, 20));
+      break;
   }
-
-  // PRIORITY 2: WOS DOI ENRICHMENT (Özet / Q Değeri / IF Doldurma)
-  // Profil çekimi bittikten sonra sıraya giren makalelerin WOS DOI işlemlerini tamamla
-  const activeWosDoi = pendingWosDoiTabs.size;
-  if (activeWosDoi < wosDoiPoolSize) {
-    const pickedWosDoi = await pollWosDoi();
-    if (pickedWosDoi) {
-      scheduleOrchestrator(jitteredInterval(10000, 20));
-      return;
-    }
-  }
-
-  if (activeWosDoi > 0) {
-    scheduleOrchestrator(jitteredInterval(10000, 20));
-    return;
-  }
-
-  // PRIORITY 3: PLUMX & SCHOLAR DOI (Atıfları Bulma)
-  // WOS DOI bittikten sonra eğer bekleyen atıf güncelleme görevleri varsa onları tamamla
-  const activeScholar = pendingScholarDoiTabs.size;
-  const activePlumx = pendingPlumx.size;
-  let pickedCitationTask = false;
-
-  if (activeScholar < scholarDoiPoolSize) {
-    if (await pollScholarDoi()) pickedCitationTask = true;
-  }
-
-  if (activePlumx < plumxPoolSize) {
-    if (await pollPlumx()) pickedCitationTask = true;
-  }
-
-  if (pickedCitationTask || activeScholar > 0 || activePlumx > 0) {
-    // Daha yavaş polling (Google Scholar IP ban riskine karşı)
-    scheduleOrchestrator(jitteredInterval(25000, 25));
-    return;
-  }
-
-  // PRIORITY 4: YENİ PROFİL ÇEKME (WOS -> SCOPUS -> SCHOLAR)
-  // Bütün alt görevler (DOI, PlumX vb.) tamamen bittikten SONRA yeni kaynak ara!
-  const pickedAuthorTask = await pollScrape();
-  if (pickedAuthorTask) {
-    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-    return;
-  }
-
-  // System is idle
-  scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_IDLE_MS, 20));
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -358,6 +504,48 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       console.warn("[Orchestrator]", err);
       scheduleOrchestrator(15000);
     });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  TAB REMOVAL LISTENER — prevents stale state when user closes tabs
+// ═══════════════════════════════════════════════
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  console.log(`[WoS Worker] Tab #${tabId} closed by user/browser, cleaning up state...`);
+
+  // Report task failure to broker before clearing local state
+  const entry = pendingTabs.get(tabId);
+  if (entry && entry.taskId && entry.type !== 'DETAIL') {
+    try {
+      const h = await brokerHeaders();
+      await fetch(`${API_BASE}/api/tasks/${entry.taskId}/fail`, {
+        method: 'POST', headers: h,
+        body: JSON.stringify({ error: 'Tab closed unexpectedly' }),
+      });
+      console.log(`[WoS Worker] Reported task ${entry.taskId} as failed (tab closed)`);
+    } catch (e) {
+      console.warn(`[WoS Worker] Failed to report task failure for tab #${tabId}:`, e);
+    }
+  }
+
+  clearPendingTab(tabId);
+  pendingPlumx.delete(tabId);
+  pendingWosDoiTabs.delete(tabId);
+  pendingScholarDoiTabs.delete(tabId);
+  pendingCitationReportTabs.delete(tabId);
+  savedCitationReportLinks.delete(tabId);
+  // Also clear citation report tab from activeWosJobs if it was closed directly
+  if (activeWosJobs.citationReportTab === tabId) {
+    activeWosJobs.citationReportTab = null;
+    console.log(`[WoS Worker] Citation report tab #${tabId} removed, cleared activeWosJobs.citationReportTab`);
+  }
+  for (const [taskId, job] of detailJobs.entries()) {
+    if (job.activeTabIds.has(tabId)) {
+      job.activeTabIds.delete(tabId);
+      job.tabToUrlMap.delete(tabId);
+      fillDetailTabPool(taskId);
+    }
   }
 });
 
@@ -557,6 +745,13 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
   const tabId = tab.id;
   await chrome.storage.session.set({ [tabId]: { taskId, externalId, source, taskType: taskType || 'FULL_SCRAPE' } });
 
+  // Track WOS group jobs
+  if (source === 'WOS') {
+    activeWosJobs.profileTab = tabId;
+    activeWosJobs.profileTaskId = taskId;
+    addLog(`[WOS Group] Profile tab opened #${tabId} for task ${taskId}`, 'info');
+  }
+
   pendingTabs.set(tabId, { taskId, source, taskType: taskType || 'FULL_SCRAPE', openedAt: Date.now(), readyAt: null });
   addLog(`Opened ${source} tab (focused, ${taskType || 'FULL_SCRAPE'})`, 'info');
 
@@ -595,7 +790,35 @@ function clearPendingTab(tabId) {
     if (activeProfileTask && activeProfileTask.taskId === entry.taskId) {
       activeProfileTask = null;
     }
+    // Free WOS group slots
+    if (entry.source === 'WOS') {
+      if (activeWosJobs.profileTab === tabId) {
+        activeWosJobs.profileTab = null;
+        activeWosJobs.profileTaskId = null;
+        addLog(`[WOS Group] Profile tab #${tabId} cleared`, 'info');
+      }
+      activeWosJobs.detailTabs.delete(tabId);
+      if (activeWosJobs.citationReportTab === tabId) {
+        activeWosJobs.citationReportTab = null;
+      }
+    }
     pendingTabs.delete(tabId);
+  } else if (activeProfileTask) {
+    // entry may be missing if it was already removed (e.g. double-clear),
+    // but if the active task was tied to this tab we must still free it
+    // to prevent the orchestrator from being permanently blocked.
+    const sessionKey = String(tabId);
+    chrome.storage.session.get([sessionKey]).then(stored => {
+      const info = stored[sessionKey];
+      if (info && activeProfileTask && activeProfileTask.taskId === info.taskId) {
+        console.warn(`[WoS Worker] clearPendingTab: entry missing for tab #${tabId}, but freeing activeProfileTask ${info.taskId} via session storage.`);
+        activeProfileTask = null;
+      }
+    }).catch(() => {
+      // Session storage unavailable — force-clear to be safe
+      console.warn(`[WoS Worker] clearPendingTab: no entry, no session for tab #${tabId}. Force-clearing activeProfileTask.`);
+      activeProfileTask = null;
+    });
   }
   // Clear scrape timeout if exists
   if (scrapeTimeouts.has(tabId)) {
@@ -787,13 +1010,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         console.log(`[WoS Worker] SCRAPE_READY received from tab #${tabId} (${msg.source || entry.source}). Timeout countdown starts now.`);
         addLog(`${msg.source || entry.source} content script ready`, 'success');
 
-        // Start the real scrape timeout now
-        setTimeout(() => {
-          const current = pendingTabs.get(tabId);
-          if (current && current.taskId === entry.taskId) {
-            handleTaskTimeout(tabId);
-          }
-        }, SCRAPE_TIMEOUT_MS);
+        // Replace the pre-ready timeout with the real scrape timeout.
+        // Using resetScrapeTimeout ensures the new timeout is stored in
+        // scrapeTimeouts and can be cancelled on PROGRESS_UPDATE or clearPendingTab.
+        resetScrapeTimeout(tabId);
+      }
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // ── WoS Session Handler: Login success signal ──
+  if (msg.type === 'WOS_LOGIN_SUCCESS') {
+    const tabId = sender.tab?.id;
+    if (tabId != null) {
+      const entry = pendingTabs.get(tabId);
+      if (entry) {
+        console.log(`[WoS Session] Login success on tab #${tabId}, resetting for retry.`);
+        addLog('WoS session restored, retrying scrape...', 'warning');
+        entry.readyAt = null; // allow next SCRAPE_READY from reloaded content.js
+        resetScrapeTimeout(tabId); // extend the overall task timeout
+
+        // Reload the tab to restart content.js scraping
+        chrome.tabs.reload(tabId);
+        console.log(`[WoS Session] Tab #${tabId} reloaded to restart scraping.`);
       }
     }
     sendResponse({ ok: true });
@@ -839,7 +1079,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'AUTHOR_METRICS_COMPLETE') {
-    handleAuthorMetrics(msg).then(sendResponse);
+    handleAuthorMetrics(msg, sender.tab?.id).then(sendResponse);
     return true;
   }
 
@@ -958,8 +1198,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 //  AUTHOR METRICS — Separate early send
 // ═══════════════════════════════════════════════
 
-async function handleAuthorMetrics(msg) {
-  const { taskId, authorMetrics, url } = msg;
+async function handleAuthorMetrics(msg, senderTabId) {
+  const { taskId, authorMetrics, url, source, taskType } = msg;
 
   // Track metrics in diagnostics
   const diagTask = diagGetTask(taskId);
@@ -986,21 +1226,29 @@ async function handleAuthorMetrics(msg) {
   }
 
   // METRICS_ONLY or SCOPUS short-circuit (Scopus doesn't do detail pages yet)
-  let targetTabId = null;
+  let targetTabId = senderTabId || null;
   let isShortCircuit = false;
 
-  for (const [tabId, entry] of pendingTabs.entries()) {
-    if (entry.taskId === taskId) {
-      if (entry.taskType === 'METRICS_ONLY' || entry.source === 'SCOPUS') {
-        targetTabId = tabId;
-        isShortCircuit = true;
-        break;
+  // Trust msg.source/msg.taskType from content script; fall back to pendingTabs if absent
+  if (source === 'SCOPUS' || taskType === 'METRICS_ONLY') {
+    isShortCircuit = true;
+  }
+
+  // Fallback lookup in pendingTabs if msg didn't carry source/taskType
+  if (!isShortCircuit) {
+    for (const [tabId, entry] of pendingTabs.entries()) {
+      if (entry.taskId === taskId) {
+        if (entry.taskType === 'METRICS_ONLY' || entry.source === 'SCOPUS') {
+          targetTabId = tabId;
+          isShortCircuit = true;
+          break;
+        }
       }
     }
   }
 
-  if (targetTabId !== null && isShortCircuit) {
-    addLog(`Short-circuiting article scraping for ${targetTabId}. Completing...`, 'info');
+  if (isShortCircuit) {
+    addLog(`Short-circuiting article scraping for task ${taskId}. Completing...`, 'info');
 
     try {
       const h = await brokerHeaders();
@@ -1009,19 +1257,30 @@ async function handleAuthorMetrics(msg) {
         body: JSON.stringify({ rawData: { authorMetrics, articles: [], scrapedAt: new Date().toISOString(), url } }),
       });
       if (resp.ok) {
-        addLog(`Task completed!`, 'success');
+        addLog(`Task ${taskId} completed!`, 'success');
         if (diagTask) { diagTask.status = 'COMPLETED'; diagTask.completedAt = new Date().toISOString(); }
       } else {
-        addLog(`Task complete returned ${resp.status}`, 'warning');
+        addLog(`Task ${taskId} complete returned ${resp.status}`, 'warning');
         if (diagTask) { diagTask.status = 'ERROR'; diagTask.error = `HTTP ${resp.status}`; diagTask.completedAt = new Date().toISOString(); }
       }
     } catch (err) {
-      addLog(`Failed to complete short-circuited task`, 'error');
+      addLog(`Failed to complete short-circuited task ${taskId}`, 'error');
       if (diagTask) { diagTask.status = 'ERROR'; diagTask.error = err.message; diagTask.completedAt = new Date().toISOString(); }
     }
 
-    clearPendingTab(targetTabId);
-    try { await chrome.tabs.remove(targetTabId); } catch (_) { }
+    if (targetTabId != null) {
+      clearPendingTab(targetTabId);
+      try { await chrome.tabs.remove(targetTabId); } catch (_) { }
+    } else {
+      // We don't know the tabId — try to find and close any tab with this taskId
+      for (const [tabId, entry] of pendingTabs.entries()) {
+        if (entry.taskId === taskId) {
+          clearPendingTab(tabId);
+          try { await chrome.tabs.remove(tabId); } catch (_) { }
+          break;
+        }
+      }
+    }
 
     updateState({
       status: 'IDLE', taskId: null, targetId: null,
@@ -1158,6 +1417,13 @@ async function openDetailTab(taskId, job, url) {
     const tab = await chrome.tabs.create({ url, active: false });
     job.activeTabIds.add(tab.id);
     job.tabToUrlMap.set(tab.id, url);
+    // Track WOS detail tabs
+    const authorTabEntry = pendingTabs.get(job.authorTabId);
+    if (authorTabEntry?.source === 'WOS') {
+      activeWosJobs.detailTabs.add(tab.id);
+      // REGISTER in pendingTabs so clearPendingTab can clean activeWosJobs.detailTabs
+      pendingTabs.set(tab.id, { source: 'WOS', taskId, type: 'DETAIL' });
+    }
   } catch (e) {
     console.warn('[WoS Worker] Detay sekmesi açılamadı:', e);
     fillDetailTabPool(taskId);
@@ -1372,6 +1638,21 @@ async function finalizeAndComplete(taskId) {
   // Author tab'ını kapat (bu işlem activeProfileTask'i null yapar)
   clearPendingTab(authorTabId);
   try { await chrome.tabs.remove(authorTabId); } catch (_) { }
+
+  // Also clear any dangling citation report tab reference so WOS phase can end
+  if (activeWosJobs.citationReportTab !== null) {
+    const citTabId = activeWosJobs.citationReportTab;
+    activeWosJobs.citationReportTab = null;
+    pendingCitationReportTabs.delete(citTabId);
+    try { await chrome.tabs.remove(citTabId); } catch (_) { }
+    addLog(`[WOS Group] Citation report tab #${citTabId} force-cleared on finalize`, 'info');
+  }
+  // Clear all WOS detail tab references so isWosPhaseActive() becomes false
+  if (activeWosJobs.detailTabs.size > 0) {
+    const count = activeWosJobs.detailTabs.size;
+    activeWosJobs.detailTabs.clear();
+    addLog(`[WOS Group] Cleared ${count} dangling detail tab reference(s) on finalize`, 'info');
+  }
 
   updateState({
     status: 'IDLE', taskId: null, targetId: null,
@@ -1775,6 +2056,8 @@ async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWo
   try {
     const tab = await chrome.tabs.create({ url, active: false });
     pendingCitationReportTabs.set(tab.id, { taskId, authorWosId, openedAt: Date.now() });
+    activeWosJobs.citationReportTab = tab.id;
+    addLog(`[WOS Group] Citation report tab opened #${tab.id} for task ${taskId}`, 'info');
     console.log(`[WoS Worker] Opened Citation Report tab #${tab.id} for task ${taskId}`);
     addLog(`Citation Report tab opened`, 'info');
 
@@ -1796,7 +2079,7 @@ async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWo
 
         // Report failure
         const h = await brokerHeaders();
-        await fetch(`http://localhost:8080/api/wos/citation-report/sync`, {
+        await fetch(`${API_BASE}/api/wos/citation-report/sync`, {
           method: 'POST',
           headers: h,
           body: JSON.stringify({
@@ -1835,7 +2118,7 @@ async function handleCitationReportComplete(tabId, taskId, data) {
 
   try {
     const h = await brokerHeaders();
-    const response = await fetch(`http://localhost:8080/api/wos/citation-report/sync`, {
+    const response = await fetch(`${API_BASE}/api/wos/citation-report/sync`, {
       method: 'POST',
       headers: h,
       body: JSON.stringify(data),
@@ -1856,6 +2139,10 @@ async function handleCitationReportComplete(tabId, taskId, data) {
   // Tab'ı kapat
   if (tabId) {
     pendingCitationReportTabs.delete(tabId);
+    if (activeWosJobs.citationReportTab === tabId) {
+      activeWosJobs.citationReportTab = null;
+      addLog(`[WOS Group] Citation report tab #${tabId} cleared`, 'info');
+    }
     try { await chrome.tabs.remove(tabId); } catch (_) { }
   }
 
