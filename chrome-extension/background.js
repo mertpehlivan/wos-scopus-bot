@@ -44,6 +44,33 @@ function jitteredInterval(baseMs, jitterPercent = 30) {
   return baseMs + randomInt(-jitter, jitter);
 }
 
+// Retry wrapper for broker polling (handles transient failures)
+const FETCH_MAX_RETRIES = 3;
+const FETCH_RETRY_DELAYS = [1000, 3000, 5000]; // exponential backoff
+
+async function fetchWithRetry(url, options, retries = 0) {
+  try {
+    const res = await fetch(url, options);
+    if (res.ok || res.status === 204) return res;
+
+    // Don't retry 4xx errors (client error), only 5xx (server) or network errors
+    if (res.status >= 500 && retries < FETCH_MAX_RETRIES) {
+      console.warn(`[Polling] HTTP ${res.status}, retry ${retries + 1}/${FETCH_MAX_RETRIES}`);
+      await new Promise(r => setTimeout(r, FETCH_RETRY_DELAYS[retries]));
+      return fetchWithRetry(url, options, retries + 1);
+    }
+    return res;
+  } catch (err) {
+    // Network error - retry with exponential backoff
+    if (retries < FETCH_MAX_RETRIES) {
+      console.warn(`[Polling] Network error: ${err.message}, retry ${retries + 1}/${FETCH_MAX_RETRIES}`);
+      await new Promise(r => setTimeout(r, FETCH_RETRY_DELAYS[retries]));
+      return fetchWithRetry(url, options, retries + 1);
+    }
+    throw err; // Give up after max retries
+  }
+}
+
 // ═══════════════════════════════════════════════
 //  CONFIGURATION — Adaptive & Anti-detection aware
 // ═══════════════════════════════════════════════
@@ -300,18 +327,30 @@ async function brokerHeaders(extra = {}) {
 }
 
 function resetScrapeTimeout(tabId) {
+  // Always cleanup old timeout first, even if exception occurs
   if (scrapeTimeouts.has(tabId)) {
-    clearTimeout(scrapeTimeouts.get(tabId));
+    try {
+      clearTimeout(scrapeTimeouts.get(tabId));
+    } catch (e) {
+      console.warn(`[Cleanup] Error clearing old timeout for tab ${tabId}:`, e);
+    }
+    scrapeTimeouts.delete(tabId);
   }
+
   const entry = pendingTabs.get(tabId);
   if (entry) {
-    const newTimeout = setTimeout(() => {
-      const current = pendingTabs.get(tabId);
-      if (current && current.taskId === entry.taskId) {
-        handleTaskTimeout(tabId);
-      }
-    }, SCRAPE_TIMEOUT_MS);
-    scrapeTimeouts.set(tabId, newTimeout);
+    try {
+      const newTimeout = setTimeout(() => {
+        const current = pendingTabs.get(tabId);
+        if (current && current.taskId === entry.taskId) {
+          handleTaskTimeout(tabId);
+        }
+      }, SCRAPE_TIMEOUT_MS);
+      scrapeTimeouts.set(tabId, newTimeout);
+    } catch (e) {
+      console.error(`[Cleanup] Failed to set new timeout for tab ${tabId}:`, e);
+      scrapeTimeouts.delete(tabId); // Fail-safe
+    }
   }
 }
 
@@ -337,22 +376,92 @@ chrome.runtime.onInstalled.addListener(() => {
 //  PHASE-BASED ORCHESTRATOR (WOS → SCOPUS+PLUMX → SCHOLAR)
 // ═══════════════════════════════════════════════
 
-function isWosPhaseActive() {
-  return activeWosJobs.profileTab !== null
-      || activeWosJobs.detailTabs.size > 0
-      || activeWosJobs.citationReportTab !== null;
+async function checkTabExists(tabId) {
+  if (tabId === null) return false;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return !!tab;
+  } catch (e) {
+    return false;
+  }
 }
 
-function isScopusPhaseActive() {
-  return activeProfileTask !== null && activeProfileTask.source === 'SCOPUS';
+async function isWosPhaseActive() {
+  if (activeWosJobs.profileTab !== null) {
+    if (await checkTabExists(activeWosJobs.profileTab)) return true;
+    console.warn(`[Orchestrator] WOS profile tab #${activeWosJobs.profileTab} no longer exists. Clearing.`);
+    activeWosJobs.profileTab = null;
+  }
+  
+  if (activeWosJobs.detailTabs.size > 0) {
+    const activeDetails = [];
+    for (const tid of activeWosJobs.detailTabs) {
+      if (await checkTabExists(tid)) activeDetails.push(tid);
+    }
+    if (activeDetails.length > 0) {
+      if (activeDetails.length !== activeWosJobs.detailTabs.size) {
+        activeWosJobs.detailTabs = new Set(activeDetails);
+      }
+      return true;
+    }
+    activeWosJobs.detailTabs.clear();
+  }
+
+  if (activeWosJobs.citationReportTab !== null) {
+    if (await checkTabExists(activeWosJobs.citationReportTab)) return true;
+    activeWosJobs.citationReportTab = null;
+  }
+
+  return false;
 }
 
-function isPlumxPhaseActive() {
-  return pendingPlumx.size > 0;
+async function isScopusPhaseActive() {
+  if (activeProfileTask !== null && activeProfileTask.source === 'SCOPUS') {
+    // Try to find the tab associated with this task
+    for (const [tabId, entry] of pendingTabs.entries()) {
+      if (entry.taskId === activeProfileTask.taskId) {
+        if (await checkTabExists(tabId)) return true;
+        console.warn(`[Orchestrator] Scopus tab #${tabId} for task ${entry.taskId} no longer exists. Clearing.`);
+        clearPendingTab(tabId);
+        return false;
+      }
+    }
+    return true; // Assume active if task exists but tab lookup failed (might be starting up)
+  }
+  return false;
 }
 
-function isScholarPhaseActive() {
-  return activeProfileTask !== null && activeProfileTask.source === 'SCHOLAR';
+async function isPlumxPhaseActive() {
+  if (pendingPlumx.size > 0) {
+    const activePlumx = [];
+    for (const [tid, info] of pendingPlumx.entries()) {
+      if (await checkTabExists(tid)) activePlumx.push([tid, info]);
+    }
+    if (activePlumx.length > 0) {
+      if (activePlumx.length !== pendingPlumx.size) {
+        pendingPlumx.clear();
+        activePlumx.forEach(([tid, info]) => pendingPlumx.set(tid, info));
+      }
+      return true;
+    }
+    pendingPlumx.clear();
+  }
+  return false;
+}
+
+async function isScholarPhaseActive() {
+  if (activeProfileTask !== null && activeProfileTask.source === 'SCHOLAR') {
+    for (const [tabId, entry] of pendingTabs.entries()) {
+      if (entry.taskId === activeProfileTask.taskId) {
+        if (await checkTabExists(tabId)) return true;
+        console.warn(`[Orchestrator] Scholar tab #${tabId} for task ${entry.taskId} no longer exists. Clearing.`);
+        clearPendingTab(tabId);
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
 }
 
 async function pollScrapeSource(source) {
@@ -361,7 +470,7 @@ async function pollScrapeSource(source) {
   }
   try {
     const headers = await brokerHeaders();
-    const res = await fetch(`${API_BASE}/api/tasks/poll?source=${source}`, { headers });
+    const res = await fetchWithRetry(`${API_BASE}/api/tasks/poll?source=${source}`, { headers });
     if (res.status === 204 || !res.ok) return false;
 
     const data = await res.json();
@@ -405,11 +514,12 @@ async function pollScrapeSource(source) {
 
 async function runWosPhase() {
   if (!GROUP_CONFIG.wos) {
+    console.log('[Orchestrator] WOS phase disabled, skipping.');
     currentPhase++;
     return;
   }
 
-  if (isWosPhaseActive()) {
+  if (await isWosPhaseActive()) {
     scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
     return;
   }
@@ -428,13 +538,14 @@ async function runWosPhase() {
 
 async function runScopusPlumxPhase() {
   if (!GROUP_CONFIG.scopusPlumx) {
+    console.log('[Orchestrator] SCOPUS+PLUMX phase disabled, skipping.');
     currentPhase++;
     return;
   }
 
   let busy = false;
-  if (isScopusPhaseActive()) busy = true;
-  if (isPlumxPhaseActive()) busy = true;
+  if (await isScopusPhaseActive()) busy = true;
+  if (await isPlumxPhaseActive()) busy = true;
 
   if (busy) {
     scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
@@ -454,11 +565,12 @@ async function runScopusPlumxPhase() {
 
 async function runScholarPhase() {
   if (!GROUP_CONFIG.scholar) {
+    console.log('[Orchestrator] SCHOLAR phase disabled, skipping.');
     currentPhase++;
     return;
   }
 
-  if (isScholarPhaseActive()) {
+  if (await isScholarPhaseActive()) {
     scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
     return;
   }
@@ -752,7 +864,7 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
     addLog(`[WOS Group] Profile tab opened #${tabId} for task ${taskId}`, 'info');
   }
 
-  pendingTabs.set(tabId, { taskId, source, taskType: taskType || 'FULL_SCRAPE', openedAt: Date.now(), readyAt: null });
+  pendingTabs.set(tabId, { taskId, externalId, source, taskType: taskType || 'FULL_SCRAPE', openedAt: Date.now(), readyAt: null });
   addLog(`Opened ${source} tab (focused, ${taskType || 'FULL_SCRAPE'})`, 'info');
 
   // Start scrape timeout (reset by PROGRESS_UPDATE / SCRAPE_READY)
@@ -1026,14 +1138,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (tabId != null) {
       const entry = pendingTabs.get(tabId);
       if (entry) {
-        console.log(`[WoS Session] Login success on tab #${tabId}, resetting for retry.`);
+        // Reconstruct the profile URL to ensure we return to the task even if hash is lost
+        let retryUrl = sender.tab?.url;
+        if (entry.externalId && entry.source === 'WOS') {
+          const baseUrl = `https://www.webofscience.com/wos/author/record/${encodeURIComponent(entry.externalId)}`;
+          retryUrl = `${baseUrl}#wos-task-id=${entry.taskId}`;
+        }
+
+        console.log(`[WoS Session] Login success on tab #${tabId}, navigating to: ${retryUrl}`);
         addLog('WoS session restored, retrying scrape...', 'warning');
         entry.readyAt = null; // allow next SCRAPE_READY from reloaded content.js
         resetScrapeTimeout(tabId); // extend the overall task timeout
 
-        // Reload the tab to restart content.js scraping
-        chrome.tabs.reload(tabId);
-        console.log(`[WoS Session] Tab #${tabId} reloaded to restart scraping.`);
+        // Navigate the tab to restart content.js scraping
+        chrome.tabs.update(tabId, { url: retryUrl });
+        console.log(`[WoS Session] Tab #${tabId} navigated to restart scraping.`);
       }
     }
     sendResponse({ ok: true });

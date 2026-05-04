@@ -225,12 +225,13 @@ public class DoiEnrichTaskController {
     // ═══════════════════════════════════════════════
 
     /**
-     * Forwards the completed task result to the main backend Spring Boot service asynchronously.
+     * Forwards the completed task result to the main backend Spring Boot service asynchronously
+     * with 3-retry exponential backoff (1s, 3s, 9s).
      * Using CompletableFuture so the Tomcat request thread is never blocked.
      */
     private void forwardToBackend(Long taskId, Map<String, Object> body, String source) {
         CompletableFuture.runAsync(() -> {
-            try {
+            forwardWithRetry(() -> {
                 String endpoint = "SCHOLAR".equals(source)
                         ? backendUrl + "/api/doi-enrich-tasks/" + taskId + "/scholar-complete"
                         : backendUrl + "/api/doi-enrich-tasks/" + taskId + "/complete";
@@ -253,17 +254,15 @@ public class DoiEnrichTaskController {
                         HttpResponse.BodyHandlers.ofString());
 
                 if (response.statusCode() >= 400) {
-                    log.warn("[DoiEnrich Broker] Backend returned {} for task {}", response.statusCode(), taskId);
+                    throw new RuntimeException("Backend returned HTTP " + response.statusCode());
                 }
-            } catch (Exception e) {
-                log.warn("[DoiEnrich Broker] Failed to forward task {} to backend: {}", taskId, e.getMessage());
-            }
+            });
         });
     }
 
     private void forwardFailureToBackend(Long taskId, String doi, String error, String source) {
         CompletableFuture.runAsync(() -> {
-            try {
+            forwardWithRetry(() -> {
                 String endpoint = backendUrl + "/api/doi-enrich-tasks/" + taskId + "/fail";
 
                 Map<String, Object> body = Map.of(
@@ -284,11 +283,38 @@ public class DoiEnrichTaskController {
                         .timeout(Duration.ofSeconds(10))
                         .build();
 
-                client.send(request, HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> response = client.send(request,
+                        HttpResponse.BodyHandlers.ofString());
 
-            } catch (Exception e) {
-                log.warn("[DoiEnrich Broker] Failed to forward failure for task {} to backend: {}", taskId, e.getMessage());
-            }
+                if (response.statusCode() >= 400) {
+                    throw new RuntimeException("Backend returned HTTP " + response.statusCode());
+                }
+            });
         });
+    }
+
+    private void forwardWithRetry(ForwardTask task) {
+        int[] delays = {1000, 3000, 9000};
+        for (int i = 0; i <= delays.length; i++) {
+            try {
+                task.execute();
+                return;
+            } catch (Exception e) {
+                if (i == delays.length) {
+                    log.error("[DoiEnrich Broker] Failed to forward task after 3 retries: {}", e.getMessage());
+                    return;
+                }
+                try {
+                    Thread.sleep(delays[i]);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    @FunctionalInterface
+    interface ForwardTask {
+        void execute() throws Exception;
     }
 }

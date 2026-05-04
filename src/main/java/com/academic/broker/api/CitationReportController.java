@@ -68,11 +68,11 @@ public class CitationReportController {
 
     /**
      * Forwards the citation report payload to the main backend Spring Boot app
-     * asynchronously so the broker response is not delayed.
+     * asynchronously with 3-retry exponential backoff (1s, 3s, 9s).
      */
     private void forwardToBackendAsync(Map<String, Object> body) {
         CompletableFuture.runAsync(() -> {
-            try {
+            forwardWithRetry(() -> {
                 String json = objectMapper.writeValueAsString(body);
                 HttpClient client = HttpClient.newBuilder()
                         .connectTimeout(Duration.ofSeconds(10))
@@ -89,18 +89,36 @@ public class CitationReportController {
                         HttpResponse.BodyHandlers.ofString());
 
                 if (response.statusCode() >= 400) {
-                    log.warn("[CitationReport] Backend returned HTTP {} when forwarding data",
-                            response.statusCode());
-                } else {
-                    log.info("[CitationReport] Successfully forwarded to backend (HTTP {})",
-                            response.statusCode());
+                    throw new RuntimeException("Backend returned HTTP " + response.statusCode());
                 }
-
-            } catch (Exception e) {
-                // Non-fatal: the data reached the broker successfully; backend unavailability
-                // is logged but should not break the extension flow.
-                log.warn("[CitationReport] Failed to forward data to backend: {}", e.getMessage());
-            }
+                log.info("[CitationReport] Successfully forwarded to backend (HTTP {})",
+                        response.statusCode());
+            });
         });
+    }
+
+    private void forwardWithRetry(ForwardTask task) {
+        int[] delays = {1000, 3000, 9000};
+        for (int i = 0; i <= delays.length; i++) {
+            try {
+                task.execute();
+                return;
+            } catch (Exception e) {
+                if (i == delays.length) {
+                    log.error("[CitationReport] Failed to forward data after 3 retries: {}", e.getMessage());
+                    return;
+                }
+                try {
+                    Thread.sleep(delays[i]);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    @FunctionalInterface
+    interface ForwardTask {
+        void execute() throws Exception;
     }
 }

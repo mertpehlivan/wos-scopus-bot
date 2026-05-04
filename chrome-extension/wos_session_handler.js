@@ -1,13 +1,15 @@
 /**
  * wos_session_handler.js
  * Handles WoS session expiry by auto-dismissing the Pendo "free view" popup,
- * clicking "Sign In", filling credentials, and submitting the login form.
+ * clicking "Sign In", filling credentials via Angular FormControl API, and submitting.
  *
  * Runs on all *.webofscience.com pages.
  */
 (function () {
     if (window.__wosSessionHandlerRunning) return;
     window.__wosSessionHandlerRunning = true;
+
+    console.log('[WoS Session] Handler initialized on URL:', window.location.href);
 
     const CONFIG = {
         email: 'info@rawdatalibrary.net',
@@ -35,56 +37,66 @@
         return null;
     }
 
-    async function setNativeValue(element, value) {
-        console.log('[WoS Session] Typing value for', element.name || element.id);
-        
-        element.scrollIntoView({ block: 'center', behavior: 'instant' });
-        await _humanDelay(50, 150);
+    // ── Angular FormControl API access ──
+    function setAngularInputValue(input, value, fieldName) {
+        if (!input) {
+            console.log(`[WoS Session] ❌ ${fieldName} input not found`);
+            return false;
+        }
 
-        // Simulate click and focus
-        element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-        element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-        element.click();
-        element.focus();
-        element.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+        console.log(`[WoS Session] 📝 Setting ${fieldName} via Angular FormControl...`);
+        input.scrollIntoView({ block: 'center', behavior: 'instant' });
 
-        await _humanDelay(100, 200);
-
-        // Clear existing value safely
+        // Try to access Angular's FormControl via __ngContext__
+        let angularSucceeded = false;
         try {
-            let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            setter.call(element, '');
-        } catch (e) {
-            element.value = '';
-        }
-        element.dispatchEvent(new Event('input', { bubbles: true }));
-        await _humanDelay(50, 100);
-
-        // Type character by character
-        for (let i = 0; i < value.length; i++) {
-            const char = value[i];
-            try {
-                let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                setter.call(element, element.value + char);
-            } catch (e) {
-                element.value += char;
+            const ctx = input.__ngContext__;
+            if (ctx && Array.isArray(ctx)) {
+                for (let i = 0; i < ctx.length; i++) {
+                    const item = ctx[i];
+                    // Look for FormControl-like object with setValue method
+                    if (item && typeof item === 'object' && item.control && typeof item.control.setValue === 'function') {
+                        console.log(`[WoS Session] Found Angular FormControl at context[${i}]`);
+                        item.control.setValue(value);
+                        item.control.markAsDirty();
+                        item.control.markAsTouched();
+                        item.control.updateValueAndValidity();
+                        console.log(`[WoS Session] ✓ Angular FormControl.setValue() succeeded for ${fieldName}`);
+                        angularSucceeded = true;
+                        break;
+                    }
+                }
             }
-            element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
-            element.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
-            element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: char }));
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
-            await _humanDelay(10, 40); // Fast human typing
+        } catch (e) {
+            console.warn(`[WoS Session] Angular FormControl access failed: ${e.message}`);
         }
 
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-        await _humanDelay(100, 200);
+        // Fallback: native value setter
+        if (!angularSucceeded) {
+            console.log(`[WoS Session] Falling back to native value setter for ${fieldName}`);
+            try {
+                // Try property descriptor
+                const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                if (descriptor && descriptor.set) {
+                    descriptor.set.call(input, value);
+                    console.log(`[WoS Session] ✓ Native descriptor.set() succeeded`);
+                } else {
+                    // Direct assignment fallback
+                    input.value = value;
+                    console.log(`[WoS Session] ✓ Direct value assignment succeeded`);
+                }
 
-        // Blur to trigger final validation
-        element.blur();
-        element.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+                // Dispatch validation events
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.dispatchEvent(new Event('blur', { bubbles: true }));
+            } catch (e) {
+                console.warn(`[WoS Session] Native setter also failed: ${e.message}`);
+            }
+        }
 
-        console.log('[WoS Session] Typing complete. Current value:', element.value);
+        console.log(`[WoS Session] ✓ ${fieldName} = "${input.value}"`);
+        return input.value === value;
     }
 
     // ── Step 1: Dismiss Pendo popup ──
@@ -131,18 +143,38 @@
     // ── Step 2: Click header "Sign In" button (opens dropdown menu) ──
     async function clickHeaderSignIn() {
         const btns = Array.from(document.querySelectorAll('button, a'));
+        console.log('[WoS Session] Found', btns.length, 'buttons/links on page');
+
+        // Try exact match first
         const signInBtn = btns.find(b => {
             const text = (b.textContent || b.innerText || '').trim().toLowerCase();
-            return text === 'sign in' && isVisible(b);
+            const visible = isVisible(b);
+            if (text.includes('sign')) {
+                console.log('[WoS Session] Found button with "sign":', text, 'visible:', visible, 'classes:', b.className);
+            }
+            return text === 'sign in' && visible;
         });
         if (signInBtn) {
-            console.log('[WoS Session] Clicking header Sign In button');
+            console.log('[WoS Session] Clicking header Sign In button (exact match)');
             signInBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
             await _humanDelay(200, 500);
             signInBtn.click();
             await _humanDelay(800, 1500);
             return true;
         }
+
+        // Fallback: try to find by cdxanalyticscategory attribute
+        const wosSignInBtn = document.querySelector('button[cdxanalyticscategory="wos-header-sign_in"], button.wos-sign-in');
+        if (wosSignInBtn && isVisible(wosSignInBtn)) {
+            console.log('[WoS Session] Clicking header Sign In button (attribute match)');
+            wosSignInBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
+            await _humanDelay(200, 500);
+            wosSignInBtn.click();
+            await _humanDelay(800, 1500);
+            return true;
+        }
+
+        console.log('[WoS Session] Header Sign In button not found');
         return false;
     }
 
@@ -174,32 +206,58 @@
         const submitBtn = document.querySelector('button#signIn-btn, button[type="submit"][name="login-btn"], form[name="loginForm"] button[type="submit"]');
 
         if (!emailInput || !passwordInput) {
+            console.warn('[WoS Session] Email or password input not found');
             return false;
         }
 
-        console.log('[WoS Session] Filling login credentials (Angular-aware)');
+        console.log('\n[WoS Session] 🔐 LOGIN PROCESS STARTING\n');
 
-        // Fill email
-        await setNativeValue(emailInput, CONFIG.email);
-        await _humanDelay(200, 400);
+        // STEP 1: EMAIL
+        emailInput.click();
+        emailInput.focus();
+        await _humanDelay(400, 700);
+        setAngularInputValue(emailInput, CONFIG.email, 'EMAIL');
+        await _humanDelay(3000, 5000);
 
-        // Fill password
-        await setNativeValue(passwordInput, CONFIG.password);
-        await _humanDelay(400, 800);
+        // STEP 2: PASSWORD
+        passwordInput.click();
+        passwordInput.focus();
+        await _humanDelay(400, 700);
+        setAngularInputValue(passwordInput, CONFIG.password, 'PASSWORD');
+        await _humanDelay(3000, 5000);
 
-        // Submit — click button + dispatch form submit for Angular
+        // STEP 3: SUBMIT
+        console.log('[WoS Session] 📤 Submitting form...');
+        console.log(`[WoS Session] Email: "${emailInput.value}"`);
+        console.log(`[WoS Session] Password: "${passwordInput.value}"`);
+
         const form = document.querySelector('form[name="loginForm"], form.steam-login-panel');
         if (submitBtn) {
-            console.log('[WoS Session] Clicking Sign In submit button');
             submitBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
-            await _humanDelay(200, 400);
+            await _humanDelay(1500, 2500);
+            console.log('[WoS Session] ✓ SUBMIT CLICKED');
             submitBtn.click();
+        } else {
+            console.warn('[WoS Session] ❌ Submit button not found!');
         }
+
         if (form) {
             console.log('[WoS Session] Dispatching form submit event');
             form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
         }
         await _humanDelay(1000, 2000);
+
+        // Signal background that login succeeded - background will reload tab to retry scraping
+        setTimeout(() => {
+            try {
+                chrome.runtime.sendMessage({ type: 'WOS_LOGIN_SUCCESS' });
+                console.log('[WoS Session] WOS_LOGIN_SUCCESS signal sent to background');
+            } catch (e) {
+                console.warn('[WoS Session] Failed to send login success signal:', e);
+            }
+        }, 1000);
+
+        console.log('\n[WoS Session] 🔐 LOGIN PROCESS COMPLETE\n');
         return true;
     }
 
@@ -248,6 +306,7 @@
 
     // Run once shortly after load, then keep polling
     setTimeout(() => {
+        console.log('[WoS Session] Initial recovery attempt...');
         attemptRecovery();
     }, 1500);
 
@@ -258,6 +317,7 @@
             clearInterval(intervalId);
             return;
         }
+        console.log('[WoS Session] Check attempt', checkAttempts, 'of', CONFIG.maxCheckAttempts);
         attemptRecovery();
     }, CONFIG.checkIntervalMs);
 })();
