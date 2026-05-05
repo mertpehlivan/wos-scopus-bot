@@ -326,6 +326,166 @@ async function brokerHeaders(extra = {}) {
   return { 'Content-Type': 'application/json', 'X-Api-Key': key, ...extra };
 }
 
+/**
+ * Maximum number of times we'll wipe cookies + reload before giving up
+ * on a Scopus task and reporting LOGIN_FAILED.
+ */
+const SCOPUS_MAX_RECOVERY_ATTEMPTS = 2;
+const SCOPUS_RECOVERY_COOLDOWN_MS = 5_000;
+
+/**
+ * Per-task recovery state, kept in chrome.storage.session so it survives
+ * tab reloads but resets on browser restart.
+ *
+ * Shape: { 'scopus_recovery_<taskId>': { attempts: number, lastAttemptAt: number } }
+ */
+async function getScopusRecoveryState(taskId) {
+  const key = `scopus_recovery_${taskId}`;
+  const stored = await chrome.storage.session.get([key]);
+  return stored[key] || { attempts: 0, lastAttemptAt: 0 };
+}
+
+async function setScopusRecoveryState(taskId, state) {
+  await chrome.storage.session.set({ [`scopus_recovery_${taskId}`]: state });
+}
+
+async function clearScopusRecoveryState(taskId) {
+  await chrome.storage.session.remove([`scopus_recovery_${taskId}`]);
+}
+
+/**
+ * Wipes cookies + storage for Scopus/Elsevier origins and reloads the tab
+ * back to the original profile URL. Tracks attempts per-task so we don't
+ * loop forever — after MAX_ATTEMPTS we report LOGIN_FAILED and let the
+ * orchestrator give up cleanly.
+ */
+async function recoverScopusSession(tabId, taskId, externalId) {
+  const state = await getScopusRecoveryState(taskId);
+
+  // Cooldown: ignore rapid repeats from the same tab (e.g., multiple
+  // detection callbacks firing during a single redirect).
+  if (state.lastAttemptAt && Date.now() - state.lastAttemptAt < SCOPUS_RECOVERY_COOLDOWN_MS) {
+    console.log(`[Scopus Session] Recovery for task ${taskId} on cooldown, skipping`);
+    return;
+  }
+
+  if (state.attempts >= SCOPUS_MAX_RECOVERY_ATTEMPTS) {
+    console.warn(`[Scopus Session] Task ${taskId} exhausted ${SCOPUS_MAX_RECOVERY_ATTEMPTS} recovery attempts; reporting LOGIN_FAILED`);
+    addLog(`Scopus auto-recovery failed after ${state.attempts} attempts`, 'error');
+    await postSessionEvent('SCOPUS', 'LOGIN_FAILED',
+      `auto-recovery exhausted after ${state.attempts} attempts`);
+    // Mark the broker task as failed so the orchestrator surfaces LOGIN_FAILED
+    // promptly instead of waiting for its 30-min source timeout.
+    try {
+      const headers = await brokerHeaders();
+      await fetch(`${API_BASE}/api/tasks/${taskId}/fail`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ error: 'Scopus auto-recovery exhausted' }),
+      });
+    } catch (e) {
+      console.warn('[Scopus Session] Failed to mark task failed:', e?.message || e);
+    }
+    await clearScopusRecoveryState(taskId);
+    clearPendingTab(tabId);
+    return;
+  }
+
+  const nextAttempt = state.attempts + 1;
+  await setScopusRecoveryState(taskId, { attempts: nextAttempt, lastAttemptAt: Date.now() });
+
+  console.log(`[Scopus Session] Recovery attempt ${nextAttempt}/${SCOPUS_MAX_RECOVERY_ATTEMPTS} for task ${taskId}`);
+  addLog(`Scopus recovery attempt ${nextAttempt}: clearing cookies & storage`, 'warning');
+  await postSessionEvent('SCOPUS', 'LOGIN_IN_PROGRESS',
+    `recovery attempt ${nextAttempt}: clearing browser data`);
+
+  // Wipe cookies + cache + IndexedDB + Service Workers + WebSQL + LocalStorage + ServerBoundCerts
+  // for Scopus and Elsevier origins. Browsing history is left alone — irrelevant.
+  try {
+    await chrome.browsingData.remove(
+      {
+        origins: [
+          'https://www.scopus.com',
+          'https://scopus.com',
+          'https://id.elsevier.com',
+          'https://www.elsevier.com',
+          'https://elsevier.com',
+        ],
+      },
+      {
+        cookies: true,
+        localStorage: true,
+        indexedDB: true,
+        cacheStorage: true,
+        serviceWorkers: true,
+      }
+    );
+    console.log('[Scopus Session] Cleared cookies + storage for Scopus/Elsevier');
+  } catch (e) {
+    console.warn('[Scopus Session] browsingData.remove failed:', e?.message || e);
+  }
+
+  // Also wipe any stragglers via cookies API (covers cases where
+  // browsingData missed cookies on subdomains we didn't list).
+  try {
+    const domains = ['.scopus.com', '.elsevier.com'];
+    for (const domain of domains) {
+      const cookies = await chrome.cookies.getAll({ domain });
+      for (const c of cookies) {
+        const protocol = c.secure ? 'https://' : 'http://';
+        const host = c.domain.startsWith('.') ? c.domain.substring(1) : c.domain;
+        const cookieUrl = protocol + host + c.path;
+        try {
+          await chrome.cookies.remove({ url: cookieUrl, name: c.name, storeId: c.storeId });
+        } catch {
+          /* ignore individual cookie removal failures */
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[Scopus Session] Manual cookie sweep failed:', e?.message || e);
+  }
+
+  // Reload the tab back to the original Scopus profile URL.
+  // The original URL may have included #scopus-task-id=<id> hash.
+  const profileUrl = `https://www.scopus.com/authid/detail.uri?authorId=${encodeURIComponent(externalId)}#scopus-task-id=${taskId}`;
+  try {
+    // Reset readiness flag so the next SCRAPE_READY is honored
+    const entry = pendingTabs.get(tabId);
+    if (entry) {
+      entry.readyAt = null;
+      resetScrapeTimeout(tabId);
+    }
+    await chrome.tabs.update(tabId, { url: profileUrl });
+    console.log(`[Scopus Session] Tab #${tabId} reloaded to ${profileUrl}`);
+  } catch (e) {
+    console.warn('[Scopus Session] Tab update failed:', e?.message || e);
+  }
+}
+
+/**
+ * Reports a login/session-state transition to the broker so the backend can
+ * decide whether to keep waiting on a stuck task. Best-effort — failures are
+ * logged but never thrown (a flaky network shouldn't break the scrape).
+ *
+ * @param {string} source  WOS | SCOPUS | SCHOLAR
+ * @param {string} event   LOGIN_DETECTED | LOGIN_IN_PROGRESS | LOGIN_SUCCESS | LOGIN_FAILED
+ * @param {string} [detail]
+ */
+async function postSessionEvent(source, event, detail) {
+  try {
+    const headers = await brokerHeaders();
+    await fetch(`${API_BASE}/api/session-events`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ source, event, detail: detail || '' }),
+    });
+    console.log(`[Session] reported ${source}/${event}`);
+  } catch (e) {
+    console.warn(`[Session] Failed to post ${source}/${event}:`, e?.message || e);
+  }
+}
+
 function resetScrapeTimeout(tabId) {
   // Always cleanup old timeout first, even if exception occurs
   if (scrapeTimeouts.has(tabId)) {
@@ -370,7 +530,70 @@ function scheduleOrchestrator(delayMs) {
 
 chrome.runtime.onInstalled.addListener(() => {
   scheduleOrchestrator(2000); // Start after 2s
+  cleanupOnStartup('install').catch(e => console.warn('[Startup] cleanup failed:', e?.message || e));
 });
+
+// Service worker boot: when Chrome wakes the worker after idle / browser
+// restart / extension reload, the in-memory pending* maps are gone but
+// browser tabs from prior runs may still be open. Without cleanup, those
+// tabs become orphaned (no taskId → no scrape → eventually time out).
+chrome.runtime.onStartup.addListener(() => {
+  cleanupOnStartup('browser-start').catch(e => console.warn('[Startup] cleanup failed:', e?.message || e));
+});
+
+/**
+ * Closes any leftover bot tabs from a prior session and clears persisted
+ * worker-window/task state so the next sync starts fresh.
+ */
+async function cleanupOnStartup(reason) {
+  console.log(`[Startup] Running cleanup (reason: ${reason})`);
+
+  // 1. If a worker window persists from a prior run, close it. We don't try
+  //    to reuse it: its tabs have lost their pendingTabs entries and would
+  //    just sit there idle.
+  try {
+    const wins = await chrome.windows.getAll({ populate: false });
+    for (const w of wins) {
+      // Heuristic: any window opened by us would have a single about:blank
+      // initially or hold our task-hash URLs. Safer: scan all windows for
+      // tabs whose URL looks like a bot task and close those tabs.
+    }
+  } catch (_) { /* ignore */ }
+
+  // 2. Sweep all tabs across all windows for stale bot task URLs (those
+  //    carrying our task-id hash). Without an in-memory entry tracking them,
+  //    they'd never resolve — close them.
+  try {
+    const allTabs = await chrome.tabs.query({});
+    let closed = 0;
+    for (const t of allTabs) {
+      const u = t.url || t.pendingUrl || '';
+      if (u.includes('wos-task-id=')
+          || u.includes('scopus-task-id=')
+          || u.includes('scholar-task-id=')
+          || u.includes('plumx-task-id=')
+          || u.includes('wos-doi-task-id=')
+          || u.includes('scholar-doi-task-id=')
+          || u.includes('citation-report-task-id=')) {
+        try { await chrome.tabs.remove(t.id); closed++; } catch (_) { /* ignore */ }
+      }
+    }
+    if (closed > 0) console.log(`[Startup] Closed ${closed} orphan bot tabs`);
+  } catch (_) { /* ignore */ }
+
+  // 3. Wipe task-info entries persisted in storage.session.
+  try {
+    const all = await chrome.storage.session.get(null);
+    const keysToRemove = Object.keys(all).filter(k =>
+      /^\d+$/.test(k)                   // numeric tab-id keys
+      || k.startsWith('scopus_recovery_') // recovery counters
+      || k === 'wos_return_url');
+    if (keysToRemove.length > 0) {
+      await chrome.storage.session.remove(keysToRemove);
+      console.log(`[Startup] Cleared ${keysToRemove.length} stale session keys`);
+    }
+  } catch (_) { /* ignore */ }
+}
 
 // ═══════════════════════════════════════════════
 //  PHASE-BASED ORCHESTRATOR (WOS → SCOPUS+PLUMX → SCHOLAR)
@@ -808,7 +1031,11 @@ async function pollPlumx() {
 async function openPlumxTab(taskId, doi) {
   const url = `https://plu.mx/plum/a/?doi=${encodeURIComponent(doi)}&theme=plum-sciencedirect-theme&hideUsage=true#plumx-task-id=${taskId}`;
   try {
-    const tab = await chrome.tabs.create({ url, active: false });
+    const winId = await getOrCreateWorkerWindow();
+    const opts = { url, active: false };
+    if (winId != null) opts.windowId = winId;
+    const tab = await chrome.tabs.create(opts);
+    if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
     pendingPlumx.set(tab.id, { taskId, doi });
     console.log(`[PlumX Worker] Opened PlumX tab #${tab.id} for DOI: ${doi}`);
     broadcastTaskStarted(taskId, 'PLUMX', doi);
@@ -818,6 +1045,116 @@ async function openPlumxTab(taskId, doi) {
       const h = await brokerHeaders();
       await fetch(`${API_BASE}/api/plumx-tasks/${taskId}/fail`, { method: 'POST', headers: h });
     } catch (_) { }
+  }
+}
+
+// ═══════════════════════════════════════════════
+//  WORKER WINDOW — keeps bot tabs out of background-throttle
+// ═══════════════════════════════════════════════
+// Chrome aggressively throttles JS timers + animation in tabs that are not
+// "active in a visible window". WoS / Scopus / Scholar are SPAs that depend
+// on those timers to render — when their tab is hidden, metric DOM nodes
+// never appear and the scrape times out.
+//
+// We dedicate a separate Chrome window to bot work. The window is created
+// `focused: false` so we don't disrupt the operator's current work, but its
+// tabs are still considered "active in window" by Chrome's renderer, which
+// means no background throttling. The user can position / minimize / move
+// this window however they like; we recreate it transparently if closed.
+
+let workerWindowId = null;
+/** Tab id of the placeholder `about:blank` tab created with the worker window. */
+let workerPlaceholderTabId = null;
+
+// Reset cached id if user closes the worker window
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (windowId === workerWindowId) {
+    console.log('[Worker Window] Closed by user; will recreate on next task');
+    workerWindowId = null;
+    workerPlaceholderTabId = null;
+  }
+});
+
+/**
+ * Closes the placeholder `about:blank` tab once a real bot tab is open in
+ * the worker window. Safe to call multiple times — only acts on the first
+ * call after a window creation.
+ *
+ * Must be called AFTER a real tab has been added, otherwise removing the
+ * last tab would close the window.
+ */
+async function dismissWorkerPlaceholder() {
+  const placeholderId = workerPlaceholderTabId;
+  if (placeholderId == null) return;
+  workerPlaceholderTabId = null; // clear first so concurrent calls no-op
+  try {
+    // Sanity check: the worker window still has more than just the placeholder
+    if (workerWindowId != null) {
+      const tabs = await chrome.tabs.query({ windowId: workerWindowId });
+      if (tabs.length <= 1) {
+        // Only placeholder — don't remove or the window closes. Restore the id.
+        workerPlaceholderTabId = placeholderId;
+        return;
+      }
+    }
+    await chrome.tabs.remove(placeholderId);
+  } catch (_) {
+    // Tab may already be gone; nothing to do
+  }
+}
+
+/**
+ * Sweep any leftover `about:blank` / new-tab pages from the worker window.
+ * Catches the case where Chrome opens a new tab unexpectedly (e.g., a popup
+ * blocker bypass, an extension dialog) or where the placeholder id we cached
+ * went stale.
+ */
+async function sweepBlankTabsInWorker(keepTabId) {
+  if (workerWindowId == null) return;
+  try {
+    const tabs = await chrome.tabs.query({ windowId: workerWindowId });
+    if (tabs.length <= 1) return; // never empty the window
+    for (const t of tabs) {
+      if (t.id === keepTabId) continue;
+      const u = t.url || t.pendingUrl || '';
+      if (u === '' || u === 'about:blank' || u.startsWith('chrome://newtab')) {
+        chrome.tabs.remove(t.id).catch(() => {});
+      }
+    }
+  } catch (_) { /* ignore */ }
+}
+
+async function getOrCreateWorkerWindow() {
+  // Validate cached id — user may have closed it
+  if (workerWindowId != null) {
+    try {
+      await chrome.windows.get(workerWindowId);
+      return workerWindowId;
+    } catch (_) {
+      workerWindowId = null;
+    }
+  }
+
+  try {
+    const win = await chrome.windows.create({
+      url: 'about:blank',
+      type: 'normal',
+      focused: false,
+      // Reasonable size — large enough that Chrome doesn't treat it as
+      // occluded, small enough to tuck in a corner.
+      width: 1100,
+      height: 800,
+      left: 50,
+      top: 50,
+    });
+    workerWindowId = win.id;
+    // Track the placeholder so we can remove it once a real bot tab joins.
+    workerPlaceholderTabId = win.tabs?.[0]?.id ?? null;
+    addLog('Worker window created — bot tabs will run there to avoid background throttling', 'info');
+    return workerWindowId;
+  } catch (e) {
+    console.warn('[Worker Window] Create failed, falling back to current window:', e?.message || e);
+    return null;
   }
 }
 
@@ -848,11 +1185,21 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
     url = `${baseUrl}#wos-task-id=${taskId}`;
   }
 
-  // Always open as ACTIVE tab so the content script can navigate properly
-  const tab = await chrome.tabs.create({
-    url,
-    active: true,
-  });
+  // Open in the dedicated worker window so the tab is "active in window"
+  // and avoids Chrome's background-tab throttling. Falls back to a normal
+  // tab in the current window if window creation fails.
+  const winId = await getOrCreateWorkerWindow();
+  const createOpts = { url, active: true };
+  if (winId != null) createOpts.windowId = winId;
+  const tab = await chrome.tabs.create(createOpts);
+
+  // Now that there's a real tab in the worker window, drop the placeholder
+  // about:blank that was created with the window. Also sweep any other
+  // empty tabs that may have crept in.
+  if (winId != null) {
+    await dismissWorkerPlaceholder();
+    await sweepBlankTabsInWorker(tab.id);
+  }
 
   const tabId = tab.id;
   await chrome.storage.session.set({ [tabId]: { taskId, externalId, source, taskType: taskType || 'FULL_SCRAPE' } });
@@ -1135,26 +1482,85 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // ── WoS Session Handler: Login success signal ──
   if (msg.type === 'WOS_LOGIN_SUCCESS') {
     const tabId = sender.tab?.id;
-    if (tabId != null) {
-      const entry = pendingTabs.get(tabId);
-      if (entry) {
-        // Reconstruct the profile URL to ensure we return to the task even if hash is lost
-        let retryUrl = sender.tab?.url;
-        if (entry.externalId && entry.source === 'WOS') {
-          const baseUrl = `https://www.webofscience.com/wos/author/record/${encodeURIComponent(entry.externalId)}`;
-          retryUrl = `${baseUrl}#wos-task-id=${entry.taskId}`;
-        }
+    // Tell backend recovery is done — backend's polling will switch the source
+    // out of LOGIN_RECOVERING state on its next status query.
+    postSessionEvent('WOS', 'LOGIN_SUCCESS', 'auto-login completed');
 
-        console.log(`[WoS Session] Login success on tab #${tabId}, navigating to: ${retryUrl}`);
-        addLog('WoS session restored, retrying scrape...', 'warning');
+    (async () => {
+      if (tabId == null) return;
+      const entry = pendingTabs.get(tabId);
+
+      // Priority 1: explicit return URL set by force-navigate fallback
+      // (article detail / citation-report / summary pages).
+      let returnUrl = null;
+      try {
+        const stored = await chrome.storage.session.get(['wos_return_url']);
+        returnUrl = stored.wos_return_url || null;
+        if (returnUrl) {
+          await chrome.storage.session.remove(['wos_return_url']);
+        }
+      } catch (e) {
+        console.warn('[WoS Session] Could not read return URL:', e);
+      }
+
+      let retryUrl = returnUrl || sender.tab?.url;
+
+      // Priority 2: reconstruct author profile URL when we know we're scraping one
+      if (!returnUrl && entry?.externalId && entry?.source === 'WOS') {
+        const baseUrl = `https://www.webofscience.com/wos/author/record/${encodeURIComponent(entry.externalId)}`;
+        retryUrl = `${baseUrl}#wos-task-id=${entry.taskId}`;
+      }
+
+      console.log(`[WoS Session] Login success on tab #${tabId}, navigating to: ${retryUrl}`);
+      addLog('WoS session restored, retrying scrape...', 'warning');
+      if (entry) {
         entry.readyAt = null; // allow next SCRAPE_READY from reloaded content.js
         resetScrapeTimeout(tabId); // extend the overall task timeout
-
-        // Navigate the tab to restart content.js scraping
-        chrome.tabs.update(tabId, { url: retryUrl });
-        console.log(`[WoS Session] Tab #${tabId} navigated to restart scraping.`);
       }
+
+      try {
+        await chrome.tabs.update(tabId, { url: retryUrl });
+        console.log(`[WoS Session] Tab #${tabId} navigated to restart scraping.`);
+      } catch (e) {
+        console.warn('[WoS Session] Tab update failed:', e?.message || e);
+      }
+    })();
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // ── Generic session-state event from content scripts ──
+  // Content scripts can send {type: 'SESSION_EVENT', source, event, detail}
+  // for any source/event pair; we forward to the broker so backend stays in sync.
+  if (msg.type === 'SESSION_EVENT') {
+    if (msg.source && msg.event) {
+      postSessionEvent(msg.source, msg.event, msg.detail);
     }
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // ── WoS return-URL persistence (storage.session not always usable from MAIN world) ──
+  if (msg.type === 'WOS_SET_RETURN_URL') {
+    chrome.storage.session.set({ wos_return_url: msg.url || '' })
+      .catch(e => console.warn('[WoS Session] Failed to set return URL:', e?.message || e));
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // ── Scopus session recovery: clear cookies/storage and retry ──
+  // Triggered by scopus_session_handler.js when it sees a login redirect.
+  if (msg.type === 'RECOVER_SCOPUS_SESSION') {
+    const tabId = sender.tab?.id;
+    const taskId = msg.taskId;
+    const externalId = msg.externalId;
+    if (tabId == null || !taskId || !externalId) {
+      sendResponse({ ok: false });
+      return false;
+    }
+    recoverScopusSession(tabId, taskId, externalId).catch(e => {
+      console.warn('[Scopus Session] Recovery threw:', e?.message || e);
+    });
     sendResponse({ ok: true });
     return true;
   }
@@ -1378,6 +1784,13 @@ async function handleAuthorMetrics(msg, senderTabId) {
       if (resp.ok) {
         addLog(`Task ${taskId} completed!`, 'success');
         if (diagTask) { diagTask.status = 'COMPLETED'; diagTask.completedAt = new Date().toISOString(); }
+        // If this was a Scopus task that may have gone through recovery,
+        // tell the backend the session is now OK and clear the per-task
+        // recovery counter so future tasks start fresh.
+        if (source === 'SCOPUS') {
+          await postSessionEvent('SCOPUS', 'LOGIN_SUCCESS', `task ${taskId} completed`);
+          await clearScopusRecoveryState(taskId);
+        }
       } else {
         addLog(`Task ${taskId} complete returned ${resp.status}`, 'warning');
         if (diagTask) { diagTask.status = 'ERROR'; diagTask.error = `HTTP ${resp.status}`; diagTask.completedAt = new Date().toISOString(); }
@@ -1533,7 +1946,11 @@ async function fillDetailTabPool(taskId) {
 
 async function openDetailTab(taskId, job, url) {
   try {
-    const tab = await chrome.tabs.create({ url, active: false });
+    const winId = await getOrCreateWorkerWindow();
+    const opts = { url, active: false };
+    if (winId != null) opts.windowId = winId;
+    const tab = await chrome.tabs.create(opts);
+    if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
     job.activeTabIds.add(tab.id);
     job.tabToUrlMap.set(tab.id, url);
     // Track WOS detail tabs
@@ -1948,7 +2365,11 @@ async function openWosDoiTab(taskId, doi) {
   const encodedDoi = encodeURIComponent(doi);
   const url = `https://www.webofscience.com/wos/woscc/smart-search#wos-doi-task-id=${taskId}&doi=${encodedDoi}`;
   try {
-    const tab = await chrome.tabs.create({ url, active: false });
+    const winId = await getOrCreateWorkerWindow();
+    const opts = { url, active: false };
+    if (winId != null) opts.windowId = winId;
+    const tab = await chrome.tabs.create(opts);
+    if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
     pendingWosDoiTabs.set(tab.id, { taskId, doi });
     console.log(`[WoS DOI Worker] Opened tab #${tab.id} for DOI: ${doi}`);
     broadcastTaskStarted(taskId, 'WOS', doi);
@@ -2055,7 +2476,11 @@ async function openScholarDoiTab(taskId, doi) {
   const encodedDoi = encodeURIComponent(doi);
   const url = `https://scholar.google.com/scholar_lookup?hl=en&doi=${encodedDoi}#scholar-doi-task-id=${taskId}&doi=${encodedDoi}`;
   try {
-    const tab = await chrome.tabs.create({ url, active: false });
+    const winId = await getOrCreateWorkerWindow();
+    const opts = { url, active: false };
+    if (winId != null) opts.windowId = winId;
+    const tab = await chrome.tabs.create(opts);
+    if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
     pendingScholarDoiTabs.set(tab.id, { taskId, doi });
     console.log(`[Scholar DOI Worker] Opened tab #${tab.id} for DOI: ${doi}`);
     broadcastTaskStarted(taskId, 'SCHOLAR', doi);
@@ -2173,7 +2598,11 @@ async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWo
   url = `${url}${sep}citation-report-task-id=${taskId}&author-wos-id=${authorWosId || ''}`;
 
   try {
-    const tab = await chrome.tabs.create({ url, active: false });
+    const winId = await getOrCreateWorkerWindow();
+    const opts = { url, active: false };
+    if (winId != null) opts.windowId = winId;
+    const tab = await chrome.tabs.create(opts);
+    if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
     pendingCitationReportTabs.set(tab.id, { taskId, authorWosId, openedAt: Date.now() });
     activeWosJobs.citationReportTab = tab.id;
     addLog(`[WOS Group] Citation report tab opened #${tab.id} for task ${taskId}`, 'info');

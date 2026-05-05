@@ -7,11 +7,14 @@
     "tabs",
     "alarms",
     "scripting",
-    "storage"
+    "storage",
+    "cookies",
+    "browsingData"
   ],
   "host_permissions": [
     "*://*.webofscience.com/*",
     "*://*.scopus.com/*",
+    "*://*.elsevier.com/*",
     "*://*.plu.mx/*",
     "*://scholar.google.com/*",
     "*://*.clarivate.com/*",
@@ -144,8 +147,13 @@
     {
       "matches": [
         "*://*.webofscience.com/wos/author/*",
+        "*://*.webofscience.com/wos/woscc/full-record/*",
+        "*://*.webofscience.com/wos/alldb/full-record/*",
+        "*://*.webofscience.com/wos/woscc/citation-report*",
         "*://*.webofscience.com/wos/alldb/basic-search*",
         "*://*.webofscience.com/wos/woscc/basic-search*",
+        "*://*.webofscience.com/wos/woscc/summary*",
+        "*://*.webofscience.com/wos/alldb/summary*",
         "*://*.clarivate.com/login*",
         "*://*.clarivate.com/auth/login*"
       ],
@@ -154,6 +162,18 @@
       ],
       "run_at": "document_idle",
       "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.scopus.com/*",
+        "*://id.elsevier.com/*",
+        "*://*.elsevier.com/authenticate/*",
+        "*://*.elsevier.com/oauth/*"
+      ],
+      "js": [
+        "scopus_session_handler.js"
+      ],
+      "run_at": "document_idle"
     }
   ]
 }

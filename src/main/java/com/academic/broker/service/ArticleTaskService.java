@@ -375,6 +375,24 @@ public class ArticleTaskService {
         plumxRepository.save(task);
     }
 
+    /**
+     * Deletes all PENDING PlumX tasks. PROCESSING tasks are preserved so the
+     * worker can finish them cleanly. Returns the number of deleted rows.
+     */
+    @Transactional
+    public int deletePendingPlumxTasks() {
+        return plumxRepository.deletePendingPlumx();
+    }
+
+    /**
+     * Deletes all PENDING article tasks (WOS / SCOPUS / SCHOLAR). PROCESSING
+     * preserved. Returns the number of deleted rows.
+     */
+    @Transactional
+    public int deletePendingArticleTasks() {
+        return repository.deletePendingArticles();
+    }
+
     @Transactional
     public ConsumeTasksResponse consumeCompletedPlumxTasks() {
         List<PlumxTask> completed = plumxRepository.findCompletedForConsume();

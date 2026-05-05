@@ -19,13 +19,82 @@
     };
 
     let checkAttempts = 0;
+    let loginDetectedReported = false;
+    let loginInProgressReported = false;
+    let forceNavigatedToLogin = false;
+
+    /** Best-effort report to background → broker → backend. */
+    function reportSession(event, detail) {
+        try {
+            chrome.runtime.sendMessage({ type: 'SESSION_EVENT', source: 'WOS', event, detail });
+        } catch (e) {
+            // Ignore — extension context may be closed
+        }
+    }
+
+    /**
+     * Detail / citation-report / search pages may show a session-expired state
+     * without a visible "Sign In" button (just a partial preview or a paywall).
+     * In that case the handler can sit forever waiting for an element that
+     * never appears. After a few unsuccessful checks we save the current URL
+     * and force-navigate to the auth URL — the login form there is auto-filled
+     * by this same script's existing form-handling code.
+     */
+    function isDataPage() {
+        const path = window.location.pathname;
+        return path.includes('/full-record/')
+            || path.includes('/citation-report')
+            || path.includes('/summary')
+            || path.includes('/wos/author/record/');
+    }
+
+    function hasArticleContent() {
+        // Heuristic: if any of these are present, the page is rendering real
+        // content and we shouldn't intervene.
+        return !!(
+            document.querySelector('[data-ta="record-summary"]')
+            || document.querySelector('app-record-content')
+            || document.querySelector('app-author-name-link')
+            || document.querySelector('app-records-list')
+            || document.querySelector('[data-author-metrics-h-index]')
+        );
+    }
+
+    async function forceNavigateToLogin() {
+        if (forceNavigatedToLogin) return false;
+        forceNavigatedToLogin = true;
+        const currentUrl = window.location.href;
+        // chrome.storage.* may be unavailable in MAIN-world content scripts,
+        // so route the persistence through background.js via runtime.sendMessage.
+        try {
+            chrome.runtime.sendMessage({ type: 'WOS_SET_RETURN_URL', url: currentUrl });
+        } catch (e) {
+            console.warn('[WoS Session] Could not store return URL:', e);
+        }
+        if (!loginDetectedReported) {
+            loginDetectedReported = true;
+            reportSession('LOGIN_DETECTED', 'no Sign In control on data page — forcing login URL');
+        }
+        console.log('[WoS Session] Force-navigating to login URL, return =', currentUrl);
+        // Clarivate's canonical login entry point — wos_session_handler will run
+        // there too (manifest matches /clarivate.com/login*) and handle the form.
+        window.location.href = 'https://access.clarivate.com/login?app=wos&alternative=true';
+        return true;
+    }
 
     function _humanDelay(min = 300, max = 800) {
         return new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min));
     }
 
     function isVisible(el) {
-        return el && el.offsetParent !== null;
+        if (!el) return false;
+        // offsetParent is null for `position: fixed` elements and elements
+        // inside CSS containment, so check rect + computed style instead.
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        return true;
     }
 
     function getVisibleElement(selectors) {
@@ -33,6 +102,32 @@
         for (const sel of selectors) {
             const el = document.querySelector(sel);
             if (isVisible(el)) return el;
+        }
+        return null;
+    }
+
+    /**
+     * Finds the visible "Sign In" control by looking at multiple signals:
+     * exact text, partial text, aria-label, data-* attributes, role.
+     * WoS rebrands periodically and exact-text-only matching breaks.
+     */
+    function findSignInControl() {
+        const candidates = Array.from(document.querySelectorAll(
+            'button, a, [role="button"], mat-menu-item, [cdxanalyticscategory*="sign"]'
+        ));
+        for (const el of candidates) {
+            if (!isVisible(el)) continue;
+            const text = (el.textContent || el.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const aria = ((el.getAttribute && el.getAttribute('aria-label')) || '').toLowerCase();
+            const cat = ((el.getAttribute && el.getAttribute('cdxanalyticscategory')) || '').toLowerCase();
+            // Match exact "sign in", "sign in to access", "sign in / register" etc.
+            // Cap length so we don't match a paragraph that contains the phrase.
+            if (text.length < 30 && (text === 'sign in' || text.startsWith('sign in') || text.endsWith('sign in'))) {
+                return el;
+            }
+            if (aria.includes('sign in') || cat.includes('sign_in') || cat.includes('signin')) {
+                return el;
+            }
         }
         return null;
     }
@@ -142,40 +237,20 @@
 
     // ── Step 2: Click header "Sign In" button (opens dropdown menu) ──
     async function clickHeaderSignIn() {
-        const btns = Array.from(document.querySelectorAll('button, a'));
-        console.log('[WoS Session] Found', btns.length, 'buttons/links on page');
-
-        // Try exact match first
-        const signInBtn = btns.find(b => {
-            const text = (b.textContent || b.innerText || '').trim().toLowerCase();
-            const visible = isVisible(b);
-            if (text.includes('sign')) {
-                console.log('[WoS Session] Found button with "sign":', text, 'visible:', visible, 'classes:', b.className);
-            }
-            return text === 'sign in' && visible;
-        });
-        if (signInBtn) {
-            console.log('[WoS Session] Clicking header Sign In button (exact match)');
-            signInBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
-            await _humanDelay(200, 500);
-            signInBtn.click();
-            await _humanDelay(800, 1500);
-            return true;
+        const btn = findSignInControl();
+        if (!btn) {
+            console.log('[WoS Session] Header Sign In control not found via any selector');
+            return false;
         }
-
-        // Fallback: try to find by cdxanalyticscategory attribute
-        const wosSignInBtn = document.querySelector('button[cdxanalyticscategory="wos-header-sign_in"], button.wos-sign-in');
-        if (wosSignInBtn && isVisible(wosSignInBtn)) {
-            console.log('[WoS Session] Clicking header Sign In button (attribute match)');
-            wosSignInBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
-            await _humanDelay(200, 500);
-            wosSignInBtn.click();
-            await _humanDelay(800, 1500);
-            return true;
-        }
-
-        console.log('[WoS Session] Header Sign In button not found');
-        return false;
+        const text = (btn.textContent || '').replace(/\s+/g, ' ').trim();
+        console.log('[WoS Session] Clicking Sign In control: text="' + text + '", tag=' + btn.tagName);
+        try {
+            btn.scrollIntoView({ block: 'center', behavior: 'instant' });
+        } catch (_) { /* scrollIntoView may throw inside iframes */ }
+        await _humanDelay(200, 500);
+        btn.click();
+        await _humanDelay(800, 1500);
+        return true;
     }
 
     // ── Step 2b: Click "Sign In" inside the opened dropdown menu ──
@@ -264,12 +339,24 @@
     // ── Main recovery loop ──
     async function attemptRecovery() {
         try {
+            // Quick health check log so we know the script is running and
+            // can see what state the page is in when we couldn't act.
+            console.log('[WoS Session] attempt', checkAttempts + 1,
+                'url=', window.location.pathname,
+                'hasArticleContent=', hasArticleContent(),
+                'signInControl=', !!findSignInControl(),
+                'loginForm=', !!document.querySelector('input[name="email"], input[formcontrolname="email"], input#mat-input-1'));
+
             // 1. Dismiss Pendo if present
             const pendoDismissed = await dismissPendoPopup();
 
             // 2. If login form is already visible, fill & submit
             const emailInput = document.querySelector('input[name="email"], input[formcontrolname="email"], input#mat-input-1');
             if (emailInput) {
+                if (!loginInProgressReported) {
+                    loginInProgressReported = true;
+                    reportSession('LOGIN_IN_PROGRESS', 'login form visible, filling credentials');
+                }
                 await fillAndSubmitLogin();
                 return true;
             }
@@ -287,13 +374,25 @@
                 }
             }
 
-            // 4. If header "Sign In" button is visible, click it to open the dropdown
-            const signInBtn = Array.from(document.querySelectorAll('button, a')).find(b => {
-                const text = (b.textContent || '').trim().toLowerCase();
-                return text === 'sign in' && isVisible(b);
-            });
+            // 4. If a "Sign In" control is anywhere on the page, click it
+            const signInBtn = findSignInControl();
             if (signInBtn) {
+                if (!loginDetectedReported) {
+                    loginDetectedReported = true;
+                    reportSession('LOGIN_DETECTED', 'Sign In control visible — session expired');
+                }
                 await clickHeaderSignIn();
+                return true;
+            }
+
+            // 5. Last resort: detail/citation pages without any Sign In control
+            //    AND without article content visible. After a few attempts of
+            //    finding nothing, force-navigate to the canonical login URL so
+            //    the form-handling code below picks up. The backend's
+            //    pendingTabs.entry tracks the original URL via the hash so
+            //    background.js can restore it after WOS_LOGIN_SUCCESS.
+            if (checkAttempts >= 3 && isDataPage() && !hasArticleContent()) {
+                await forceNavigateToLogin();
                 return true;
             }
 
@@ -314,6 +413,10 @@
         checkAttempts++;
         if (checkAttempts > CONFIG.maxCheckAttempts) {
             console.log('[WoS Session] Max checks reached, stopping session monitor.');
+            // If we got far enough to attempt login but it never resolved, signal failure.
+            if (loginInProgressReported) {
+                reportSession('LOGIN_FAILED', 'auto-login did not complete within ' + CONFIG.maxCheckAttempts + ' checks');
+            }
             clearInterval(intervalId);
             return;
         }

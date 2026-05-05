@@ -73,4 +73,18 @@ public class PlumxTaskController {
         ConsumeTasksResponse response = taskService.consumeCompletedPlumxTasks();
         return ResponseEntity.ok(response);
     }
+
+    /**
+     * Deletes all PENDING PlumX tasks. Used by the backend when a new sync
+     * starts (so leftover tasks from prior runs don't keep the worker busy)
+     * or when the user cancels a sync. Currently in-progress (PROCESSING)
+     * tasks are left alone so the worker can finish them cleanly.
+     *
+     * <p>Returns the count of deleted tasks.
+     */
+    @DeleteMapping("/pending")
+    public ResponseEntity<Map<String, Object>> deletePendingPlumxTasks() {
+        int deleted = taskService.deletePendingPlumxTasks();
+        return ResponseEntity.ok(Map.of("deleted", deleted));
+    }
 }

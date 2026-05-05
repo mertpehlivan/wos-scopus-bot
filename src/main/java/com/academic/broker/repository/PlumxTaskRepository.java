@@ -48,4 +48,13 @@ public interface PlumxTaskRepository extends JpaRepository<PlumxTask, Long> {
     @Modifying
     @Query("DELETE FROM PlumxTask")
     int deleteAllPlumx();
+
+    /**
+     * Deletes all PENDING PlumX tasks. Used to clear leftover tasks from a
+     * prior sync so they don't keep the worker busy after a new sync starts
+     * or after the user cancels.
+     */
+    @Modifying
+    @Query("DELETE FROM PlumxTask t WHERE t.status = com.academic.broker.domain.TaskStatus.PENDING")
+    int deletePendingPlumx();
 }

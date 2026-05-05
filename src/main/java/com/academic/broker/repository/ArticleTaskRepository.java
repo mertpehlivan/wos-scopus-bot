@@ -77,4 +77,13 @@ public interface ArticleTaskRepository extends JpaRepository<ArticleTask, Long> 
     @Modifying
     @Query("DELETE FROM ArticleTask t")
     int deleteAllTasks();
+
+    /**
+     * Wipes all PENDING article tasks. PROCESSING ones are preserved so the
+     * worker can finish what it has in flight without confusing it with a
+     * sudden missing-row.
+     */
+    @Modifying
+    @Query("DELETE FROM ArticleTask t WHERE t.status = com.academic.broker.domain.TaskStatus.PENDING")
+    int deletePendingArticles();
 }

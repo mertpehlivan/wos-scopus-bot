@@ -55,6 +55,26 @@
             return;
         }
 
+        // Bail early ONLY if the URL itself proves we're on a login/OAuth page.
+        // We deliberately don't sniff the DOM here (e.g., password inputs)
+        // because Scopus author pages can carry inline sign-in widgets that
+        // would falsely trigger bail-out and starve the scrape.
+        // Use pathname / host so query-string params like `?ref=login` don't
+        // trip the check.
+        const host = window.location.host;
+        const path = window.location.pathname;
+        const isLoginPage =
+            host.includes('id.elsevier.com') ||
+            path.includes('/authenticate/') ||
+            path.includes('/oauth/') ||
+            path === '/signin' || path.startsWith('/signin/') ||
+            path === '/login' || path.startsWith('/login/');
+        if (isLoginPage) {
+            console.log('[WoS Worker] Scopus login redirect detected (host=' + host + ', path=' + path + ') — yielding to session handler');
+            return;
+        }
+        console.log('[WoS Worker] Scopus author page check passed (host=' + host + ', path=' + path + ')');
+
         console.log(`[WoS Worker] Started handling Scopus task ID: ${taskId}`);
 
         // ── Handshake: Signal that the content script is ready ──
@@ -66,36 +86,77 @@
             log: 'Started parsing Scopus profile metrics...',
         });
 
-        // Wait for DOM elements to render with human-like delays
+        // Wait for DOM elements to render with human-like delays.
+        // Two extraction strategies, run in tandem:
+        //   1. Specific section selectors (fast when they match)
+        //   2. Body-text regex fallback (resilient to Scopus DOM rewrites)
         let authorMetrics = { hIndex: 0, sumOfTimesCited: 0, publications: 0, citingArticles: 0 };
+
+        const sectionSelectors = {
+            citations: '[data-testid="metrics-section-citations-count"], [data-author-metrics-citations-count="true"], [data-testid*="citation"], [aria-label*="citation" i], .citations-count',
+            docs:      '[data-testid="metrics-section-document-count"], [data-author-metrics-document-count="true"], [data-testid*="document"], [aria-label*="document" i], .document-count',
+            hIndex:    '[data-testid="metrics-section-h-index"], [data-author-metrics-h-index="true"], [data-testid*="h-index" i], [aria-label*="h-index" i], .h-index',
+        };
+        const countNodeSelector = '[data-testid="unclickable-count"], [data-testid="clickable-count"], [data-testid*="count"], span.Typography-module__ix7bs, .Typography-module__ix7bs, .metrics-count';
+
+        function extractCount(section) {
+            if (!section) return 0;
+            const node = section.querySelector(countNodeSelector);
+            if (node) {
+                const n = parseInt((node.textContent || '').replace(/,/g, ''), 10);
+                if (!isNaN(n)) return n;
+            }
+            const text = (section.textContent || '').replace(/,/g, '').match(/\d+/);
+            return text ? parseInt(text[0], 10) : 0;
+        }
+
+        // Body-text regex extractor — runs only if section selectors fail.
+        // Scopus author pages put the metric numbers next to clearly-labelled text.
+        function extractFromBodyText() {
+            const txt = (document.body?.innerText || '').replace(/ /g, ' ');
+            // h-index: "h-index" optionally followed by colon and a number
+            const h = txt.match(/h[\s\-]*index[^0-9]{0,40}?(\d{1,5})/i);
+            const cites = txt.match(/(?:total\s+citations?|sum\s+of\s+times\s+cited|citations\s+by[\s\d,]*?\s+documents?)[^0-9]{0,40}?(\d[\d,]{0,9})/i)
+                || txt.match(/citations?\s*[:\-]?\s*(\d[\d,]{0,9})/i);
+            const docs = txt.match(/(?:documents?(?:\s+by\s+author)?|publications?)[^0-9]{0,40}?(\d[\d,]{0,6})/i);
+            const citing = txt.match(/citations\s+by\s+([\d,]+)\s+documents?/i);
+            return {
+                hIndex: h ? parseInt(h[1], 10) : 0,
+                sumOfTimesCited: cites ? parseInt(cites[1].replace(/,/g, ''), 10) : 0,
+                publications: docs ? parseInt(docs[1].replace(/,/g, ''), 10) : 0,
+                citingArticles: citing ? parseInt(citing[1].replace(/,/g, ''), 10) : 0,
+            };
+        }
+
         for (let i = 0; i < 60; i++) {
-            const citationsSection = document.querySelector('[data-testid="metrics-section-citations-count"], [data-author-metrics-citations-count="true"], .citations-count');
-            const docsSection = document.querySelector('[data-testid="metrics-section-document-count"], [data-author-metrics-document-count="true"], .document-count');
-            const hIndexSection = document.querySelector('[data-testid="metrics-section-h-index"], [data-author-metrics-h-index="true"], .h-index');
+            const citationsSection = document.querySelector(sectionSelectors.citations);
+            const docsSection = document.querySelector(sectionSelectors.docs);
+            const hIndexSection = document.querySelector(sectionSelectors.hIndex);
 
             if (citationsSection || docsSection || hIndexSection) {
-                const getCount = (section) => {
-                    if (!section) return 0;
-                    const node = section.querySelector('[data-testid="unclickable-count"], [data-testid="clickable-count"], span.Typography-module__ix7bs, .Typography-module__ix7bs, .metrics-count');
-                    if (node) return parseInt(node.textContent.replace(/,/g, ''), 10);
-                    // Fallback to text matching within section
-                    const text = section.textContent.replace(/,/g, '').match(/\d+/);
-                    return text ? parseInt(text[0], 10) : 0;
-                };
-
-                if (citationsSection) authorMetrics.sumOfTimesCited = getCount(citationsSection);
-                if (docsSection) authorMetrics.publications = getCount(docsSection);
-                if (hIndexSection) authorMetrics.hIndex = getCount(hIndexSection);
+                if (citationsSection) authorMetrics.sumOfTimesCited = extractCount(citationsSection);
+                if (docsSection) authorMetrics.publications = extractCount(docsSection);
+                if (hIndexSection) authorMetrics.hIndex = extractCount(hIndexSection);
 
                 const citationsText = citationsSection ? citationsSection.textContent : "";
-                const citingTextMatch = citationsText.match(/Citations by\s*([\d,]+)/i) || document.body.innerText.match(/Citations by\s*([\d,]+)/i);
+                const citingTextMatch = citationsText.match(/Citations by\s*([\d,]+)/i)
+                    || (document.body?.innerText || '').match(/Citations by\s*([\d,]+)/i);
                 if (citingTextMatch) {
                     authorMetrics.citingArticles = parseInt(citingTextMatch[1].replace(/,/g, ''), 10) || 0;
                 }
                 break;
             }
-            // Human-like wait between DOM checks
             await _humanDelay(800, 1500);
+        }
+
+        // If structured selectors failed, retry with body-text regex.
+        if (authorMetrics.hIndex === 0 && authorMetrics.publications === 0) {
+            console.log('[WoS Worker] Scopus structured selectors found nothing; trying body-text fallback');
+            const fallback = extractFromBodyText();
+            if (fallback.hIndex || fallback.publications || fallback.sumOfTimesCited) {
+                authorMetrics = { ...authorMetrics, ...fallback };
+                console.log('[WoS Worker] Scopus fallback parsed:', fallback);
+            }
         }
 
         if (authorMetrics.hIndex === 0 && authorMetrics.publications === 0) {

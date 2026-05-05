@@ -133,6 +133,18 @@ public class ArticleTaskController {
     }
 
     /**
+     * Wipes all PENDING article tasks (across WOS / SCOPUS / SCHOLAR).
+     * PROCESSING tasks are left alone so the worker can finish what it
+     * picked up. Used by the backend at sync-cancel and sync-start to
+     * prevent leftover work from a prior run from contaminating the new one.
+     */
+    @DeleteMapping("/pending")
+    public ResponseEntity<Map<String, Object>> deletePendingArticles() {
+        int deleted = taskService.deletePendingArticleTasks();
+        return ResponseEntity.ok(Map.of("deleted", deleted));
+    }
+
+    /**
      * Delete ALL tasks from every table. Requires confirmation.
      */
     @DeleteMapping("/reset-all")
