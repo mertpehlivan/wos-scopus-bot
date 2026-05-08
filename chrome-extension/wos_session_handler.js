@@ -486,15 +486,18 @@
             console.log('[WoS Session] Dispatching form submit event');
             form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
         }
-        // Best-effort, may be killed by navigation. The post-login
-        // session-handler picks up wos_login_pending and re-fires this
-        // message reliably.
-        try {
-            chrome.runtime.sendMessage({ type: 'WOS_LOGIN_SUCCESS' });
-            console.log('[WoS Session] WOS_LOGIN_SUCCESS signal sent (pre-nav, best-effort)');
-        } catch (e) {
-            // Swallow — we have the storage sentinel as backup.
-        }
+        // DO NOT fire WOS_LOGIN_SUCCESS here. The form post hasn't even
+        // completed — auth cookies aren't set yet — and any navigation
+        // background.js triggers in response would race the redirect
+        // chain and either land on an anonymous page (re-triggering
+        // login → loop) or, more commonly, get overwritten by the
+        // chain itself, leaving the tab on basic-search. Worse, this
+        // call also consumes the wos_return_url + wos_login_pending
+        // flags from storage, which kills the post-login breadcrumb
+        // path that IS reliable. The breadcrumb (checkPostLoginBreadcrumb
+        // → WOS_CHECK_POST_LOGIN) fires on the post-redirect WoS page
+        // when auth is fully established, and is the single source of
+        // truth for "login finished, navigate back to task URL".
 
         console.log('\n[WoS Session] 🔐 LOGIN PROCESS COMPLETE\n');
         return true;
