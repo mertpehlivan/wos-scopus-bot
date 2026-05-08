@@ -190,10 +190,22 @@ public class DoiEnrichTaskController {
             repository.save(task);
         });
 
-        // Forward result to backend Spring Boot
-        forwardToBackend(taskId, body, source);
+        // Forwarding to the main backend is DISABLED. The legacy
+        // /api/doi-enrich-tasks/{id}/complete endpoint on the backend
+        // wrote per-DOI enrichment straight into ResearcherProfile +
+        // StagedPublication, bypassing the operator approval gate.
+        //
+        // Per-DOI enrichment now flows exclusively through:
+        //   • Operator-panel "Tekrar Çek" on a publication row →
+        //     forcePlumxRefresh → bridge.ingestPlumxCompletion →
+        //     stagedData.publications[doi].citations.* (operator reviews)
+        //
+        // The DOI-enrich-tasks table still holds the COMPLETED row so
+        // any historical consumer can read it, but nothing is pushed to
+        // the backend automatically.
+        // forwardToBackend(taskId, body, source);  // disabled
 
-        log.info("[DoiEnrich Broker] Task {} ({}) completed", taskId, source);
+        log.info("[DoiEnrich Broker] Task {} ({}) completed (no-forward; operator-panel owns this now)", taskId, source);
         return ResponseEntity.ok().build();
     }
 
@@ -213,8 +225,8 @@ public class DoiEnrichTaskController {
             task.touch();
             repository.save(task);
 
-            // Forward failure to backend
-            forwardFailureToBackend(taskId, task.getDoi(), error, task.getSource());
+            // Forwarding to backend disabled — see completeTask Javadoc.
+            // forwardFailureToBackend(taskId, task.getDoi(), error, task.getSource());
         });
         log.warn("[DoiEnrich Broker] Task {} failed: {}", taskId, error);
         return ResponseEntity.ok().build();

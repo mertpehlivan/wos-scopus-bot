@@ -1,5 +1,6 @@
 package com.academic.broker.config;
 
+import com.academic.broker.service.OperatorAuthService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -35,15 +36,25 @@ public class SecurityConfig {
     @Value("${broker.extension-origin:chrome-extension://*}")
     private String extensionOrigin;
 
+    /** Origin where the operator panel runs. CSV — multiple allowed. */
+    @Value("${broker.operator-panel-origin:http://localhost:3001,http://localhost:3000}")
+    private String operatorPanelOrigins;
+
     @Bean
-    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    public SecurityFilterChain filterChain(HttpSecurity http,
+                                           OperatorAuthService operatorAuthService) throws Exception {
         http
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .csrf(csrf -> csrf.disable())
                 .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
+                // Order matters: ApiKey first (for backend/extension calls),
+                // then operator-token filter for /api/operator/sync-requests/**.
+                // Each filter's shouldNotFilter() bows out for the other's path.
                 .addFilterBefore(new ApiKeyAuthFilter(brokerApiKey),
-                        UsernamePasswordAuthenticationFilter.class);
+                        UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(new OperatorAuthFilter(operatorAuthService),
+                        ApiKeyAuthFilter.class);
         return http.build();
     }
 
@@ -52,11 +63,19 @@ public class SecurityConfig {
         CorsConfiguration configuration = new CorsConfiguration();
         // Use allowedOriginPatterns (supports wildcards) instead of setAllowedOrigins
         // so we don't need to hardcode extension IDs and allowCredentials can be toggled.
-        configuration.setAllowedOriginPatterns(List.of(
-                "chrome-extension://*",  // All Chrome extensions (development-friendly)
-                "http://localhost:*",    // Local development
-                extensionOrigin          // Specific extension ID from config (production override)
+        java.util.List<String> patterns = new java.util.ArrayList<>(List.of(
+                "chrome-extension://*",
+                "http://localhost:*",
+                "http://127.0.0.1:*",
+                extensionOrigin
         ));
+        if (operatorPanelOrigins != null && !operatorPanelOrigins.isBlank()) {
+            for (String o : operatorPanelOrigins.split(",")) {
+                String trimmed = o.trim();
+                if (!trimmed.isEmpty()) patterns.add(trimmed);
+            }
+        }
+        configuration.setAllowedOriginPatterns(patterns);
         configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         configuration.setAllowedHeaders(Arrays.asList("authorization", "content-type", "x-auth-token", "X-Api-Key"));
         configuration.setExposedHeaders(List.of("X-Api-Key"));

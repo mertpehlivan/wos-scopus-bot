@@ -31,12 +31,31 @@ public interface ArticleTaskRepository extends JpaRepository<ArticleTask, Long> 
 
     /**
      * Worker poll: select one PENDING task for the given source and lock it
-     * (PESSIMISTIC_WRITE)
-     * to avoid race conditions. Caller must run in a transaction and then update
-     * status to PROCESSING.
+     * ({@code PESSIMISTIC_WRITE}) to avoid race conditions. Caller must run
+     * in a transaction and then update status to PROCESSING.
+     *
+     * <p>Ordering — <b>least-time-remaining first</b>. Tasks attached to a
+     * sync request are sorted by the request's {@code expiresAt} ASC, so
+     * the request closest to its 24h SLA deadline gets serviced first;
+     * tasks with no sync request id (legacy / one-off refreshes) come
+     * after, ordered by their own createdAt for FIFO fairness.
+     *
+     * <p>The {@code COALESCE} returns the parent request's expiresAt
+     * when present, falling back to the task's own createdAt — which is
+     * a far-past timestamp relative to expiresAt, putting orphan tasks
+     * at the front. We don't want orphans first; the
+     * {@code CASE WHEN ... IS NULL} prefix bumps them to the end.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("SELECT t FROM ArticleTask t WHERE t.targetSource = :source AND t.status = com.academic.broker.domain.TaskStatus.PENDING ORDER BY t.createdAt ASC")
+    @Query("""
+        SELECT t FROM ArticleTask t
+        WHERE t.targetSource = :source
+          AND t.status = com.academic.broker.domain.TaskStatus.PENDING
+        ORDER BY
+          CASE WHEN t.syncRequestId IS NULL THEN 1 ELSE 0 END ASC,
+          (SELECT s.expiresAt FROM SyncRequest s WHERE s.id = t.syncRequestId) ASC,
+          t.createdAt ASC
+        """)
     List<ArticleTask> findOnePendingBySourceForUpdate(@Param("source") TargetSource source, Pageable pageable);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
@@ -86,4 +105,30 @@ public interface ArticleTaskRepository extends JpaRepository<ArticleTask, Long> 
     @Modifying
     @Query("DELETE FROM ArticleTask t WHERE t.status = com.academic.broker.domain.TaskStatus.PENDING")
     int deletePendingArticles();
+
+    /** All article-tasks linked to a given sync request. */
+    List<ArticleTask> findBySyncRequestId(java.util.UUID syncRequestId);
+
+    /**
+     * Deletes article-tasks for a given sync request that are still PENDING
+     * or PROCESSING. Used when the request transitions to a terminal state
+     * (APPROVED / REJECTED / EXPIRED) so the worker doesn't keep scraping
+     * for a sync the operator already closed.
+     */
+    @Modifying
+    @Query("DELETE FROM ArticleTask t WHERE t.syncRequestId = :reqId AND t.status IN :statuses")
+    int deleteBySyncRequestIdAndStatusIn(@Param("reqId") java.util.UUID syncRequestId,
+                                          @Param("statuses") List<TaskStatus> statuses);
+
+    /**
+     * Article-tasks that are NOT linked to any sync request still in
+     * PENDING_SCRAPE state. These are leftovers from approved / rejected /
+     * expired requests, or from one-off operator refreshes whose sync
+     * request never opened. Used by ensureCleanSlate to wipe them when a
+     * new request starts.
+     */
+    @Query("SELECT t FROM ArticleTask t WHERE t.status IN :statuses AND " +
+           "(t.syncRequestId IS NULL OR t.syncRequestId NOT IN " +
+           "  (SELECT s.id FROM SyncRequest s WHERE s.status = com.academic.broker.domain.SyncRequestStatus.PENDING_SCRAPE))")
+    List<ArticleTask> findOrphans(@Param("statuses") List<TaskStatus> statuses);
 }

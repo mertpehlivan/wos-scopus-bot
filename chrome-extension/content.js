@@ -428,6 +428,51 @@ function scrapeAuthorMetrics() {
 //  SCRAPE ARTICLES
 // ═══════════════════════════════════════════════
 
+/**
+ * Tries hard to find the canonical "open this paper's detail page" URL
+ * for a given WoS document list item. WoS now ships several layouts:
+ *   1. Classic: title is an <a href="/wos/woscc/full-record/WOS:..."> link.
+ *   2. Lazy: title is a <button>; the href appears on a sibling `a` once
+ *      the user hovers (we still see it in the DOM).
+ *   3. New: title is a <span> with click handler; the WoS UID lives on a
+ *      data attribute (`data-uid`, `data-record-id`, `data-ta="..."`) and
+ *      we have to construct the URL ourselves.
+ * Returns an absolute URL or null if every strategy comes up empty.
+ */
+function extractArticleUrl(item, titleEl) {
+  // Strategy 1 — direct href on title element.
+  if (titleEl) {
+    const rawHref = titleEl.getAttribute('href');
+    if (rawHref && rawHref.length > 1) {
+      return rawHref.startsWith('http') ? rawHref : `https://www.webofscience.com${rawHref}`;
+    }
+  }
+  // Strategy 2 — any descendant link that points to a full record.
+  const recordLink = item.querySelector(
+    'a[href*="/wos/woscc/full-record/"], a[href*="/wos/full-record/"], a[href*="/full-record/"]'
+  );
+  if (recordLink) {
+    const h = recordLink.getAttribute('href');
+    if (h) return h.startsWith('http') ? h : `https://www.webofscience.com${h}`;
+  }
+  // Strategy 3 — recover the WoS UID from a data attribute and build it.
+  const uidCandidates = [
+    item.getAttribute('data-uid'),
+    item.getAttribute('data-record-id'),
+    item.getAttribute('data-ut'),
+    item.querySelector('[data-uid]')?.getAttribute('data-uid'),
+    item.querySelector('[data-record-id]')?.getAttribute('data-record-id'),
+    item.querySelector('[data-ut]')?.getAttribute('data-ut'),
+  ];
+  for (const uid of uidCandidates) {
+    if (!uid) continue;
+    const cleaned = uid.replace(/^WOS:/i, '').trim();
+    if (!cleaned) continue;
+    return `https://www.webofscience.com/wos/woscc/full-record/WOS:${encodeURIComponent(cleaned)}`;
+  }
+  return null;
+}
+
 function scrapeCurrentPageArticles(handledUrls, handledTitles) {
   const articles = [];
   try {
@@ -436,14 +481,20 @@ function scrapeCurrentPageArticles(handledUrls, handledTitles) {
     items.forEach((item) => {
       try {
         const titleEl = item.querySelector(
-          'a.title, .summary-record-title a, h3 a, h2 a, [data-test="title"] a, [data-ta="summary-record-title-link"]'
+          'a.title, .summary-record-title a, h3 a, h2 a, [data-test="title"] a, [data-ta="summary-record-title-link"], '
+          + 'a[data-ta="summary-record-title-link"], button[data-ta="summary-record-title-link"], '
+          + '.title-section a, .title-section button'
         );
-        const title = titleEl ? titleEl.textContent.trim() : null;
-        let articleUrl = null;
-        if (titleEl && titleEl.hasAttribute('href')) {
-          const rawHref = titleEl.getAttribute('href');
-          articleUrl = rawHref.startsWith('http') ? rawHref : `https://www.webofscience.com${rawHref}`;
+        // Title text fallback — sometimes the click target is the button
+        // wrapper, but the actual text is in a nested span.
+        let title = titleEl ? titleEl.textContent.trim() : null;
+        if (!title) {
+          const fallbackTitle = item.querySelector(
+            '[data-ta="summary-record-title"], .summary-record-title, h3, h2'
+          );
+          if (fallbackTitle) title = fallbackTitle.textContent.trim();
         }
+        const articleUrl = extractArticleUrl(item, titleEl);
 
         if (!title) return;
 
@@ -700,8 +751,80 @@ async function findAndSaveCitationReportLink(taskId, authorWosId) {
 //  MAIN ENTRY POINT
 // ═══════════════════════════════════════════════
 
+/**
+ * Detects WoS's anonymous "free view" banner — the page is rendering
+ * partial author/profile data without a valid session, so any scrape now
+ * would be incomplete. wos_session_handler.js handles the recovery by
+ * force-navigating to the Clarivate login URL; we just stand down and
+ * let it work. This script is reinjected automatically after the post-
+ * login navigation completes (the manifest matches the WoS author
+ * record path), so no need to wire any explicit "resume" signal here.
+ *
+ * <p>Only counts the banner when it's actually VISIBLE — display:none
+ * leftovers from a previous render shouldn't trigger us.
+ */
+function _wosIsAnonymousFreeView() {
+  // Look for the banner element directly first — more reliable than
+  // a body-text scan, which catches stale Angular comments.
+  const candidates = document.querySelectorAll(
+    '[class*="free-view" i], [class*="anonymous-banner" i], app-anonymous-banner, mat-toolbar'
+  );
+  for (const el of candidates) {
+    const txt = (el.textContent || '').toLowerCase();
+    if (!txt.includes('free view of the web of science')) continue;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return true;
+  }
+  // Fallback: body-text scan (catches layout variants we don't have selectors for).
+  const text = (document.body && document.body.innerText) || '';
+  if (!text) return false;
+  return /you are accessing a free view of the web of science/i.test(text);
+}
+
+/**
+ * Waits up to {@code timeoutMs} for the free-view banner to disappear.
+ * Login flow takes a few seconds: tab navigates to access.clarivate.com,
+ * form auto-fills, submit, redirect back. content.js gets re-injected
+ * on the post-login page; if Angular hasn't finished hydrating by then
+ * the banner element may briefly still be visible. We poll instead of
+ * bailing instantly so the scrape resumes the moment the session is
+ * actually active.
+ *
+ * @returns true if the banner is gone (or never was), false on timeout.
+ */
+async function _wosWaitForAuthenticated(timeoutMs = 30000) {
+  const checkInterval = 500;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!_wosIsAnonymousFreeView()) return true;
+    await new Promise(r => setTimeout(r, checkInterval));
+  }
+  return false;
+}
+
 async function run() {
   console.log('[WoS Worker] Content script BAŞLATILDI.');
+
+  // Anonymous free-view → wait for session_handler to log in. The
+  // recovery flow navigates to access.clarivate.com/login, fills the
+  // form, submits, and Clarivate redirects us back to this same author
+  // page. Because tab navigation re-injects content scripts, this run()
+  // function fires fresh on the post-login page. We poll for the banner
+  // to disappear (up to 30s) and then proceed with the normal scrape;
+  // bailing out unconditionally would mean the scrape never resumed
+  // when login DID succeed and the post-login page just hadn't fully
+  // hydrated by the time content.js's document_idle hook fired.
+  if (_wosIsAnonymousFreeView()) {
+    console.log('[WoS Worker] Free-view banner detected — waiting for session_handler to recover...');
+    const ok = await _wosWaitForAuthenticated(30000);
+    if (!ok) {
+      console.warn('[WoS Worker] Session never recovered within 30s — standing down.');
+      return;
+    }
+    console.log('[WoS Worker] Session active; proceeding with scrape.');
+  }
 
   let taskId = await getTaskId();
   if (!taskId) {

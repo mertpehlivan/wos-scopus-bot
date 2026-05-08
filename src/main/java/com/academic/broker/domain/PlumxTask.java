@@ -22,6 +22,7 @@ import org.hibernate.type.SqlTypes;
 
 import java.time.Instant;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * Lightweight task entity for PlumX citation lookups.
@@ -54,6 +55,16 @@ public class PlumxTask {
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "raw_data", columnDefinition = "jsonb")
     private Map<String, Object> rawData;
+
+    /**
+     * Optional FK to the {@code SyncRequest} this PlumX lookup belongs to.
+     * When present, the worker bridge folds the scraped citation counts into
+     * that request's stagedData publications (matched by DOI). Tasks created
+     * outside a sync flow leave this null and just sit in plumx_tasks for
+     * downstream consumers to read.
+     */
+    @Column(name = "sync_request_id")
+    private UUID syncRequestId;
 
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)

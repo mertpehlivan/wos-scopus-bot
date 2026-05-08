@@ -22,6 +22,7 @@ import org.hibernate.type.SqlTypes;
 
 import java.time.Instant;
 import java.util.Map;
+import java.util.UUID;
 
 @Entity
 @Table(name = "article_tasks")
@@ -77,6 +78,15 @@ public class ArticleTask {
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "raw_data", columnDefinition = "jsonb")
     private Map<String, Object> rawData;
+
+    /**
+     * Optional link to the {@code SyncRequest} this task was created for.
+     * When set, the task processor writes its scraped output into the
+     * sync request's stagedData instead of (or in addition to) the legacy
+     * direct-to-backend path.
+     */
+    @Column(name = "sync_request_id")
+    private UUID syncRequestId;
 
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)

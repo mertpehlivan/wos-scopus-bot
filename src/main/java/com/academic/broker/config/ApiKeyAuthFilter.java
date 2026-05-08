@@ -34,9 +34,12 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
+        String path = request.getRequestURI();
         return request.getDispatcherType() == DispatcherType.ERROR
                 || "OPTIONS".equalsIgnoreCase(request.getMethod())
-                || "/error".equals(request.getRequestURI());
+                || "/error".equals(path)
+                // Operator panel endpoints have their own token-based filter.
+                || path.startsWith("/api/operator/");
     }
 
     @Override

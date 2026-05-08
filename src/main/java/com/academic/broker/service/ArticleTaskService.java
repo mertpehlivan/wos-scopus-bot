@@ -16,6 +16,7 @@ import com.academic.broker.domain.PlumxTask;
 import com.academic.broker.repository.ArticleTaskRepository;
 import com.academic.broker.repository.DoiEnrichTaskRepository;
 import com.academic.broker.repository.PlumxTaskRepository;
+import com.academic.broker.repository.SyncRequestRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -27,6 +28,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -37,6 +39,19 @@ public class ArticleTaskService {
     private final ArticleTaskRepository repository;
     private final PlumxTaskRepository plumxRepository;
     private final DoiEnrichTaskRepository doiEnrichRepository;
+    /**
+     * Used by addTasks to inspect the OWNER of a leftover PENDING task —
+     * if its owning sync request is no longer active, the row is wiped
+     * and re-created for the current sync (prevents the leftover-Scholar
+     * bug from blocking new requests).
+     */
+    private final SyncRequestRepository syncRequestRepository;
+    /**
+     * Optional bridge that pushes worker output into a {@code SyncRequest}'s
+     * stagedData. Marked optional so the article-task pipeline still works
+     * for callers who don't go through the operator-panel staging flow.
+     */
+    private final org.springframework.beans.factory.ObjectProvider<SyncRequestWorkerBridge> syncBridge;
 
     @Value("${broker.processing-timeout-minutes:5}")
     private int processingTimeoutMinutes;
@@ -52,14 +67,82 @@ public class ArticleTaskService {
     @Transactional
     public AddTasksResponse addTasks(TargetSource source, List<String> externalIds, String redirectUrl, boolean force,
             TaskType taskType) {
+        return addTasks(source, externalIds, redirectUrl, force, taskType, null);
+    }
+
+    /**
+     * Creates worker tasks for the given externalIds. If {@code syncRequestId}
+     * is non-null, the new tasks are stamped with it so the worker bridge
+     * routes their results into that request's staged data on completion.
+     */
+    @Transactional
+    public AddTasksResponse addTasks(TargetSource source, List<String> externalIds, String redirectUrl, boolean force,
+            TaskType taskType, java.util.UUID syncRequestId) {
         TaskType resolvedType = taskType != null ? taskType : TaskType.FULL_SCRAPE;
         List<String> addedIds = new ArrayList<>();
+        List<Long> addedTaskIds = new ArrayList<>();
         for (String externalId : externalIds) {
             if (force) {
                 // Remove existing active tasks for this externalId to prevent duplicate processing
                 repository.deleteByTargetSourceAndExternalIdAndStatusIn(source, externalId, ACTIVE_STATUSES);
             } else if (repository.existsByTargetSourceAndExternalIdAndStatusIn(source, externalId, ACTIVE_STATUSES)) {
-                continue;
+                // exists() found at least one PENDING/PROCESSING row for
+                // this {source, externalId}. Decide based on the OWNER of
+                // the row that's actually still active.
+                //
+                //   • Owner is the SAME sync request as us → idempotent
+                //     duplicate call; leave it alone.
+                //   • Owner is a sync request still in PENDING_SCRAPE →
+                //     same idea; the parallel addTasks for the same active
+                //     request just shouldn't double-create.
+                //   • Owner is null OR points to a CLOSED sync request →
+                //     stragglel from a previous run. Wipe and recreate so
+                //     the worker doesn't complete it into the wrong sync
+                //     (the historical leftover-Scholar bug).
+                //   • findTop returned null OR a non-active row → there's
+                //     a state inconsistency (older PENDING with newer
+                //     COMPLETED). Wipe and recreate to be safe — without
+                //     this we'd silently skip creation and the orchestrator
+                //     would think there's nothing to do for this source.
+                ArticleTask existing = repository
+                        .findTopByTargetSourceAndExternalIdOrderByIdDesc(source, externalId)
+                        .orElse(null);
+
+                boolean shouldKeepExisting = false;
+                if (existing != null && ACTIVE_STATUSES.contains(existing.getStatus())) {
+                    UUID existingOwner = existing.getSyncRequestId();
+                    boolean ownerIsActive = existingOwner != null
+                            && syncRequestRepository.findById(existingOwner)
+                                    .map(s -> s.getStatus() == com.academic.broker.domain.SyncRequestStatus.PENDING_SCRAPE)
+                                    .orElse(false);
+                    boolean sameOwner = syncRequestId != null && syncRequestId.equals(existingOwner);
+
+                    if (sameOwner || ownerIsActive) {
+                        // Idempotent — keep, optionally attach our id if
+                        // the row had none.
+                        if (syncRequestId != null && existingOwner == null) {
+                            existing.setSyncRequestId(syncRequestId);
+                            repository.save(existing);
+                        }
+                        shouldKeepExisting = true;
+                    } else {
+                        log.info("[Tasks] {} task for {} owned by closed sync {}; replacing with fresh row for {}",
+                                source, externalId, existingOwner, syncRequestId);
+                    }
+                } else {
+                    // exists() said yes but findTop returned null/non-active
+                    // — older PENDING rows exist that the most-recent-id
+                    // query can't see. Wipe and recreate.
+                    log.info("[Tasks] {} task for {} has stale PENDING row(s) without a most-recent active twin; replacing for {}",
+                            source, externalId, syncRequestId);
+                }
+
+                if (shouldKeepExisting) {
+                    continue; // skip the create path
+                }
+                // Wipe any active rows we don't want to keep, then fall
+                // through to the create block below.
+                repository.deleteByTargetSourceAndExternalIdAndStatusIn(source, externalId, ACTIVE_STATUSES);
             }
             ArticleTask task = ArticleTask.builder()
                     .targetSource(source)
@@ -67,15 +150,27 @@ public class ArticleTaskService {
                     .redirectUrl(redirectUrl)
                     .taskType(resolvedType)
                     .status(TaskStatus.PENDING)
+                    .syncRequestId(syncRequestId)
                     .updatedAt(Instant.now())
                     .build();
-            repository.save(task);
+            ArticleTask saved = repository.save(task);
             addedIds.add(externalId);
+            addedTaskIds.add(saved.getId());
+        }
+
+        // Seed sourceProgress on the sync request so the operator panel
+        // shows "Çekiliyor" instead of "Bilinmiyor" while the worker is
+        // mid-flight. Done once per addTasks call (not per externalId)
+        // since all externalIds in a single call share the source.
+        if (syncRequestId != null && !addedIds.isEmpty()) {
+            SyncRequestWorkerBridge bridge = syncBridge.getIfAvailable();
+            if (bridge != null) bridge.markSourcePending(syncRequestId, source.name());
         }
         return AddTasksResponse.builder()
                 .added(addedIds.size())
                 .skipped(externalIds.size() - addedIds.size())
                 .addedIds(addedIds)
+                .addedTaskIds(addedTaskIds)
                 .build();
     }
 
@@ -101,6 +196,7 @@ public class ArticleTaskService {
                 .externalId(task.getExternalId())
                 .redirectUrl(task.getRedirectUrl())
                 .taskType(task.getTaskType())
+                .syncRequestId(task.getSyncRequestId())
                 .build();
     }
 
@@ -125,6 +221,11 @@ public class ArticleTaskService {
         task.touch();
         repository.save(task);
         log.info("Task {} completed by extension (source={}, externalId={})", taskId, task.getTargetSource(), task.getExternalId());
+        // If this task was created for a SyncRequest, push the result into staging.
+        if (task.getSyncRequestId() != null) {
+            SyncRequestWorkerBridge bridge = syncBridge.getIfAvailable();
+            if (bridge != null) bridge.ingestTaskCompletion(task);
+        }
     }
 
     /**
@@ -162,6 +263,10 @@ public class ArticleTaskService {
         task.setStatus(TaskStatus.FAILED);
         task.touch();
         repository.save(task);
+        if (task.getSyncRequestId() != null) {
+            SyncRequestWorkerBridge bridge = syncBridge.getIfAvailable();
+            if (bridge != null) bridge.ingestTaskCompletion(task);
+        }
     }
 
     /**
@@ -307,18 +412,47 @@ public class ArticleTaskService {
      */
     @Transactional
     public AddTasksResponse addPlumxTasks(List<String> dois) {
+        return addPlumxTasks(dois, null);
+    }
+
+    /**
+     * Add PlumX DOI tasks in batch, optionally stamping each task with the
+     * sync request id that requested them. When stamped, the worker bridge
+     * folds the citation counts into that sync request's publications on
+     * completion (matched by DOI).
+     */
+    @Transactional
+    public AddTasksResponse addPlumxTasks(List<String> dois, java.util.UUID syncRequestId) {
         List<String> addedDois = new ArrayList<>();
         for (String doi : dois) {
             if (plumxRepository.existsByDoiAndStatusIn(doi, ACTIVE_STATUSES)) {
+                // If a sync request id came in but the existing task isn't
+                // stamped, attach it so the bridge still sees the result.
+                if (syncRequestId != null) {
+                    plumxRepository.findFirstByDoiAndStatusIn(doi, ACTIVE_STATUSES)
+                            .ifPresent(t -> {
+                                if (t.getSyncRequestId() == null) {
+                                    t.setSyncRequestId(syncRequestId);
+                                    plumxRepository.save(t);
+                                }
+                            });
+                }
                 continue;
             }
             PlumxTask task = PlumxTask.builder()
                     .doi(doi)
                     .status(TaskStatus.PENDING)
+                    .syncRequestId(syncRequestId)
                     .updatedAt(Instant.now())
                     .build();
             plumxRepository.save(task);
             addedDois.add(doi);
+        }
+        // Seed PLUMX progress on the sync request so the panel shows the
+        // PlumX side-channel as "Çekiliyor" while DOIs drain.
+        if (syncRequestId != null && !addedDois.isEmpty()) {
+            SyncRequestWorkerBridge bridge = syncBridge.getIfAvailable();
+            if (bridge != null) bridge.markSourcePending(syncRequestId, "PLUMX");
         }
         return AddTasksResponse.builder()
                 .added(addedDois.size())
@@ -345,9 +479,43 @@ public class ArticleTaskService {
                     .externalId(task.getDoi())
                     .redirectUrl(null)
                     .taskType(TaskType.CITATION_SYNC)
+                    .syncRequestId(task.getSyncRequestId())
                     .build());
         }
         return results;
+    }
+
+    /**
+     * Operator-panel per-publication "Tekrar Çek" entry point. Wipes any
+     * still-active (PENDING / PROCESSING) PlumX row for {@code doi} and
+     * inserts a fresh PENDING one stamped with {@code syncRequestId} so
+     * the worker bridge routes the citation overlay back into the right
+     * sync request when the lookup finishes.
+     *
+     * <p>Different from {@link #addPlumxTasks(List, UUID)} which dedupes
+     * — operator explicitly asked for a re-fetch, so the dedupe check
+     * would skip the work. We force a wipe + insert.
+     */
+    @Transactional
+    public void forcePlumxRefresh(String doi, UUID syncRequestId) {
+        if (doi == null || doi.isBlank()) return;
+        // Wipe whatever's currently active for this DOI.
+        plumxRepository.findFirstByDoiAndStatusIn(doi, ACTIVE_STATUSES)
+                .ifPresent(plumxRepository::delete);
+        PlumxTask fresh = PlumxTask.builder()
+                .doi(doi)
+                .status(TaskStatus.PENDING)
+                .syncRequestId(syncRequestId)
+                .updatedAt(Instant.now())
+                .build();
+        plumxRepository.save(fresh);
+        // Surface a "Çekiliyor" chip on the operator panel so the operator
+        // sees their click landed.
+        if (syncRequestId != null) {
+            SyncRequestWorkerBridge bridge = syncBridge.getIfAvailable();
+            if (bridge != null) bridge.markSourcePending(syncRequestId, "PLUMX");
+        }
+        log.info("[Tasks] PlumX refresh queued for doi={} sync={}", doi, syncRequestId);
     }
 
     @Transactional
@@ -361,6 +529,16 @@ public class ArticleTaskService {
         task.setStatus(TaskStatus.COMPLETED);
         task.touch();
         plumxRepository.save(task);
+
+        // If this PlumX lookup was kicked off as part of a sync request, fold
+        // the citation counts (Scopus / Mendeley / CrossRef) into that
+        // request's stagedData publications — matched by DOI. Mirrors the
+        // historical SmartPublicationService.triggerPlumxCitationEnrichment
+        // post-processing, but in the broker so backend never sees PlumX raw.
+        if (task.getSyncRequestId() != null) {
+            SyncRequestWorkerBridge bridge = syncBridge.getIfAvailable();
+            if (bridge != null) bridge.ingestPlumxCompletion(task);
+        }
     }
 
     @Transactional

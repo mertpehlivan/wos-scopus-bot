@@ -61,7 +61,8 @@
     },
     {
       "matches": [
-        "*://*.webofscience.com/wos/woscc/full-record/*"
+        "*://*.webofscience.com/wos/woscc/full-record/*",
+        "*://*.webofscience.com/wos/alldb/full-record/*"
       ],
       "js": [
         "stealth-utils.js"
@@ -71,7 +72,8 @@
     },
     {
       "matches": [
-        "*://*.webofscience.com/wos/woscc/full-record/*"
+        "*://*.webofscience.com/wos/woscc/full-record/*",
+        "*://*.webofscience.com/wos/alldb/full-record/*"
       ],
       "js": [
         "article_detail.js"

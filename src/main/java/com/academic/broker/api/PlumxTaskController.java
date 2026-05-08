@@ -24,14 +24,29 @@ public class PlumxTaskController {
 
     /**
      * Add PlumX DOI tasks in batch.
-     * Accepts: { "dois": ["10.1234/...", "10.5678/..."] }
+     * <p>Accepts:
+     * <pre>{ "dois": ["10.1234/...", "10.5678/..."], "syncRequestId": "uuid-or-null" }</pre>
+     * The {@code syncRequestId} can also be passed as a query parameter — useful
+     * when the worker submits PlumX tasks itself as a follow-on to an OpenAlex
+     * completion and wants to keep the request payload minimal.
      */
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<AddTasksResponse> addPlumxTasks(
-            @RequestBody Map<String, List<String>> request) {
-        List<String> dois = request.getOrDefault("dois",
+            @RequestBody Map<String, Object> request,
+            @RequestParam(name = "syncRequestId", required = false) java.util.UUID syncRequestIdQuery) {
+        @SuppressWarnings("unchecked")
+        List<String> dois = (List<String>) request.getOrDefault("dois",
                 request.getOrDefault("externalIds", List.of()));
-        AddTasksResponse response = taskService.addPlumxTasks(dois);
+
+        java.util.UUID syncRequestId = syncRequestIdQuery;
+        Object bodyId = request.get("syncRequestId");
+        if (bodyId instanceof String s && !s.isBlank()) {
+            try { syncRequestId = java.util.UUID.fromString(s); } catch (Exception ignored) {}
+        } else if (bodyId instanceof java.util.UUID u) {
+            syncRequestId = u;
+        }
+
+        AddTasksResponse response = taskService.addPlumxTasks(dois, syncRequestId);
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 

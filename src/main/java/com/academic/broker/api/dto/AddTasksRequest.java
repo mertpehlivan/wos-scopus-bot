@@ -10,6 +10,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.util.List;
+import java.util.UUID;
 
 @Data
 @Builder
@@ -35,4 +36,13 @@ public class AddTasksRequest {
      * FULL_SCRAPE (default) = metrics + article details.
      */
     private TaskType taskType;
+
+    /**
+     * Optional. When set, every task created by this call is stamped with the
+     * given {@code SyncRequest} id; the worker bridge then routes the scraped
+     * payload into that request's {@code stagedData} when the task completes.
+     * Backend's "Senkronize Et" flow always passes this; one-off operator
+     * refreshes typically don't.
+     */
+    private UUID syncRequestId;
 }

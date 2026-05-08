@@ -16,4 +16,7 @@ public class AddTasksResponse {
     private int added;
     private int skipped; // already present as PENDING/PROCESSING
     private List<String> addedIds;
+    /** Database ids of newly created tasks. Lets the backend audit / cancel by id. */
+    @lombok.Builder.Default
+    private List<Long> addedTaskIds = new java.util.ArrayList<>();
 }

@@ -31,9 +31,20 @@ broker:
   api-key: ${BROKER_API_KEY:change-me-in-production}
   # URL of the main backend system that receives Citation Report data
   backend-url: ${BACKEND_URL:http://localhost:8080}
+  # Shared secret used by the broker when calling the main backend's
+  # /api/v1/internal/apply-sync endpoint. Defaults to broker.api-key.
+  backend-api-key: ${BACKEND_API_KEY:${BROKER_API_KEY:change-me-in-production}}
   # Chrome extension origin for CORS (set to exact extension ID in production)
   # Example: BROKER_EXTENSION_ORIGIN=chrome-extension://abcdefghijklmnopabcdefghijklmnop
   extension-origin: ${BROKER_EXTENSION_ORIGIN:chrome-extension://*}
+  # Operator panel SLA — how long the operator has to approve/reject a request.
+  sla-review-hours: ${SLA_REVIEW_HOURS:24}
+  # Secret used to sign operator panel session tokens (HMAC-SHA256).
+  operator-token-secret: ${OPERATOR_TOKEN_SECRET:${BROKER_API_KEY:change-me-in-production}}
+  # Default operator account created at first startup. CHANGE in production.
+  default-operator:
+    username: ${OPERATOR_DEFAULT_USERNAME:admin}
+    password: ${OPERATOR_DEFAULT_PASSWORD:admin}
 
 server:
   port: 8081

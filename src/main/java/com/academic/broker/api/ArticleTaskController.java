@@ -38,9 +38,13 @@ public class ArticleTaskController {
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<AddTasksResponse> addTasks(
             @Valid @RequestBody AddTasksRequest request,
-            @RequestParam(name = "force", defaultValue = "false") boolean force) {
+            @RequestParam(name = "force", defaultValue = "false") boolean force,
+            @RequestParam(name = "syncRequestId", required = false) java.util.UUID syncRequestIdParam) {
+        // Body wins over query param (callers can pick whichever is convenient).
+        java.util.UUID syncRequestId = request.getSyncRequestId() != null
+                ? request.getSyncRequestId() : syncRequestIdParam;
         AddTasksResponse response = taskService.addTasks(request.getSource(), request.getExternalIds(),
-                request.getRedirectUrl(), force, request.getTaskType());
+                request.getRedirectUrl(), force, request.getTaskType(), syncRequestId);
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 

@@ -13,16 +13,54 @@ import org.springframework.data.repository.query.Param;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 public interface PlumxTaskRepository extends JpaRepository<PlumxTask, Long> {
 
     boolean existsByDoiAndStatusIn(String doi, List<TaskStatus> statuses);
 
+    Optional<PlumxTask> findFirstByDoiAndStatusIn(String doi, List<TaskStatus> statuses);
+
+    /**
+     * All PlumX tasks tagged with a given sync request id. Used by the
+     * worker bridge to gate "READY_FOR_REVIEW" transition until every PlumX
+     * fan-out submitted for the request has reached a terminal status.
+     */
+    List<PlumxTask> findBySyncRequestId(UUID syncRequestId);
+
+    /**
+     * Deletes PlumX tasks for a sync request that are still PENDING /
+     * PROCESSING. Called when the request reaches a terminal state so
+     * stragglers don't keep the worker busy after the operator closed it.
+     */
+    @Modifying
+    @Query("DELETE FROM PlumxTask t WHERE t.syncRequestId = :reqId AND t.status IN :statuses")
+    int deleteBySyncRequestIdAndStatusIn(@Param("reqId") UUID syncRequestId,
+                                          @Param("statuses") List<TaskStatus> statuses);
+
+    /** PlumX tasks not linked to any active (PENDING_SCRAPE) sync request. */
+    @Query("SELECT t FROM PlumxTask t WHERE t.status IN :statuses AND " +
+           "(t.syncRequestId IS NULL OR t.syncRequestId NOT IN " +
+           "  (SELECT s.id FROM SyncRequest s WHERE s.status = com.academic.broker.domain.SyncRequestStatus.PENDING_SCRAPE))")
+    List<PlumxTask> findOrphans(@Param("statuses") List<TaskStatus> statuses);
+
     /**
      * Poll a batch of PENDING PlumX tasks and lock them for processing.
+     *
+     * <p>Same priority-queue semantics as {@code ArticleTaskRepository
+     * .findOnePendingBySourceForUpdate}: tasks linked to a sync request
+     * with the closest {@code expiresAt} go first; orphan tasks (no
+     * syncRequestId) come last, ordered by createdAt FIFO.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("SELECT t FROM PlumxTask t WHERE t.status = com.academic.broker.domain.TaskStatus.PENDING ORDER BY t.createdAt ASC")
+    @Query("""
+        SELECT t FROM PlumxTask t
+        WHERE t.status = com.academic.broker.domain.TaskStatus.PENDING
+        ORDER BY
+          CASE WHEN t.syncRequestId IS NULL THEN 1 ELSE 0 END ASC,
+          (SELECT s.expiresAt FROM SyncRequest s WHERE s.id = t.syncRequestId) ASC,
+          t.createdAt ASC
+        """)
     List<PlumxTask> findPendingForUpdate(Pageable pageable);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)

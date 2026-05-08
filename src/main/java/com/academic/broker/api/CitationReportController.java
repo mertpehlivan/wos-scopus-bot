@@ -19,13 +19,20 @@ import java.util.concurrent.CompletableFuture;
 /**
  * Broker endpoint for WoS Citation Report data.
  *
- * <p>The Chrome extension sends citation report data here after scraping the
- * WoS citation-report page. The broker validates the payload and forwards it
- * asynchronously to the main backend system.</p>
+ * <p><b>The forward-to-backend leg has been turned off.</b> Previously
+ * the broker forwarded everything posted here to the main backend's
+ * {@code /api/wos/citation-report/sync} endpoint, which wrote directly
+ * into {@code researcher_profile} + {@code staged_publication} — bypassing
+ * the operator approval gate completely. The bridge already extracts the
+ * citation-report data from the article-task's {@code rawData}; this
+ * endpoint is kept only as an ack for the extension's POST so the
+ * Chrome side doesn't see HTTP errors mid-flight.
  *
  * <h3>Contract:</h3>
  * <ul>
- *   <li>{@code POST /api/wos/citation-report/sync} — Extension sends scraped data</li>
+ *   <li>{@code POST /api/wos/citation-report/sync} — accepted, logged,
+ *       and dropped. Returns 200 OK so the extension's retry loop quiets
+ *       down.</li>
  * </ul>
  */
 @Slf4j
@@ -40,10 +47,10 @@ public class CitationReportController {
     private String backendUrl;
 
     /**
-     * Receives Citation Report data from the Chrome extension and forwards it
-     * asynchronously to the main backend.
-     *
-     * @param body Raw payload: { authorWosId, taskId, researcherProfileStats, publications, error? }
+     * Accepts Citation Report data from the Chrome extension. Logs and
+     * returns 200 OK without forwarding — the bridge owns the
+     * citation-report integration now (data flows through {@code
+     * /api/tasks/{taskId}/complete} → {@code SyncRequestWorkerBridge}).
      */
     @PostMapping(value = "/sync", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<Map<String, Object>> syncCitationReport(
@@ -57,13 +64,12 @@ public class CitationReportController {
             log.warn("[CitationReport] Extension reported an error for author={} task={}: {}",
                     authorWosId, taskId, error);
         } else {
-            log.info("[CitationReport] Received data for author={} task={}", authorWosId, taskId);
+            log.debug("[CitationReport] Received data for author={} task={} (no-forward; bridge owns this now)",
+                    authorWosId, taskId);
         }
 
-        // Forward to main backend asynchronously (non-blocking)
-        forwardToBackendAsync(body);
-
-        return ResponseEntity.ok(Map.of("ok", true, "received", true));
+        // Forwarding is disabled — see class-level Javadoc.
+        return ResponseEntity.ok(Map.of("ok", true, "received", true, "forwarded", false));
     }
 
     /**

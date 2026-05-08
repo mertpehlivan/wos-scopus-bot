@@ -112,9 +112,15 @@ const SCRAPE_TIMEOUT_MS    = 3_600_000; // 60 minutes — raised from 10 min to 
 const scrapeTimeouts = new Map();
 
 // Adaptive detail tab pool
-let detailPoolSize = 1;          // Conservative: 1 at a time
+// Detail tabs run STRICTLY one at a time across all sources. We open
+// each tab with active:true so its renderer isn't RAF-throttled — but
+// only one tab can be active in a window at once. Running pool > 1
+// would mean every new tab demotes the previous to background mid-load
+// and Angular's lazy-mounted JCR/abstract sections never finish
+// rendering. Pool stays clamped to 1.
+let detailPoolSize = 1;
 const DETAIL_POOL_MIN = 1;
-const DETAIL_POOL_MAX = 2;
+const DETAIL_POOL_MAX = 1;
 let detailRateLimited = false;
 let detailBackoffUntil = 0;
 
@@ -141,7 +147,16 @@ const detailJobs = new Map();
 //  PHASE-BASED ORCHESTRATOR CONFIGURATION
 // ═══════════════════════════════════════════════
 
-let currentPhase = 1; // 1=WOS, 2=SCOPUS_PLUMX, 3=SCHOLAR, 4=IDLE
+// Phase priority chain (highest → lowest):
+//   OPENALEX → WOS → SCOPUS → PLUMX → SCHOLAR
+// OpenAlex drains the publications baseline first — DOIs, titles,
+// authorship come from OpenAlex and the other sources only enrich
+// citation metrics on top of those rows. Running OpenAlex AFTER
+// WoS/Scopus would race the operator panel into showing partial data.
+//
+// Orchestrator is stateless: every tick re-checks the chain from the
+// top, so a fresh sync request always starts at OpenAlex regardless
+// of where the worker idled in the previous cycle.
 
 let GROUP_CONFIG = {
   wos: true,
@@ -735,102 +750,129 @@ async function pollScrapeSource(source) {
   }
 }
 
-async function runWosPhase() {
-  if (!GROUP_CONFIG.wos) {
-    console.log('[Orchestrator] WOS phase disabled, skipping.');
-    currentPhase++;
-    return;
-  }
+// ── Legacy phase functions removed ─────────────────────────────────
+// runOpenAlexPhase / runWosPhase / runScopusPlumxPhase / runScholarPhase
+// were a state-machine over `currentPhase`. They had a subtle bug: if
+// the worker idled at phase 3 (Scholar) and a new sync queued tasks
+// for all phases, phase 3 would claim the fresh Scholar task before
+// phase 0 (OpenAlex) got a chance — breaking the ordering contract.
+// Replaced by stateless `run*PhaseInline` predicates called from
+// `runPriorityOrchestrator` in priority order on every tick.
 
-  if (await isWosPhaseActive()) {
-    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-    return;
-  }
-
-  const picked = await pollScrapeSource('WOS');
-  if (picked) {
-    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-    return;
-  }
-
-  // WOS phase complete
-  console.log('[Orchestrator] WOS phase fully drained. Moving to SCOPUS+PLUMX.');
-  currentPhase++;
-  scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-}
-
-async function runScopusPlumxPhase() {
-  if (!GROUP_CONFIG.scopusPlumx) {
-    console.log('[Orchestrator] SCOPUS+PLUMX phase disabled, skipping.');
-    currentPhase++;
-    return;
-  }
-
-  let busy = false;
-  if (await isScopusPhaseActive()) busy = true;
-  if (await isPlumxPhaseActive()) busy = true;
-
-  if (busy) {
-    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-    return;
-  }
-
-  const pickedScopus = await pollScrapeSource('SCOPUS');
-  const pickedPlumx = await pollPlumx();
-
-  if (!pickedScopus && !pickedPlumx) {
-    console.log('[Orchestrator] SCOPUS+PLUMX phase fully drained. Moving to SCHOLAR.');
-    currentPhase++;
-  }
-
-  scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-}
-
-async function runScholarPhase() {
-  if (!GROUP_CONFIG.scholar) {
-    console.log('[Orchestrator] SCHOLAR phase disabled, skipping.');
-    currentPhase++;
-    return;
-  }
-
-  if (await isScholarPhaseActive()) {
-    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-    return;
-  }
-
-  const picked = await pollScrapeSource('SCHOLAR');
-  if (picked) {
-    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
-    return;
-  }
-
-  console.log('[Orchestrator] SCHOLAR phase fully drained. All phases complete.');
-  currentPhase++;
-  scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_IDLE_MS, 20));
-}
-
+/**
+ * Stateless top-level orchestrator. Each tick walks the priority chain
+ * from highest (OpenAlex) to lowest (Scholar), stopping at the first
+ * phase that has work or is in flight. Replaces the old
+ * {@code currentPhase} state machine, which carried over from previous
+ * cycles — if the worker happened to be sitting at phase 3 (Scholar)
+ * when a new sync request landed, it would claim a fresh Scholar task
+ * before checking OpenAlex/WoS/Scopus, breaking the documented
+ *  OPENALEX → WOS → SCOPUS+PLUMX → SCHOLAR  ordering.
+ *
+ * <p>Now: every tick re-checks the chain from the top, so a fresh sync
+ * is guaranteed to start at OpenAlex regardless of where the worker
+ * idled in the previous cycle.
+ *
+ * <p>Each phase helper returns:
+ * <ul>
+ *   <li>{@code "busy"}    — phase has a tab/task in flight, wait & retry</li>
+ *   <li>{@code "picked"}  — phase claimed a fresh task, pipeline running</li>
+ *   <li>{@code "drained"} — phase has nothing to do, fall through</li>
+ * </ul>
+ *
+ * "busy" and "picked" are both terminal for this tick (don't try later
+ * phases) since profile-tab phases share {@code activeProfileTask} and
+ * we can only run one tab at a time. OpenAlex is the only exception —
+ * it uses its own slot, so a busy OpenAlex doesn't block lower phases…
+ * but per the product spec we still gate them on it (publications
+ * baseline must be in stagedData before WoS enrichment can attach).
+ */
 async function runPriorityOrchestrator() {
   if (detailRateLimited || plumxRateLimited) {
     scheduleOrchestrator(jitteredInterval(30000, 20));
     return;
   }
 
-  switch (currentPhase) {
-    case 1:
-      await runWosPhase();
-      break;
-    case 2:
-      await runScopusPlumxPhase();
-      break;
-    case 3:
-      await runScholarPhase();
-      break;
-    case 4:
-    default:
-      currentPhase = 1;
-      scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_IDLE_MS, 20));
-      break;
+  // ── Phase 0: OpenAlex ───────────────────────────────────────────
+  // Drain OpenAlex completely before touching profile tabs so the
+  // publications baseline is in stagedData when WoS/Scopus/Scholar
+  // arrive to enrich it. activeOpenAlexTask is set inside pollOpenAlex
+  // and cleared in its finally block, so a return-true here means the
+  // task is done synchronously.
+  if (GROUP_CONFIG.openalex !== false) {
+    if (activeOpenAlexTask !== null) {
+      // Still processing the current OpenAlex task.
+      scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+      return;
+    }
+    const oaPicked = await pollOpenAlex();
+    if (oaPicked) {
+      scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+      return;
+    }
+    // OpenAlex drained → fall through to profile phases.
   }
+
+  // ── Phase 1: WOS ────────────────────────────────────────────────
+  const wosState = await runWosPhaseInline();
+  if (wosState !== 'drained') {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+
+  // ── Phase 2: SCOPUS first, PLUMX after ──────────────────────────
+  const scopusState = await runScopusPhaseInline();
+  if (scopusState !== 'drained') {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+  const plumxState = await runPlumxPhaseInline();
+  if (plumxState !== 'drained') {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+
+  // ── Phase 3: SCHOLAR ────────────────────────────────────────────
+  const scholarState = await runScholarPhaseInline();
+  if (scholarState !== 'drained') {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+
+  // Everything drained — back to slow idle poll.
+  scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_IDLE_MS, 20));
+}
+
+/** WoS phase as a stateless predicate. */
+async function runWosPhaseInline() {
+  if (!GROUP_CONFIG.wos) return 'drained';
+  if (await isWosPhaseActive()) return 'busy';
+  const picked = await pollScrapeSource('WOS');
+  return picked ? 'picked' : 'drained';
+}
+
+/** Scopus author profile (METRICS_ONLY by default). */
+async function runScopusPhaseInline() {
+  if (!GROUP_CONFIG.scopusPlumx) return 'drained';
+  if (await isScopusPhaseActive()) return 'busy';
+  const picked = await pollScrapeSource('SCOPUS');
+  return picked ? 'picked' : 'drained';
+}
+
+/** PlumX per-DOI batch pool. */
+async function runPlumxPhaseInline() {
+  if (!GROUP_CONFIG.scopusPlumx) return 'drained';
+  if (await isPlumxPhaseActive()) return 'busy';
+  const picked = await pollPlumx();
+  return picked ? 'picked' : 'drained';
+}
+
+/** Scholar author profile. */
+async function runScholarPhaseInline() {
+  if (!GROUP_CONFIG.scholar) return 'drained';
+  if (await isScholarPhaseActive()) return 'busy';
+  const picked = await pollScrapeSource('SCHOLAR');
+  return picked ? 'picked' : 'drained';
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -922,8 +964,371 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 //  SOURCE-BASED PARALLEL POLL
 // ═══════════════════════════════════════════════
 
+/**
+ * Polls and resolves any pending OpenAlex tasks. Unlike WOS/Scopus/Scholar
+ * (which need a browser tab to scrape), OpenAlex serves a public JSON API
+ * — we hit it directly from the service worker. No tab opened, no DOM,
+ * no rate-limit concerns at our scale (~1 author + ~100 works per call).
+ *
+ * <p>Idempotent + non-blocking: doesn't take {@code activeProfileTask}
+ * because it doesn't compete with the browser-tab pipeline.
+ */
+/**
+ * Slot for the active OpenAlex task. Mirrors {@code activeProfileTask} so
+ * the orchestrator can guarantee OpenAlex finishes BEFORE WoS/Scopus/Scholar
+ * tabs open — OpenAlex sets the publication baseline (DOIs, titles, years)
+ * that the other sources just enrich with citations / index info.
+ */
+let activeOpenAlexTask = null;
+
+async function pollOpenAlex() {
+  if (activeOpenAlexTask) return false;
+  try {
+    const headers = await brokerHeaders();
+    const res = await fetch(`${API_BASE}/api/tasks/poll?source=OPENALEX`, { headers });
+    if (res.status === 204 || !res.ok) return false;
+    const data = await res.json();
+    if (!data?.taskId || !data?.externalId) return false;
+
+    activeOpenAlexTask = data;
+    try {
+      // Run synchronously — caller awaits, ordering downstream is preserved.
+      await processOpenAlexTask(data);
+    } catch (e) {
+      console.warn('[OpenAlex] Task processing failed:', e?.message || e);
+    } finally {
+      activeOpenAlexTask = null;
+    }
+    return true;
+  } catch (e) {
+    console.warn('[OpenAlex] Poll failed:', e?.message || e);
+    return false;
+  }
+}
+
+async function processOpenAlexTask(task) {
+  const { taskId, externalId, taskType } = task;
+  // METRICS_ONLY: skip the works fetch entirely; just refresh the
+  // author summary stats (hIndex / citations / documents / i10Index).
+  // Used by the operator panel's source-level "Tekrar Çek" button so
+  // we can update the dashboard chips without re-scraping the full
+  // publication catalogue (which would race merge logic and risk
+  // wiping operator edits).
+  const metricsOnly = taskType === 'METRICS_ONLY';
+  console.log(`[OpenAlex] Processing task ${taskId} for ORCID: ${externalId} (${metricsOnly ? 'METRICS_ONLY' : 'FULL_SCRAPE'})`);
+  addLog(`OpenAlex task started (ID: ${taskId}, ORCID: ${externalId}, ${metricsOnly ? 'metrics-only' : 'full'})`, 'info');
+
+  const cleanedOrcid = stripOrcidPrefix(externalId);
+  const ua = 'rdlsis-worker (mailto:rdlsis@example.com)';
+
+  // 1) Author endpoint
+  let author;
+  try {
+    const url = `https://api.openalex.org/authors/orcid:${encodeURIComponent(cleanedOrcid)}?mailto=rdlsis@example.com`;
+    const r = await fetch(url, { headers: { 'User-Agent': ua, Accept: 'application/json' } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    author = await r.json();
+  } catch (e) {
+    console.warn(`[OpenAlex] Author lookup failed for ${cleanedOrcid}:`, e?.message || e);
+    await openAlexFailTask(taskId, `author lookup failed: ${e?.message || e}`);
+    return;
+  }
+
+  // 2) Build author-metrics payload
+  const summary = author?.summary_stats || {};
+  const authorMetrics = {
+    hIndex: Number(summary.h_index ?? 0) || 0,
+    citations: Number(author?.cited_by_count ?? 0) || 0,
+    documents: Number(author?.works_count ?? 0) || 0,
+  };
+  const i10 = Number(summary.i10_index ?? -1);
+  if (i10 >= 0) authorMetrics.i10Index = i10;
+
+  // 3) Works endpoint — page through every work the author has, not
+  // just the top-100 most-cited. The historical SmartPublicationService
+  // used cursor pagination to grab the full catalog (capped at OpenAlex's
+  // hard limit of 200 per page), and the operator panel needs the
+  // complete list so WoS/Scopus/Scholar enrichment has somewhere to
+  // attach. Stops on next_cursor=null OR after a sane safety cap so a
+  // pathological author profile can't spin the worker indefinitely.
+  //
+  // METRICS_ONLY skips this entirely — author dashboard refresh only.
+  let publications = [];
+  if (!metricsOnly) {
+    try {
+      const aid = extractOpenAlexId(author?.id);
+      const baseFilter = aid
+        ? `authorships.author.id:${aid}`
+        : `authorships.author.orcid:${encodeURIComponent(cleanedOrcid)}`;
+      let cursor = "*";
+      const PER_PAGE = 200;
+      const MAX_PAGES = 10; // 2000 works ceiling; covers virtually every researcher
+      let pages = 0;
+      while (cursor && pages < MAX_PAGES) {
+        pages++;
+        const worksUrl =
+          `https://api.openalex.org/works?filter=${baseFilter}` +
+          `&per_page=${PER_PAGE}&sort=cited_by_count:desc&cursor=${encodeURIComponent(cursor)}` +
+          `&mailto=rdlsis@example.com`;
+        const r = await fetch(worksUrl, { headers: { 'User-Agent': ua, Accept: 'application/json' } });
+        if (!r.ok) {
+          console.warn('[OpenAlex] Works HTTP', r.status, '(page', pages, ')');
+          break;
+        }
+        const wd = await r.json();
+        const arr = Array.isArray(wd?.results) ? wd.results : [];
+        for (const w of arr) {
+          const p = toOpenAlexPublication(w);
+          if (p) publications.push(p);
+        }
+        // OpenAlex returns next_cursor=null when the list is exhausted.
+        cursor = wd?.meta?.next_cursor || null;
+        if (arr.length < PER_PAGE) break; // short page — definitely the last
+      }
+      addLog(`OpenAlex works: ${publications.length} fetched across ${pages} page(s)`, 'info');
+    } catch (e) {
+      console.warn('[OpenAlex] Works lookup failed:', e?.message || e);
+    }
+  } else {
+    addLog(`OpenAlex METRICS_ONLY — skipping works fetch`, 'info');
+  }
+
+  // 4) Push to broker — author-metrics first, then complete
+  try {
+    const h = await brokerHeaders();
+    const url = `https://api.openalex.org/authors/orcid:${cleanedOrcid}`;
+
+    await fetch(`${API_BASE}/api/tasks/${taskId}/author-metrics`, {
+      method: 'POST', headers: h,
+      body: JSON.stringify({ authorMetrics, url }),
+    });
+
+    await fetch(`${API_BASE}/api/tasks/${taskId}/complete`, {
+      method: 'POST', headers: h,
+      body: JSON.stringify({
+        rawData: {
+          publications,
+          authorMetrics,
+          scrapedAt: new Date().toISOString(),
+          url,
+          source: 'OPENALEX',
+        },
+      }),
+    });
+
+    addLog(`OpenAlex done: h=${authorMetrics.hIndex}, citations=${authorMetrics.citations}, ${publications.length} works`, 'success');
+
+    // ── 5) Fan out PlumX citation lookups for every DOI we just produced.
+    //    Mirrors the historical SmartPublicationService.triggerPlumxCitation
+    //    Enrichment step that ran on the backend right after OpenAlex sync.
+    //    Now that's worker-side: PlumX results come back through the broker
+    //    bridge and merge into stagedData.publications[].citations.scopus,
+    //    so the operator panel sees a fully-citation-loaded review.
+    //
+    //    The task carries the syncRequestId so the broker can route the
+    //    citations to the right request (multiple operators may have
+    //    overlapping DOIs across requests — without the stamp, citations
+    //    would land on whichever pub the broker found first).
+    //
+    //    METRICS_ONLY skips PlumX fan-out — it's a pure metrics refresh
+    //    and we don't want to disturb the per-DOI citation overlay that
+    //    might already exist on the publications list.
+    if (metricsOnly) {
+      return;
+    }
+    try {
+      const dois = publications
+        .map(p => (p && p.doi ? String(p.doi).trim() : null))
+        .filter(Boolean);
+      if (dois.length > 0) {
+        const syncRequestId = task && task.syncRequestId ? task.syncRequestId : null;
+        // Broker already de-dupes per-DOI in addPlumxTasks; we send the
+        // full list and let it skip dupes.
+        const body = { dois };
+        if (syncRequestId) body.syncRequestId = syncRequestId;
+        const r = await fetch(`${API_BASE}/api/plumx-tasks`, {
+          method: 'POST', headers: h,
+          body: JSON.stringify(body),
+        });
+        if (r.ok) {
+          let added = 0;
+          try {
+            const j = await r.json();
+            added = Number(j?.added ?? 0);
+          } catch (_) { /* ignore non-json */ }
+          addLog(`PlumX batch queued: ${added}/${dois.length} new DOIs`, 'info');
+        } else {
+          console.warn('[OpenAlex] PlumX batch HTTP', r.status);
+        }
+      }
+    } catch (plumxErr) {
+      // Non-fatal — OpenAlex itself completed, so don't unwind. PlumX is an
+      // enrichment side-channel; if it fails the operator just doesn't get
+      // Scopus citations on the first pass.
+      console.warn('[OpenAlex] PlumX fan-out failed:', plumxErr?.message || plumxErr);
+    }
+  } catch (e) {
+    console.warn(`[OpenAlex] Broker write failed for task ${taskId}:`, e?.message || e);
+    await openAlexFailTask(taskId, `broker write failed: ${e?.message || e}`);
+  }
+}
+
+async function openAlexFailTask(taskId, reason) {
+  try {
+    const h = await brokerHeaders();
+    await fetch(`${API_BASE}/api/tasks/${taskId}/fail`, {
+      method: 'POST', headers: h,
+      body: JSON.stringify({ error: reason || 'OpenAlex task failed' }),
+    });
+  } catch (_) { /* swallow */ }
+}
+
+function stripOrcidPrefix(raw) {
+  const s = String(raw || '').trim();
+  const idx = s.lastIndexOf('/');
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
+function extractOpenAlexId(fullId) {
+  if (!fullId) return null;
+  const idx = String(fullId).lastIndexOf('/');
+  return idx >= 0 ? String(fullId).slice(idx + 1) : String(fullId);
+}
+
+/**
+ * Reconstructs a plain-text abstract from OpenAlex's `abstract_inverted_index`
+ * shape — a {word: [position, position, ...]} map that has to be unrolled
+ * into an ordered word array. Same algorithm as the historical
+ * SmartPublicationService used.
+ */
+function reconstructAbstract(invertedIndex) {
+  if (!invertedIndex || typeof invertedIndex !== 'object') return '';
+  const positions = [];
+  for (const [word, posArr] of Object.entries(invertedIndex)) {
+    if (!Array.isArray(posArr)) continue;
+    for (const p of posArr) {
+      if (typeof p === 'number') positions.push([p, word]);
+    }
+  }
+  if (positions.length === 0) return '';
+  positions.sort((a, b) => a[0] - b[0]);
+  return positions.map(([, w]) => w).join(' ');
+}
+
+function toOpenAlexPublication(w) {
+  if (!w) return null;
+  const out = {};
+
+  // ── Identifiers ──────────────────────────────────────────────────────
+  let doi = w.doi || '';
+  if (doi) {
+    const idx = doi.indexOf('doi.org/');
+    if (idx >= 0) doi = doi.slice(idx + 'doi.org/'.length);
+    out.doi = doi;
+  }
+  if (w.id) {
+    const oaIdx = String(w.id).lastIndexOf('/');
+    if (oaIdx >= 0) out.openAlexId = String(w.id).slice(oaIdx + 1);
+  }
+
+  // ── Title / type ─────────────────────────────────────────────────────
+  if (w.title || w.display_name) {
+    out.title = w.title || w.display_name;
+  }
+  if (w.type) out.originalType = w.type;
+  if (w.publication_year) out.year = w.publication_year;
+  if (w.publication_date) out.publicationDate = w.publication_date;
+  if (w.language) out.language = w.language;
+
+  // ── Citations (OpenAlex's authoritative count) ───────────────────────
+  if (w.cited_by_count != null) out.citations = { openalex: w.cited_by_count };
+
+  // ── Venue / journal (try multiple locations) ─────────────────────────
+  const venue = w.host_venue || w.primary_location?.source || w.locations?.[0]?.source;
+  if (venue?.display_name) out.journal = venue.display_name;
+  if (venue?.publisher) out.publisher = venue.publisher;
+  if (venue?.issn_l) out.issn = venue.issn_l;
+  if (venue?.issn) out.issnList = venue.issn;
+  if (venue?.is_oa != null) out.openAccess = !!venue.is_oa;
+
+  // ── Bibliographic ────────────────────────────────────────────────────
+  if (w.biblio) {
+    if (w.biblio.volume) out.volume = String(w.biblio.volume);
+    if (w.biblio.issue) out.issue = String(w.biblio.issue);
+    const fp = w.biblio.first_page || '';
+    const lp = w.biblio.last_page || '';
+    if (fp && lp) out.pages = `${fp}-${lp}`;
+    else if (fp) out.pages = String(fp);
+  }
+
+  // ── Authors with ORCID + affiliation hint when available ─────────────
+  if (Array.isArray(w.authorships)) {
+    const authors = w.authorships
+      .map((a) => {
+        const name = a?.author?.display_name;
+        if (!name) return null;
+        let orcid = a?.author?.orcid || '';
+        if (orcid && orcid.startsWith('https://orcid.org/')) {
+          orcid = orcid.slice('https://orcid.org/'.length);
+        }
+        const out = { name };
+        if (orcid) out.orcid = orcid;
+        const inst = a?.institutions?.[0]?.display_name;
+        if (inst) out.affiliation = inst;
+        return out;
+      })
+      .filter(Boolean);
+    if (authors.length) out.authors = authors;
+  }
+
+  // ── Abstract (OpenAlex stores it as inverted index — unroll it) ──────
+  if (w.abstract_inverted_index) {
+    const abs = reconstructAbstract(w.abstract_inverted_index);
+    if (abs) out.abstract = abs;
+  }
+
+  // ── Concepts/keywords (OpenAlex labels topical tags) ─────────────────
+  if (Array.isArray(w.concepts) && w.concepts.length) {
+    out.keywords = w.concepts
+      .filter((c) => c?.display_name && (c.score == null || c.score >= 0.3))
+      .map((c) => c.display_name)
+      .slice(0, 12);
+  }
+  // OpenAlex also exposes a keywords array directly for some works
+  if (Array.isArray(w.keywords) && w.keywords.length && !out.keywords) {
+    out.keywords = w.keywords
+      .map((k) => (typeof k === 'string' ? k : k?.display_name))
+      .filter(Boolean)
+      .slice(0, 12);
+  }
+
+  // ── Open access link the operator may want to verify ─────────────────
+  const oaUrl = w.open_access?.oa_url || w.primary_location?.landing_page_url;
+  if (oaUrl) out.url = oaUrl;
+
+  return out;
+}
+
 async function pollScrape() {
-  // Only one profile task at a time (serial across WOS/SCOPUS/SCHOLAR)
+  // ── Source ordering policy ──────────────────────────────────────────────
+  // Per product spec (2026-05): the worker must finish OpenAlex BEFORE it
+  // touches any profile-tab source. OpenAlex provides the publications
+  // baseline (DOIs, titles, authorship) that WoS/Scopus/Scholar then enrich
+  // with citation metrics. Running them in parallel produced races where the
+  // operator panel saw partial pubs lists and stale metric merges.
+  //
+  // Order:  OPENALEX  →  WOS  →  SCOPUS  →  SCHOLAR   (serial)
+  //         PlumX runs as its own pool, see pollPlumx() — that's expected,
+  //         it's a per-paper enrichment side-channel, not a profile source.
+
+  // 1) Drain OpenAlex first. While an OpenAlex task is in flight,
+  //    we don't poll any profile sources at all.
+  await pollOpenAlex();
+  if (activeOpenAlexTask !== null) {
+    return false;
+  }
+
+  // 2) Only one profile task at a time (serial across WOS/SCOPUS/SCHOLAR)
   if (activeProfileTask !== null) {
     return false;
   }
@@ -1032,7 +1437,10 @@ async function openPlumxTab(taskId, doi) {
   const url = `https://plu.mx/plum/a/?doi=${encodeURIComponent(doi)}&theme=plum-sciencedirect-theme&hideUsage=true#plumx-task-id=${taskId}`;
   try {
     const winId = await getOrCreateWorkerWindow();
-    const opts = { url, active: false };
+    // active:true so PlumX's ScienceDirect-themed iframe actually renders
+    // (it stalls on RAF when the tab is hidden), and the worker window
+    // stays focused:false so the operator's main window isn't disturbed.
+    const opts = { url, active: true };
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
@@ -1490,8 +1898,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (tabId == null) return;
       const entry = pendingTabs.get(tabId);
 
-      // Priority 1: explicit return URL set by force-navigate fallback
-      // (article detail / citation-report / summary pages).
+      // ── Resolve where to go ──
+      // Priority 1: the URL the user was on when login was triggered. The
+      // session handler now saves this on every sign-in path (button,
+      // dropdown, force-navigate), so it should virtually always be set.
       let returnUrl = null;
       try {
         const stored = await chrome.storage.session.get(['wos_return_url']);
@@ -1503,16 +1913,56 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         console.warn('[WoS Session] Could not read return URL:', e);
       }
 
-      let retryUrl = returnUrl || sender.tab?.url;
-
-      // Priority 2: reconstruct author profile URL when we know we're scraping one
-      if (!returnUrl && entry?.externalId && entry?.source === 'WOS') {
+      // Priority 2: derive from pendingTabs entry. SAFE only when the task
+      // is an author-profile scrape (FULL_SCRAPE on /wos/author/record/).
+      // For article-detail / citation-report tasks the externalId is a DOI
+      // or article id and the wos/author/record/<id> URL would be wrong.
+      let retryUrl = returnUrl;
+      if (!retryUrl && entry?.externalId && entry?.source === 'WOS' &&
+          (entry.taskType === 'FULL_SCRAPE' || !entry.taskType)) {
         const baseUrl = `https://www.webofscience.com/wos/author/record/${encodeURIComponent(entry.externalId)}`;
         retryUrl = `${baseUrl}#wos-task-id=${entry.taskId}`;
       }
 
+      // Priority 3: whatever URL the tab is currently on. Last-ditch.
+      if (!retryUrl) retryUrl = sender.tab?.url;
+
+      // Sanity: never navigate back to a login URL (would loop).
+      if (retryUrl && (retryUrl.includes('access.clarivate.com')
+              || retryUrl.includes('/login')
+              || retryUrl.includes('/signin'))) {
+        console.warn('[WoS Session] retryUrl looks like a login page, skipping navigation:', retryUrl);
+        retryUrl = null;
+      }
+
+      // Always re-stamp the task-id hash. The saved returnUrl (Priority 1)
+      // is captured at the time of sign-in click — by then Angular's
+      // router has often dropped any URL hash, so the stored value is
+      // hash-less. Without the hash, content.js's getTaskId() falls back
+      // to GET_TASK_INFO, which CAN race the navigation: the tab's
+      // chrome.storage.session entry is still present, but if anything
+      // cleared it (the recovery flow's various edge cases), content.js
+      // exits silently as "Task ID bulunamadı" and the scrape never
+      // restarts. Re-stamping is cheap and idempotent.
+      if (retryUrl && entry?.taskId) {
+        const hashKey = `wos-task-id=${entry.taskId}`;
+        if (!retryUrl.includes(hashKey)) {
+          // Strip any existing hash first — Angular routes usually live
+          // in path, hash should only carry our task id.
+          const hashPos = retryUrl.indexOf('#');
+          const base = hashPos >= 0 ? retryUrl.slice(0, hashPos) : retryUrl;
+          retryUrl = `${base}#${hashKey}`;
+        }
+      }
+
+      if (!retryUrl) {
+        addLog('WoS session restored but no return URL — tab will stay where it is', 'warning');
+        sendResponse({ ok: true });
+        return;
+      }
+
       console.log(`[WoS Session] Login success on tab #${tabId}, navigating to: ${retryUrl}`);
-      addLog('WoS session restored, retrying scrape...', 'warning');
+      addLog('WoS session restored, retrying scrape on original URL', 'success');
       if (entry) {
         entry.readyAt = null; // allow next SCRAPE_READY from reloaded content.js
         resetScrapeTimeout(tabId); // extend the overall task timeout
@@ -1881,6 +2331,43 @@ async function handleDetailsNeeded(authorTabId, msg) {
 
   // WOS / SCOPUS: normal detail scraping
   const articlesToDetail = articles.filter(a => a.articleUrl);
+  const noUrlCount = articles.length - articlesToDetail.length;
+
+  // Loud diagnostics — operator panel showed pubs without Q value /
+  // Impact Factor / abstract because detail tabs weren't opening. The
+  // root cause was article rows that came back without `articleUrl`.
+  // Now we surface that count so the next time it happens it's
+  // immediately visible from the worker's log strip.
+  console.log(`[WoS Worker] Detail eligibility: ${articlesToDetail.length}/${articles.length} articles have URLs (${noUrlCount} missing)`);
+  addLog(`Detail eligibility: ${articlesToDetail.length}/${articles.length} articles ready (${noUrlCount} no URL)`,
+         articlesToDetail.length > 0 ? 'info' : 'warning');
+
+  if (articlesToDetail.length === 0) {
+    // Nothing to scrape — short-circuit straight to /complete with the
+    // list-page data we already have. Otherwise the task would sit
+    // forever in PROCESSING and the operator panel would never
+    // transition out of "Çekiliyor".
+    addLog(`No detail URLs found for ${source} — completing with citation-report data only`, 'warning');
+    const rawData = { ...authorData, articles, source };
+    try {
+      const h = await brokerHeaders();
+      await fetch(`${API_BASE}/api/tasks/${taskId}/complete`, {
+        method: 'POST', headers: h,
+        body: JSON.stringify({ rawData }),
+      });
+      if (diagTask) { diagTask.status = 'COMPLETED'; diagTask.completedAt = new Date().toISOString(); }
+    } catch (err) {
+      addLog(`Failed to complete task ${taskId} (no-detail path): ${err.message}`, 'error');
+      if (diagTask) { diagTask.status = 'ERROR'; diagTask.error = err.message; }
+    }
+    clearPendingTab(authorTabId);
+    try { await chrome.tabs.remove(authorTabId); } catch (_) { }
+    updateState({
+      status: 'IDLE', taskId: null, targetId: null,
+      progress: { current: 0, total: 0, label: 'Waiting...' }
+    });
+    return;
+  }
 
   detailJobs.set(taskId, {
     authorData, articles,
@@ -1907,9 +2394,14 @@ async function fillDetailTabPool(taskId) {
   const source = authorTabEntry?.source || 'WOS';
 
   // SOURCE-SPECIFIC POOL LIMITS
-  let currentMax = detailPoolSize;
-  if (source === 'SCHOLAR') currentMax = 1; // Strictly 1 at a time for Scholar details
-  if (source === 'SCOPUS') currentMax = 1;  // Scopus also slow
+  // ALL sources are now serial because each detail tab opens active:true
+  // (so its renderer isn't RAF-throttled). Multiple active tabs in the
+  // same window would have every new tab demote the previous one to
+  // background mid-scrape, breaking Angular renders. detailPoolSize is
+  // hard-capped at DETAIL_POOL_MAX=1 above, but we still read it through
+  // the variable so the rate-limit-driven shrink/grow telemetry continues
+  // to log meaningful messages.
+  const currentMax = detailPoolSize;
 
   // Check rate limit backoff
   if (detailRateLimited && Date.now() < detailBackoffUntil) {
@@ -1947,7 +2439,14 @@ async function fillDetailTabPool(taskId) {
 async function openDetailTab(taskId, job, url) {
   try {
     const winId = await getOrCreateWorkerWindow();
-    const opts = { url, active: false };
+    // active:true — WoS detail pages are Angular SPAs that depend on
+    // requestAnimationFrame to mount JCR/quartile/abstract sections.
+    // Background tabs in non-focused windows have RAF throttled, so the
+    // detail content never appears and the scrape times out. Making the
+    // tab active in the worker window unthrottles the renderer; the
+    // window itself stays focused:false so we don't steal focus from
+    // the operator's main panel.
+    const opts = { url, active: true };
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
@@ -2227,7 +2726,39 @@ async function handleContentResult(tabId, msg) {
   // Main author tab fail
   const entry = pendingTabs.get(tabId);
   if (!entry) return;
-  const { taskId } = entry;
+  const { taskId, source, externalId } = entry;
+
+  // ── Scopus auto-recovery on metric-extraction failure ──────────────
+  // When scopus_content.js can't find h-index / publications on the
+  // page, the most common cause is a stale login that's silently
+  // serving an anonymous (metricsless) view rather than redirecting
+  // to a login wall. The session_handler doesn't catch this case
+  // because there's no redirect to detect. We do here: clear cookies
+  // + storage and let the worker re-poll the same task on the next
+  // orchestrator tick. The recovery counter caps it at
+  // SCOPUS_MAX_RECOVERY_ATTEMPTS so we don't loop on a permanent
+  // outage.
+  if (source === 'SCOPUS' && externalId
+      && msg.error && /could not find scopus author metrics|metrics on page in time/i.test(msg.error)) {
+    const state = await getScopusRecoveryState(taskId);
+    if (state.attempts < SCOPUS_MAX_RECOVERY_ATTEMPTS) {
+      addLog(`Scopus metrics not found — clearing cookies and retrying (${state.attempts + 1}/${SCOPUS_MAX_RECOVERY_ATTEMPTS})`, 'warning');
+      try {
+        // recoverScopusSession increments the attempt counter, wipes
+        // cookies+storage for Scopus/Elsevier, and reloads the tab to
+        // the original Scopus profile URL — the content script will
+        // re-scrape from a clean session.
+        await recoverScopusSession(tabId, taskId, externalId);
+      } catch (e) {
+        console.warn('[Scopus Session] Recovery on metric-fail threw:', e?.message || e);
+      }
+      // Don't mark the task failed; recovery either reloads the same
+      // tab in-place or (on exhaustion) marks failed itself.
+      return;
+    }
+    // Recovery exhausted — fall through to the normal fail path below.
+    addLog(`Scopus recovery exhausted (${state.attempts} attempts); marking task failed`, 'error');
+  }
 
   addLog(`Scrape Failed: ${msg.error || 'Unknown error'}`, 'error');
   updateState({ status: 'ERROR' });
@@ -2366,7 +2897,10 @@ async function openWosDoiTab(taskId, doi) {
   const url = `https://www.webofscience.com/wos/woscc/smart-search#wos-doi-task-id=${taskId}&doi=${encodedDoi}`;
   try {
     const winId = await getOrCreateWorkerWindow();
-    const opts = { url, active: false };
+    // active:true so smart-search's autocomplete + result render isn't
+    // throttled. Worker window itself stays focused:false (set when
+    // created) so the operator panel isn't disturbed.
+    const opts = { url, active: true };
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
@@ -2477,7 +3011,9 @@ async function openScholarDoiTab(taskId, doi) {
   const url = `https://scholar.google.com/scholar_lookup?hl=en&doi=${encodedDoi}#scholar-doi-task-id=${taskId}&doi=${encodedDoi}`;
   try {
     const winId = await getOrCreateWorkerWindow();
-    const opts = { url, active: false };
+    // active:true so the lookup page actually renders results (Scholar's
+    // result list is RAF-driven). Worker window stays focused:false.
+    const opts = { url, active: true };
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
@@ -2599,7 +3135,9 @@ async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWo
 
   try {
     const winId = await getOrCreateWorkerWindow();
-    const opts = { url, active: false };
+    // active:true — citation report's per-paper times-cited table is
+    // virtualized and won't render its rows when the tab is hidden.
+    const opts = { url, active: true };
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
