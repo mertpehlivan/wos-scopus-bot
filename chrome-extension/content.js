@@ -752,24 +752,22 @@ async function findAndSaveCitationReportLink(taskId, authorWosId) {
 // ═══════════════════════════════════════════════
 
 /**
- * Detects WoS's anonymous "free view" banner — the page is rendering
- * partial author/profile data without a valid session, so any scrape now
- * would be incomplete. wos_session_handler.js handles the recovery by
+ * Detects whether the WoS page is in anonymous mode — either the free-view
+ * banner is visible OR a Sign In control is exposed in the header
+ * (which only renders when not logged in). Both reliably mean the scrape
+ * would come back partial. wos_session_handler.js handles the recovery by
  * force-navigating to the Clarivate login URL; we just stand down and
  * let it work. This script is reinjected automatically after the post-
- * login navigation completes (the manifest matches the WoS author
- * record path), so no need to wire any explicit "resume" signal here.
+ * login navigation completes.
  *
- * <p>Only counts the banner when it's actually VISIBLE — display:none
- * leftovers from a previous render shouldn't trigger us.
+ * <p>Only counts the indicators when they're actually VISIBLE.
  */
 function _wosIsAnonymousFreeView() {
-  // Look for the banner element directly first — more reliable than
-  // a body-text scan, which catches stale Angular comments.
-  const candidates = document.querySelectorAll(
+  // 1. Banner element — most reliable when present.
+  const bannerCandidates = document.querySelectorAll(
     '[class*="free-view" i], [class*="anonymous-banner" i], app-anonymous-banner, mat-toolbar'
   );
-  for (const el of candidates) {
+  for (const el of bannerCandidates) {
     const txt = (el.textContent || '').toLowerCase();
     if (!txt.includes('free view of the web of science')) continue;
     const style = window.getComputedStyle(el);
@@ -777,10 +775,27 @@ function _wosIsAnonymousFreeView() {
     const rect = el.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) return true;
   }
-  // Fallback: body-text scan (catches layout variants we don't have selectors for).
+  // 2. Body-text scan fallback for banner.
   const text = (document.body && document.body.innerText) || '';
-  if (!text) return false;
-  return /you are accessing a free view of the web of science/i.test(text);
+  if (text && /you are accessing a free view of the web of science/i.test(text)) {
+    return true;
+  }
+  // 3. Sign In control visible — modern WoS layouts often drop the banner
+  //    but still show Sign In in the header when anonymous.
+  const signInCandidates = document.querySelectorAll(
+    'button, a, [role="button"], mat-menu-item, [cdxanalyticscategory*="sign" i]'
+  );
+  for (const el of signInCandidates) {
+    const t = ((el.textContent || el.innerText || '')).replace(/\s+/g, ' ').trim().toLowerCase();
+    if (t !== 'sign in' && !t.startsWith('sign in')) continue;
+    if (t.length > 40) continue;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    return true;
+  }
+  return false;
 }
 
 /**

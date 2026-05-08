@@ -501,6 +501,108 @@ async function postSessionEvent(source, event, detail) {
   }
 }
 
+/**
+ * Resolves the post-login retry URL for the given WoS tab and triggers
+ * a tab.update navigation to it. Idempotent — both the WOS_LOGIN_SUCCESS
+ * message handler and the WOS_CHECK_POST_LOGIN handler call into here,
+ * and storage flags are consumed exactly once.
+ *
+ * @param {number} tabId   the tab to navigate
+ * @param {string} [tabUrl] the tab's current URL (best-effort fallback)
+ */
+async function handleWosLoginSuccess(tabId, tabUrl) {
+  if (tabId == null) return;
+  const entry = pendingTabs.get(tabId);
+
+  // Priority 1: the URL the user was on when login was triggered. The
+  // session handler now saves this on every sign-in path (button,
+  // dropdown, force-navigate), so it should virtually always be set.
+  // Also consume the wos_login_pending breadcrumb so a double-fire
+  // (pre-nav best-effort + post-nav storage trigger) doesn't navigate
+  // twice. Both flags survive the form-submit redirect; first
+  // consumer wins.
+  let returnUrl = null;
+  let hadAnyFlag = false;
+  try {
+    const stored = await chrome.storage.session.get(['wos_return_url', 'wos_login_pending']);
+    returnUrl = stored.wos_return_url || null;
+    const toRemove = [];
+    if (stored.wos_return_url != null) toRemove.push('wos_return_url');
+    if (stored.wos_login_pending != null) toRemove.push('wos_login_pending');
+    hadAnyFlag = toRemove.length > 0;
+    if (toRemove.length > 0) {
+      await chrome.storage.session.remove(toRemove);
+    }
+  } catch (e) {
+    console.warn('[WoS Session] Could not read return URL:', e);
+  }
+
+  // Dedup: if no flag was set, this is a duplicate delivery. Skip.
+  if (!hadAnyFlag) {
+    console.log('[WoS Session] handleWosLoginSuccess: both flags already consumed, skipping (dedup)');
+    return;
+  }
+
+  // Priority 2: derive from pendingTabs entry. SAFE only when the task
+  // is an author-profile scrape (FULL_SCRAPE on /wos/author/record/).
+  // For article-detail / citation-report tasks the externalId is a DOI
+  // or article id and the wos/author/record/<id> URL would be wrong.
+  let retryUrl = returnUrl;
+  if (!retryUrl && entry?.externalId && entry?.source === 'WOS' &&
+      (entry.taskType === 'FULL_SCRAPE' || !entry.taskType)) {
+    const baseUrl = `https://www.webofscience.com/wos/author/record/${encodeURIComponent(entry.externalId)}`;
+    retryUrl = `${baseUrl}#wos-task-id=${entry.taskId}`;
+  }
+
+  // Priority 3: whatever URL the tab is currently on. Last-ditch.
+  if (!retryUrl) retryUrl = tabUrl;
+
+  // Sanity: never navigate back to a login URL (would loop).
+  if (retryUrl && (retryUrl.includes('access.clarivate.com')
+          || retryUrl.includes('/login')
+          || retryUrl.includes('/signin'))) {
+    console.warn('[WoS Session] retryUrl looks like a login page, skipping navigation:', retryUrl);
+    retryUrl = null;
+  }
+
+  // Always re-stamp the task-id hash. The saved returnUrl (Priority 1)
+  // is captured at the time of sign-in click — by then Angular's
+  // router has often dropped any URL hash, so the stored value is
+  // hash-less. Without the hash, content.js's getTaskId() falls back
+  // to GET_TASK_INFO, which CAN race the navigation: the tab's
+  // chrome.storage.session entry is still present, but if anything
+  // cleared it (the recovery flow's various edge cases), content.js
+  // exits silently as "Task ID bulunamadı" and the scrape never
+  // restarts. Re-stamping is cheap and idempotent.
+  if (retryUrl && entry?.taskId) {
+    const hashKey = `wos-task-id=${entry.taskId}`;
+    if (!retryUrl.includes(hashKey)) {
+      const hashPos = retryUrl.indexOf('#');
+      const base = hashPos >= 0 ? retryUrl.slice(0, hashPos) : retryUrl;
+      retryUrl = `${base}#${hashKey}`;
+    }
+  }
+
+  if (!retryUrl) {
+    addLog('WoS session restored but no return URL — tab will stay where it is', 'warning');
+    return;
+  }
+
+  console.log(`[WoS Session] Login success on tab #${tabId}, navigating to: ${retryUrl}`);
+  addLog('WoS session restored, retrying scrape on original URL', 'success');
+  if (entry) {
+    entry.readyAt = null; // allow next SCRAPE_READY from reloaded content.js
+    resetScrapeTimeout(tabId); // extend the overall task timeout
+  }
+
+  try {
+    await chrome.tabs.update(tabId, { url: retryUrl });
+    console.log(`[WoS Session] Tab #${tabId} navigated to restart scraping.`);
+  } catch (e) {
+    console.warn('[WoS Session] Tab update failed:', e?.message || e);
+  }
+}
+
 function resetScrapeTimeout(tabId) {
   // Always cleanup old timeout first, even if exception occurs
   if (scrapeTimeouts.has(tabId)) {
@@ -1890,91 +1992,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // ── WoS Session Handler: Login success signal ──
   if (msg.type === 'WOS_LOGIN_SUCCESS') {
     const tabId = sender.tab?.id;
-    // Tell backend recovery is done — backend's polling will switch the source
-    // out of LOGIN_RECOVERING state on its next status query.
+    const tabUrl = sender.tab?.url;
     postSessionEvent('WOS', 'LOGIN_SUCCESS', 'auto-login completed');
-
-    (async () => {
-      if (tabId == null) return;
-      const entry = pendingTabs.get(tabId);
-
-      // ── Resolve where to go ──
-      // Priority 1: the URL the user was on when login was triggered. The
-      // session handler now saves this on every sign-in path (button,
-      // dropdown, force-navigate), so it should virtually always be set.
-      let returnUrl = null;
-      try {
-        const stored = await chrome.storage.session.get(['wos_return_url']);
-        returnUrl = stored.wos_return_url || null;
-        if (returnUrl) {
-          await chrome.storage.session.remove(['wos_return_url']);
-        }
-      } catch (e) {
-        console.warn('[WoS Session] Could not read return URL:', e);
-      }
-
-      // Priority 2: derive from pendingTabs entry. SAFE only when the task
-      // is an author-profile scrape (FULL_SCRAPE on /wos/author/record/).
-      // For article-detail / citation-report tasks the externalId is a DOI
-      // or article id and the wos/author/record/<id> URL would be wrong.
-      let retryUrl = returnUrl;
-      if (!retryUrl && entry?.externalId && entry?.source === 'WOS' &&
-          (entry.taskType === 'FULL_SCRAPE' || !entry.taskType)) {
-        const baseUrl = `https://www.webofscience.com/wos/author/record/${encodeURIComponent(entry.externalId)}`;
-        retryUrl = `${baseUrl}#wos-task-id=${entry.taskId}`;
-      }
-
-      // Priority 3: whatever URL the tab is currently on. Last-ditch.
-      if (!retryUrl) retryUrl = sender.tab?.url;
-
-      // Sanity: never navigate back to a login URL (would loop).
-      if (retryUrl && (retryUrl.includes('access.clarivate.com')
-              || retryUrl.includes('/login')
-              || retryUrl.includes('/signin'))) {
-        console.warn('[WoS Session] retryUrl looks like a login page, skipping navigation:', retryUrl);
-        retryUrl = null;
-      }
-
-      // Always re-stamp the task-id hash. The saved returnUrl (Priority 1)
-      // is captured at the time of sign-in click — by then Angular's
-      // router has often dropped any URL hash, so the stored value is
-      // hash-less. Without the hash, content.js's getTaskId() falls back
-      // to GET_TASK_INFO, which CAN race the navigation: the tab's
-      // chrome.storage.session entry is still present, but if anything
-      // cleared it (the recovery flow's various edge cases), content.js
-      // exits silently as "Task ID bulunamadı" and the scrape never
-      // restarts. Re-stamping is cheap and idempotent.
-      if (retryUrl && entry?.taskId) {
-        const hashKey = `wos-task-id=${entry.taskId}`;
-        if (!retryUrl.includes(hashKey)) {
-          // Strip any existing hash first — Angular routes usually live
-          // in path, hash should only carry our task id.
-          const hashPos = retryUrl.indexOf('#');
-          const base = hashPos >= 0 ? retryUrl.slice(0, hashPos) : retryUrl;
-          retryUrl = `${base}#${hashKey}`;
-        }
-      }
-
-      if (!retryUrl) {
-        addLog('WoS session restored but no return URL — tab will stay where it is', 'warning');
-        sendResponse({ ok: true });
-        return;
-      }
-
-      console.log(`[WoS Session] Login success on tab #${tabId}, navigating to: ${retryUrl}`);
-      addLog('WoS session restored, retrying scrape on original URL', 'success');
-      if (entry) {
-        entry.readyAt = null; // allow next SCRAPE_READY from reloaded content.js
-        resetScrapeTimeout(tabId); // extend the overall task timeout
-      }
-
-      try {
-        await chrome.tabs.update(tabId, { url: retryUrl });
-        console.log(`[WoS Session] Tab #${tabId} navigated to restart scraping.`);
-      } catch (e) {
-        console.warn('[WoS Session] Tab update failed:', e?.message || e);
-      }
-    })();
+    handleWosLoginSuccess(tabId, tabUrl).catch(e =>
+        console.warn('[WoS Session] handleWosLoginSuccess failed:', e?.message || e));
     sendResponse({ ok: true });
     return true;
   }
@@ -1992,9 +2013,64 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // ── WoS return-URL persistence (storage.session not always usable from MAIN world) ──
   if (msg.type === 'WOS_SET_RETURN_URL') {
+    // Awaitable so the caller (forceNavigateToLogin) can rely on the
+    // write completing before triggering navigation.
     chrome.storage.session.set({ wos_return_url: msg.url || '' })
-      .catch(e => console.warn('[WoS Session] Failed to set return URL:', e?.message || e));
-    sendResponse({ ok: true });
+      .then(() => sendResponse({ ok: true }))
+      .catch(e => {
+        console.warn('[WoS Session] Failed to set return URL:', e?.message || e);
+        sendResponse({ ok: false, error: e?.message });
+      });
+    return true; // async response
+  }
+
+  // ── WoS login pending sentinel ──
+  // Set right before the login form is submitted; survives the post-
+  // submit redirect. The post-login session_handler asks
+  // WOS_CHECK_POST_LOGIN to learn whether to dispatch WOS_LOGIN_SUCCESS.
+  // session_handler runs in MAIN world and can't touch chrome.storage
+  // directly — all storage I/O happens here.
+  if (msg.type === 'WOS_SET_LOGIN_PENDING') {
+    chrome.storage.session.set({ wos_login_pending: Date.now() })
+      .then(() => sendResponse({ ok: true }))
+      .catch(e => {
+        console.warn('[WoS Session] Failed to set login-pending:', e?.message || e);
+        sendResponse({ ok: false, error: e?.message });
+      });
+    return true;
+  }
+
+  // ── Post-login breadcrumb check ──
+  // Returns { fired: true } if the wos_login_pending flag was set and
+  // we just dispatched the login-success navigation; false otherwise.
+  // Idempotent — flag is consumed on first hit (inside handleWosLoginSuccess).
+  if (msg.type === 'WOS_CHECK_POST_LOGIN') {
+    (async () => {
+      try {
+        const tabId = sender.tab?.id;
+        const tabUrl = sender.tab?.url;
+        const stored = await chrome.storage.session.get(['wos_login_pending']);
+        const ts = stored.wos_login_pending;
+        if (!ts) {
+          sendResponse({ fired: false, reason: 'no flag' });
+          return;
+        }
+        if (Date.now() - ts > 5 * 60 * 1000) {
+          await chrome.storage.session.remove(['wos_login_pending']);
+          sendResponse({ fired: false, reason: 'stale' });
+          return;
+        }
+        // Real flag, real tab — route through the same login-success
+        // helper so navigation / dedup / hash-restamp is identical
+        // to the WOS_LOGIN_SUCCESS message path.
+        postSessionEvent('WOS', 'LOGIN_SUCCESS', 'post-login breadcrumb consumed');
+        await handleWosLoginSuccess(tabId, tabUrl);
+        sendResponse({ fired: true, tabId });
+      } catch (e) {
+        console.warn('[WoS Session] WOS_CHECK_POST_LOGIN failed:', e?.message || e);
+        sendResponse({ fired: false, error: e?.message });
+      }
+    })();
     return true;
   }
 

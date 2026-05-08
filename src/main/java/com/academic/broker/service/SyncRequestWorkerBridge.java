@@ -857,10 +857,12 @@ public class SyncRequestWorkerBridge {
      *  provides them (OpenAlex doesn't have JCR data). */
     @SuppressWarnings("unchecked")
     private static void enrichInto(Map<String, Object> into, Map<String, Object> from, String source) {
-        // Generic backfill: only if existing is missing/blank.
+        // Generic backfill: only if existing is missing/blank. Abstract
+        // intentionally NOT in this list — it has source-specific rules
+        // applied below (OpenAlex → WoS only).
         List<String> backfill = List.of(
                 "year", "journal", "publisher", "volume", "issue", "pages", "url",
-                "authors", "abstract", "language", "issn", "eissn", "articleNo",
+                "authors", "language", "issn", "eissn", "articleNo",
                 "publicationDate", "openAccess",
                 "wosId", "scopusId", "openAlexId",
                 "category");
@@ -874,27 +876,65 @@ public class SyncRequestWorkerBridge {
                 into.put(k, from.get(k));
             }
         }
-        // WoS-specialty fields ALWAYS take WoS's value when WoS provides one
-        // (JCR Q value, JIF, indexTypes — none of which OpenAlex/Scopus have).
+
+        // ── Abstract: OpenAlex priority, WoS fallback only ──────────
+        // Per product spec the publication's abstract must come from
+        // OpenAlex when available; if OpenAlex didn't supply one, WoS
+        // is allowed to fill in. Scopus / Scholar / PlumX never touch
+        // the abstract field — they don't reliably produce one and
+        // letting them overwrite would cost us OpenAlex's longer
+        // reconstructed text.
         if ("WOS".equals(source)) {
-            for (String k : List.of("indexType", "qValue", "impactFactor",
+            Object existing = into.get("abstract");
+            boolean blank = existing == null
+                    || (existing instanceof String s && s.isBlank());
+            if (blank && from.get("abstract") != null) {
+                Object incoming = from.get("abstract");
+                if (incoming instanceof String is && !is.isBlank()) {
+                    into.put("abstract", is);
+                }
+            }
+        }
+        // SCOPUS / SCHOLAR / PLUMX: deliberately no abstract write.
+        // WoS-specialty fields ALWAYS take WoS's value when WoS provides one
+        // (JCR Q value, JIF, indexTypes, funding, addresses — none of
+        // which OpenAlex/Scopus have).
+        if ("WOS".equals(source)) {
+            for (String k : List.of(
+                    "indexType", "qValue", "impactFactor",
                     "indexTypes", "wosCategories", "researchAreas",
-                    "authorKeywords", "keywordsPlus", "jcrCategories", "jciCategories")) {
+                    "authorKeywords", "keywordsPlus",
+                    "jcrCategories", "jciCategories", "jifValues", "jcrYear", "jciValue",
+                    "funding", "addresses", "orcidList", "researcherIdList",
+                    "accession", "idsNumber", "earlyAccess", "indexed",
+                    "documentTypes", "mappedPublicationType")) {
                 if (from.get(k) != null) into.put(k, from.get(k));
             }
         }
-        // Keywords: union across sources rather than first-wins, since each
-        // surface (OpenAlex concepts, WoS authorKeywords, Scopus keywords)
-        // captures different facets of the paper.
+        // ── Keywords: WoS priority ─────────────────────────────────
+        // Per product spec WoS authorKeywords are the canonical source —
+        // when WoS provides a non-empty list, REPLACE whatever other
+        // sources contributed (OpenAlex concepts in particular tend to
+        // be very general topical labels). Other sources only fill the
+        // field when it's still empty (first-source-wins for non-WoS).
         Object incomingKw = from.get("keywords");
         if (incomingKw instanceof java.util.Collection<?> incomingList && !incomingList.isEmpty()) {
-            java.util.LinkedHashSet<Object> merged = new java.util.LinkedHashSet<>();
-            Object existingKw = into.get("keywords");
-            if (existingKw instanceof java.util.Collection<?> existingList) {
-                merged.addAll((java.util.Collection<Object>) existingList);
+            if ("WOS".equals(source)) {
+                // WoS always overwrites, dedup'd and ordered.
+                java.util.LinkedHashSet<Object> wosKw = new java.util.LinkedHashSet<>(
+                        (java.util.Collection<Object>) incomingList);
+                into.put("keywords", new java.util.ArrayList<>(wosKw));
+            } else {
+                // Non-WoS: only set if existing is missing/empty.
+                Object existingKw = into.get("keywords");
+                boolean blank = existingKw == null
+                        || (existingKw instanceof java.util.Collection<?> ec && ec.isEmpty());
+                if (blank) {
+                    java.util.LinkedHashSet<Object> dedup = new java.util.LinkedHashSet<>(
+                            (java.util.Collection<Object>) incomingList);
+                    into.put("keywords", new java.util.ArrayList<>(dedup));
+                }
             }
-            merged.addAll((java.util.Collection<Object>) incomingList);
-            into.put("keywords", new java.util.ArrayList<>(merged));
         }
         // Merge citations from this source
         Object srcCit = from.get("citations");
@@ -968,13 +1008,35 @@ public class SyncRequestWorkerBridge {
 
         // ── Links / abstract / classification ──────────────────────────
         copyFirst(p, "url", raw, "url", "href", "link", "articleUrl");
-        copyFirst(p, "abstract", raw, "abstract", "abstractText");
+        // Abstract: only OpenAlex and WoS may produce one. Scopus, Scholar,
+        // and PlumX never touch abstract — even when they're a baseline
+        // source (e.g. WoS-only pub matched against no OpenAlex twin).
+        // Per product spec the priority chain is OpenAlex → WoS, others
+        // remain hands-off so we never replace the longer/cleaner
+        // OpenAlex reconstruction with a partial scrape.
+        if ("OPENALEX".equals(source) || "WOS".equals(source)) {
+            copyFirst(p, "abstract", raw, "abstract", "abstractText");
+        }
         copyFirst(p, "openAccess", raw, "openAccess");
 
         // Index info — WoS provides indexTypes (array, e.g. SCI-EXPANDED, SSCI)
-        // and a derived indexType (Q value).
+        // and a derived indexType (Q value, despite the field name).
+        // Normalize the array entries to the system's short codes so the
+        // researcher dashboard's IndexBadge component can render them
+        // (it only knows SCI / SCI-E / SSCI / AHCI / ESCI / CPCI-* /
+        // BKCI-* / Scopus / TR Dizin).
         Object indexTypes = raw.get("indexTypes");
-        if (indexTypes != null) p.put("indexTypes", indexTypes);
+        if (indexTypes instanceof java.util.List<?> idxList) {
+            java.util.List<String> normalized = new java.util.ArrayList<>();
+            for (Object o : idxList) {
+                if (o == null) continue;
+                String code = normalizeIndexCode(String.valueOf(o));
+                if (code != null && !normalized.contains(code)) normalized.add(code);
+            }
+            if (!normalized.isEmpty()) p.put("indexTypes", normalized);
+        } else if (indexTypes != null) {
+            p.put("indexTypes", indexTypes);
+        }
         Object researchAreas = raw.get("researchAreas");
         if (researchAreas != null) p.put("researchAreas", researchAreas);
         Object wosCategories = raw.get("wosCategories");
@@ -1048,6 +1110,27 @@ public class SyncRequestWorkerBridge {
         Object impactFactor = raw.get("impactFactor");
         if (impactFactor != null) p.put("impactFactor", impactFactor);
 
+        // Additional WoS-detail fields the form-engine downstream renders.
+        // Carry them through unchanged so the operator panel + the
+        // researcher CV both see the rich JCR / JCI / funding metadata.
+        for (String k : List.of(
+                // JCR / JCI rankings + values
+                "jifValues", "jcrYear", "jciValue",
+                // Funding & affiliation context
+                "funding", "addresses",
+                // Author identifier crosswalks (ORCID / ResearcherID lists
+                // attached to this paper). Different from the per-author
+                // `authors[].orcid` because some papers have ORCID without
+                // a full name match.
+                "orcidList", "researcherIdList",
+                // Misc bibliographic IDs
+                "accession", "idsNumber", "earlyAccess", "indexed",
+                // Documents-by-author tabs sometimes carry these
+                "pubType", "documentSubType")) {
+            Object v = raw.get(k);
+            if (v != null) p.put(k, v);
+        }
+
         // Carry through type-signalling fields so resolveCategory has a
         // chance to read them.
         for (String k : List.of("documentType", "documentTypes",
@@ -1077,6 +1160,109 @@ public class SyncRequestWorkerBridge {
         // Audit: provenance per-publication
         p.put("provenance", "WORKER");
         return p;
+    }
+
+    /**
+     * Normalises a WoS edition string (as scraped from
+     * {@code [id^="FullRRPTa-edition"]} elements) to the system's short
+     * code that the IndexBadge component recognises:
+     * <pre>
+     *   SCI     — Science Citation Index
+     *   SCI-E   — Science Citation Index Expanded
+     *   SSCI    — Social Sciences Citation Index
+     *   AHCI    — Arts &amp; Humanities Citation Index
+     *   ESCI    — Emerging Sources Citation Index
+     *   CPCI-S  — Conference Proceedings Citation Index – Science
+     *   CPCI-SSH— Conference Proceedings Citation Index – Social Sciences &amp; Humanities
+     *   BKCI-S  — Book Citation Index – Science
+     *   BKCI-SSH— Book Citation Index – Social Sciences &amp; Humanities
+     * </pre>
+     * Inputs may be:
+     * <ul>
+     *   <li>"Science Citation Index Expanded (SCI-EXPANDED)" — full WoS label with paren'd code</li>
+     *   <li>"SCI-EXPANDED" — bare code</li>
+     *   <li>"SSCI" — already short</li>
+     *   <li>Anything unrecognised — returned trimmed verbatim so we don't lose data</li>
+     * </ul>
+     */
+    private static String normalizeIndexCode(String raw) {
+        if (raw == null) return null;
+        String s = raw.trim();
+        if (s.isEmpty()) return null;
+
+        // 1. Look for a parenthesised short code first — most reliable
+        //    when the WoS label is the long human-readable form.
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\(([A-Za-z][A-Za-z0-9 \\-]{1,15})\\)").matcher(s);
+        while (m.find()) {
+            String paren = m.group(1).trim().toUpperCase();
+            String code = mapShortIndexCode(paren);
+            if (code != null) return code;
+        }
+
+        // 2. Match against well-known full names.
+        String upper = s.toUpperCase();
+        if (upper.contains("SCIENCE CITATION INDEX EXPANDED")) return "SCI-E";
+        if (upper.contains("SCIENCE CITATION INDEX")) return "SCI";
+        if (upper.contains("SOCIAL SCIENCES CITATION INDEX")) return "SSCI";
+        if (upper.contains("ARTS") && upper.contains("HUMANITIES CITATION INDEX")) return "AHCI";
+        if (upper.contains("EMERGING SOURCES CITATION INDEX")) return "ESCI";
+        if (upper.contains("CONFERENCE PROCEEDINGS CITATION INDEX")
+                && (upper.contains("SOCIAL") || upper.contains("HUMANITIES") || upper.contains("SSH"))) {
+            return "CPCI-SSH";
+        }
+        if (upper.contains("CONFERENCE PROCEEDINGS CITATION INDEX")) return "CPCI-S";
+        if (upper.contains("BOOK CITATION INDEX")
+                && (upper.contains("SOCIAL") || upper.contains("HUMANITIES") || upper.contains("SSH"))) {
+            return "BKCI-SSH";
+        }
+        if (upper.contains("BOOK CITATION INDEX")) return "BKCI-S";
+
+        // 3. Bare short code passed as-is.
+        String maybe = mapShortIndexCode(upper);
+        if (maybe != null) return maybe;
+
+        // 4. Unknown — return trimmed input so unusual labels still appear
+        //    on the badge (operator can edit if needed).
+        return s;
+    }
+
+    /** Folds known short-code spellings (e.g. "SCI-EXPANDED" → "SCI-E"). */
+    private static String mapShortIndexCode(String upper) {
+        switch (upper) {
+            case "SCI":
+                return "SCI";
+            case "SCI-E":
+            case "SCIE":
+            case "SCI-EXPANDED":
+                return "SCI-E";
+            case "SSCI":
+                return "SSCI";
+            case "AHCI":
+            case "A&HCI":
+                return "AHCI";
+            case "ESCI":
+                return "ESCI";
+            case "CPCI-S":
+            case "CPCIS":
+                return "CPCI-S";
+            case "CPCI-SSH":
+            case "CPCISSH":
+                return "CPCI-SSH";
+            case "BKCI-S":
+            case "BKCIS":
+                return "BKCI-S";
+            case "BKCI-SSH":
+            case "BKCISSH":
+                return "BKCI-SSH";
+            case "SCOPUS":
+                return "Scopus";
+            case "TR DIZIN":
+            case "TR-DIZIN":
+            case "TR_DIZIN":
+                return "TR Dizin";
+            default:
+                return null;
+        }
     }
 
     private static void copyFirst(Map<String, Object> dst, String dstKey, Map<String, Object> src, String... candidates) {

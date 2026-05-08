@@ -89,13 +89,19 @@
 
     /**
      * Saves the current page URL as the post-login return target — but
-     * only if the URL is a data page worth coming back to. Logging an
+     * only if the URL is a data page worth coming back to. Saving an
      * already-on-login-page URL would create a redirect loop after
      * successful auth.
      *
-     * @returns {boolean} true if the URL was eligible and the message sent
+     * <p>Awaitable: sends WOS_SET_RETURN_URL via chrome.runtime.sendMessage
+     * and resolves only after the background's storage write returns.
+     * Critical because the caller (forceNavigateToLogin) follows up with
+     * window.location.href = ... that kills the JS context — without
+     * awaiting, the storage write can lose the race against navigation.
+     *
+     * @returns {Promise<boolean>} true if the URL was eligible and stored
      */
-    function saveReturnUrlIfDataPage(reason) {
+    async function saveReturnUrlIfDataPage(reason) {
         const url = window.location.href;
         const host = window.location.host;
         // Don't save Clarivate / Sign-in pages — those aren't where we
@@ -106,18 +112,30 @@
         if (path.startsWith('/login') || path.startsWith('/signin')) return false;
 
         try {
-            chrome.runtime.sendMessage({ type: 'WOS_SET_RETURN_URL', url });
+            // Await delivery so the storage write completes before the
+            // caller initiates navigation. chrome.runtime.sendMessage
+            // returns a Promise in Manifest V3.
+            await chrome.runtime.sendMessage({ type: 'WOS_SET_RETURN_URL', url });
             console.log('[WoS Session] Saved return URL (' + reason + '):', url);
+            return true;
         } catch (e) {
-            console.warn('[WoS Session] Could not save return URL:', e);
+            console.warn('[WoS Session] Could not save return URL:', e?.message || e);
+            return false;
         }
-        return true;
     }
 
     async function forceNavigateToLogin() {
         if (forceNavigatedToLogin) return false;
         forceNavigatedToLogin = true;
-        saveReturnUrlIfDataPage('forceNavigate');
+        // AWAIT the return-URL save so it lands in storage before we
+        // tear down this JS context with window.location.href below.
+        // Without awaiting, the storage write was being dropped in
+        // practice — background.js then had no return URL after
+        // login, fell through to Priority 2/3 (rebuild from entry or
+        // sender.tab.url, which was the post-login basic-search), and
+        // tab stayed on the home page instead of going back to the
+        // task URL.
+        await saveReturnUrlIfDataPage('forceNavigate');
         if (!loginDetectedReported) {
             loginDetectedReported = true;
             reportSession('LOGIN_DETECTED', 'no Sign In control on data page — forcing login URL');
@@ -437,6 +455,23 @@
         console.log(`[WoS Session] Email: "${emailInput.value}"`);
         console.log(`[WoS Session] Password: "${passwordInput.value}"`);
 
+        // Persist a "login was just submitted" sentinel BEFORE clicking
+        // submit. The form post triggers a redirect chain that kills
+        // this JS context within ~1 second — any
+        // chrome.runtime.sendMessage we fire AFTER submit is racing
+        // navigation and was being lost in practice. The sentinel goes
+        // into chrome.storage.session via the background (this script
+        // runs in MAIN world and can't touch chrome.storage directly).
+        // Storage survives navigation so the post-login attemptRecovery
+        // on the landed-on WoS page picks up the breadcrumb and asks
+        // background to fire WOS_LOGIN_SUCCESS.
+        try {
+            await chrome.runtime.sendMessage({ type: 'WOS_SET_LOGIN_PENDING' });
+            console.log('[WoS Session] wos_login_pending sentinel set via background');
+        } catch (e) {
+            console.warn('[WoS Session] Could not set login-pending sentinel:', e?.message || e);
+        }
+
         const form = document.querySelector('form[name="loginForm"], form.steam-login-panel');
         if (submitBtn) {
             submitBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
@@ -451,25 +486,57 @@
             console.log('[WoS Session] Dispatching form submit event');
             form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
         }
-        await _humanDelay(1000, 2000);
-
-        // Signal background that login succeeded - background will reload tab to retry scraping
-        setTimeout(() => {
-            try {
-                chrome.runtime.sendMessage({ type: 'WOS_LOGIN_SUCCESS' });
-                console.log('[WoS Session] WOS_LOGIN_SUCCESS signal sent to background');
-            } catch (e) {
-                console.warn('[WoS Session] Failed to send login success signal:', e);
-            }
-        }, 1000);
+        // Best-effort, may be killed by navigation. The post-login
+        // session-handler picks up wos_login_pending and re-fires this
+        // message reliably.
+        try {
+            chrome.runtime.sendMessage({ type: 'WOS_LOGIN_SUCCESS' });
+            console.log('[WoS Session] WOS_LOGIN_SUCCESS signal sent (pre-nav, best-effort)');
+        } catch (e) {
+            // Swallow — we have the storage sentinel as backup.
+        }
 
         console.log('\n[WoS Session] 🔐 LOGIN PROCESS COMPLETE\n');
         return true;
     }
 
+    /**
+     * Post-login breadcrumb: on any subsequent page load, ask the
+     * background whether a {@code wos_login_pending} sentinel is set.
+     * If yes, background consumes the flag and fires WOS_LOGIN_SUCCESS
+     * internally to navigate the tab back to the saved return URL.
+     *
+     * <p>This script runs in MAIN world so it has no direct access to
+     * {@code chrome.storage} — all storage interactions must go through
+     * the background via {@code chrome.runtime.sendMessage}.
+     */
+    async function checkPostLoginBreadcrumb() {
+        try {
+            const host = window.location.host;
+            // Only fire on WoS pages — login redirects through Clarivate,
+            // and we don't want to ask while still on the auth domain.
+            if (!host.includes('webofscience.com')) return false;
+            const resp = await chrome.runtime.sendMessage({ type: 'WOS_CHECK_POST_LOGIN' });
+            if (resp?.fired) {
+                console.log('[WoS Session] Post-login breadcrumb consumed by background — login success dispatched');
+            }
+            return resp?.fired === true;
+        } catch (e) {
+            console.warn('[WoS Session] checkPostLoginBreadcrumb failed:', e?.message || e);
+            return false;
+        }
+    }
+
     // ── Main recovery loop ──
     async function attemptRecovery() {
         try {
+            // First thing every tick: if we just submitted the login form
+            // and the redirect chain landed us on a WoS page, fire the
+            // WOS_LOGIN_SUCCESS signal so background.js can navigate the
+            // tab back to the original task URL. The sentinel was set
+            // pre-submit; this consumes it once.
+            await checkPostLoginBreadcrumb();
+
             const ctrl = findSignInControl()
             const articleVisible = hasArticleContent()
             const loginFormVisible = !!document.querySelector('input[name="email"], input[formcontrolname="email"], input#mat-input-1')
@@ -499,14 +566,22 @@
                 return false;
             }
 
-            // Free-view banner visible on a data page → go straight to
-            // login. The dropdown click flow IS available as a fallback,
-            // but on the modern WoS layout it's a race against
-            // content.js, which is already trying to scrape the partial
-            // anonymous data and could complete the task with zeros
-            // before our auth flow finishes. Direct nav is deterministic.
-            if (freeViewBanner && !loginFormVisible && isDataPage()) {
-                console.log('[WoS Session] Free-view banner detected on data page — forcing login URL immediately');
+            // Anonymous mode on a data page → go straight to login.
+            // Trigger conditions (any of):
+            //   • free-view banner is visible (English or Turkish), OR
+            //   • a Sign In control is visible (modern WoS layouts often
+            //     drop the banner but still show Sign In in the header
+            //     when anonymous).
+            // Both reliably mean "we're not logged in and the scrape will
+            // come back partial". The previous code tried to click the
+            // header Sign In button up to 2 times before giving up — but
+            // clicking it on the new Angular layout often opens-and-
+            // closes the dropdown in the same tick, so we'd loop. Direct
+            // navigation to access.clarivate.com/login is deterministic
+            // and the form-fill code there picks up automatically.
+            if ((freeViewBanner || ctrl) && !loginFormVisible && isDataPage()) {
+                const reason = freeViewBanner ? 'free-view banner' : 'Sign In control';
+                console.log('[WoS Session] Anonymous data page detected (' + reason + ') — forcing login URL immediately');
                 await forceNavigateToLogin();
                 return true;
             }
