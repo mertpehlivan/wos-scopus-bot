@@ -922,6 +922,18 @@ async function runPriorityOrchestrator() {
     return;
   }
 
+  // ── Phase 1.5: Citation Report retries ─────────────────────────
+  // Operator-triggered retries (or any task that ended up PENDING in
+  // the broker without an active author scrape — e.g. a previously
+  // FAILED row reset to PENDING) get picked up here, AFTER all WoS
+  // author/detail work is drained so the new tab doesn't compete with
+  // an in-progress scrape.
+  const crState = await runCitationReportPhaseInline();
+  if (crState !== 'drained') {
+    scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_ACTIVE_MS, 30));
+    return;
+  }
+
   // ── Phase 2: SCOPUS first, PLUMX after ──────────────────────────
   const scopusState = await runScopusPhaseInline();
   if (scopusState !== 'drained') {
@@ -945,12 +957,365 @@ async function runPriorityOrchestrator() {
   scheduleOrchestrator(jitteredInterval(POLL_INTERVAL_IDLE_MS, 20));
 }
 
+/* ═══════════════════════════════════════════════
+ *  WOS SESSION PRE-FLIGHT
+ * ═══════════════════════════════════════════════
+ *
+ *  Before opening any WoS author / detail / citation-report tab the
+ *  worker now verifies that a logged-in WoS session is available.
+ *  Without this check, every cold-start scrape would land on the
+ *  free-view banner, force the session_handler into reactive mode,
+ *  bounce the tab through the Clarivate login URL, and only then
+ *  resume the scrape — losing 10–30s per task and sometimes failing
+ *  the scrape entirely if the redirect chain races content.js.
+ *
+ *  Strategy: open a hidden basic-search tab tagged with
+ *  {@code #wos-session-probe=1}; the existing session_handler runs
+ *  there and either:
+ *    • detects an authenticated page → emits {@code WOS_SESSION_OK}
+ *    • detects free-view / Sign In → runs the same login flow it
+ *      already runs on task tabs, and the post-login breadcrumb
+ *      fires {@code WOS_LOGIN_SUCCESS} which we treat as "session
+ *      verified" too.
+ *  The probe tab is then closed and the cached status is reused for
+ *  {@code WOS_SESSION_TTL_MS} so subsequent tasks don't pay the
+ *  probe cost.
+ */
+const WOS_SESSION_PROBE_FLAG = 'wos-session-probe=1';
+const WOS_SESSION_PROBE_URL =
+    'https://www.webofscience.com/wos/woscc/basic-search#' + WOS_SESSION_PROBE_FLAG;
+// Cache the verified session for 25 min — well under the typical WoS
+// session lifetime (~hours) but short enough that a logout while the
+// worker is idle gets re-detected before the next batch.
+const WOS_SESSION_TTL_MS = 25 * 60 * 1000;
+const WOS_SESSION_PROBE_TIMEOUT_MS = 90_000;
+let wosSession = {
+  status: 'unknown',     // 'unknown' | 'checking' | 'authenticated' | 'expired'
+  lastVerifiedAt: 0,
+  pendingProbeTabId: null,
+  pendingResolve: null,
+  pendingTimeoutId: null,
+};
+
+/**
+ * Waits until {@code chrome.tabs.get(tabId).status === 'complete'} or
+ * the timeout expires. Used to time the post-load DOM check so we
+ * don't try to query the page mid-bootstrap.
+ */
+function waitForTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (ok, err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      ok ? resolve() : reject(err || new Error('timeout'));
+    };
+    const onUpdated = (changedId, info) => {
+      if (changedId === tabId && info.status === 'complete') finish(true);
+    };
+    const timer = setTimeout(() => finish(false, new Error('tab load timeout')), timeoutMs);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    // The tab may already be 'complete' before we attached the listener.
+    chrome.tabs.get(tabId).then(t => {
+      if (t && t.status === 'complete') finish(true);
+    }).catch(() => { /* tab gone — let timer handle it */ });
+  });
+}
+
+/**
+ * Reads the probe tab's DOM directly via {@code chrome.scripting.executeScript}
+ * to decide whether the session is logged in. We can't rely on the
+ * session_handler messaging path alone — Angular strips the URL hash
+ * during bootstrap, so any flag we put on the URL might be gone by the
+ * time the handler runs. Polling the DOM from background avoids that
+ * whole class of race conditions: if "Sign In" / login form / free-view
+ * banner are absent and the body actually rendered, we're logged in.
+ *
+ * Returns one of:
+ *   - {logged: true,  reason}      → session is active
+ *   - {logged: false, reason}      → login required (session_handler
+ *                                    will run its own login flow next)
+ *   - null                          → check failed (script error / tab gone)
+ */
+async function probeWosLoggedInState(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const txt = (document.body && document.body.innerText || '').toLowerCase();
+        const hasFreeView =
+            txt.includes('you are accessing a free view of the web of science')
+            || txt.includes('web of science free view');
+        const loginForm = !!document.querySelector(
+            'input[name="email"], input[formcontrolname="email"], input#mat-input-1');
+        // "Sign In" control: walk visible buttons/links.
+        let hasSignIn = false;
+        const candidates = document.querySelectorAll('button, a, [role="button"], mat-menu-item');
+        for (const el of candidates) {
+          const own = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+          if (own === 'sign in' || own === 'sign in »') {
+            const r = el.getBoundingClientRect();
+            const cs = window.getComputedStyle(el);
+            if (r.width > 0 && r.height > 0
+                && cs.display !== 'none' && cs.visibility !== 'hidden') {
+              hasSignIn = true;
+              break;
+            }
+          }
+        }
+        return {
+          hasFreeView,
+          loginForm,
+          hasSignIn,
+          bodyLen: txt.length,
+          host: location.host,
+          path: location.pathname,
+        };
+      },
+    });
+    const r = results && results[0] && results[0].result;
+    if (!r) return null;
+    // If we're still on a Clarivate auth domain, the redirect chain
+    // hasn't finished — treat as "not yet decided" and let the timeout
+    // / session_handler login flow handle it.
+    if (r.host && r.host.includes('clarivate.com')) {
+      return { logged: false, reason: 'on auth domain', detail: r };
+    }
+    if (r.bodyLen < 50) {
+      return { logged: false, reason: 'body not rendered', detail: r };
+    }
+    if (r.hasFreeView || r.hasSignIn || r.loginForm) {
+      return { logged: false, reason: 'auth UI visible', detail: r };
+    }
+    return { logged: true, reason: 'no auth UI', detail: r };
+  } catch (e) {
+    console.warn('[WoS Session] Probe DOM check failed:', e?.message || e);
+    return null;
+  }
+}
+
+/**
+ * Resolves true if a usable WoS session is available, false otherwise.
+ * Caches the answer; the orchestrator can call this on every WoS phase
+ * tick and only the first one (or the one after TTL expiry) actually
+ * opens a probe tab.
+ */
+async function ensureWosSession() {
+  const now = Date.now();
+  if (wosSession.status === 'authenticated'
+      && (now - wosSession.lastVerifiedAt) < WOS_SESSION_TTL_MS) {
+    return true;
+  }
+  if (wosSession.status === 'checking' && wosSession.pendingResolve) {
+    // A probe is already in flight — chain onto its resolve.
+    return new Promise(resolve => {
+      const orig = wosSession.pendingResolve;
+      wosSession.pendingResolve = (ok) => { orig(ok); resolve(ok); };
+    });
+  }
+
+  wosSession.status = 'checking';
+  let resolveFn;
+  const probePromise = new Promise(r => { resolveFn = r; });
+  wosSession.pendingResolve = resolveFn;
+
+  let winId = null;
+  try { winId = await getOrCreateWorkerWindow(); } catch (_) { /* fall back to default window */ }
+  const opts = { url: WOS_SESSION_PROBE_URL, active: false };
+  if (winId != null) opts.windowId = winId;
+  let tab;
+  try {
+    tab = await chrome.tabs.create(opts);
+    wosSession.pendingProbeTabId = tab.id;
+    if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
+    addLog('[WoS Session] Pre-flight session probe started', 'info');
+  } catch (e) {
+    console.warn('[WoS Session] Probe tab creation failed:', e?.message || e);
+    finishWosProbe(false);
+    return probePromise;
+  }
+
+  // Belt-and-suspenders timeout — if the DOM-poll loop below somehow
+  // hangs and no message lands either, this fires and prevents the
+  // orchestrator from stalling forever.
+  wosSession.pendingTimeoutId = setTimeout(() => {
+    if (wosSession.pendingResolve) {
+      console.warn('[WoS Session] Probe timed out after',
+          WOS_SESSION_PROBE_TIMEOUT_MS, 'ms');
+      finishWosProbe(false);
+    }
+  }, WOS_SESSION_PROBE_TIMEOUT_MS);
+
+  // Run the DOM-check loop in the background. Don't await it — we want
+  // the probe to also be resolvable by inbound WOS_LOGIN_SUCCESS /
+  // WOS_SESSION_OK messages (which finishWosProbe respects via the
+  // pendingResolve check). The first one to call finishWosProbe wins.
+  (async () => {
+    try {
+      await waitForTabComplete(tab.id, 25_000);
+    } catch (_) { /* fall through to polling */ }
+    // Give Angular a few seconds to bootstrap before the first DOM read.
+    // Then poll up to 6 times at 2s intervals — if a redirect chain is
+    // still in flight (Clarivate auth → WoS), we'll catch the final
+    // state. session_handler may run its own login flow during this
+    // window; if so the resulting WOS_LOGIN_SUCCESS lands first and
+    // we exit early via finishWosProbe.
+    await new Promise(r => setTimeout(r, 2500));
+    for (let i = 0; i < 6; i++) {
+      if (!wosSession.pendingResolve) return; // already resolved by message handler
+      const verdict = await probeWosLoggedInState(tab.id);
+      if (verdict) {
+        if (verdict.logged) {
+          console.log('[WoS Session] Probe DOM check: logged in');
+          if (wosSession.pendingResolve) finishWosProbe(true);
+          return;
+        }
+        // Not logged in yet — but session_handler may be running the
+        // login flow. Don't fail-fast on the first negative read; give
+        // the login a few cycles to complete (each cycle takes 5–15s in
+        // session_handler — Angular form-fill + submit + redirect).
+        if (verdict.reason === 'auth UI visible' && i >= 5) {
+          console.log('[WoS Session] Probe DOM check: still on auth UI after 5 polls — failing');
+          if (wosSession.pendingResolve) finishWosProbe(false);
+          return;
+        }
+        // 'on auth domain' / 'body not rendered' → keep waiting.
+      }
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    // Loop ended without verdict — leave it to the hard timeout.
+  })().catch(e => console.warn('[WoS Session] DOM probe loop error:', e?.message || e));
+
+  return probePromise;
+}
+
+/**
+ * Closes the probe tab, updates cached status, resolves the pending
+ * promise. Idempotent — calling twice with conflicting outcomes will
+ * keep the first answer.
+ */
+function finishWosProbe(ok) {
+  if (wosSession.pendingTimeoutId != null) {
+    clearTimeout(wosSession.pendingTimeoutId);
+    wosSession.pendingTimeoutId = null;
+  }
+  if (wosSession.pendingProbeTabId != null) {
+    const tabId = wosSession.pendingProbeTabId;
+    wosSession.pendingProbeTabId = null;
+    chrome.tabs.remove(tabId).catch(() => { /* tab may already be gone */ });
+  }
+  wosSession.status = ok ? 'authenticated' : 'expired';
+  wosSession.lastVerifiedAt = Date.now();
+  if (wosSession.pendingResolve) {
+    const resolve = wosSession.pendingResolve;
+    wosSession.pendingResolve = null;
+    resolve(ok);
+  }
+  addLog(ok ? '[WoS Session] Pre-flight OK — session is active'
+            : '[WoS Session] Pre-flight failed — proceeding without verified login',
+         ok ? 'success' : 'warning');
+}
+
+// Cooldown after a failed pre-flight probe before retrying. Without
+// this the orchestrator would re-open a probe tab on every tick (the
+// cache miss as soon as the previous probe is marked `expired`),
+// burning resources and blocking the other source phases. 60s is long
+// enough to let a transient failure resolve (network blip, slow
+// Angular load) without making the user wait minutes for a real
+// re-probe after a logout.
+const WOS_SESSION_RETRY_BACKOFF_MS = 60_000;
+
 /** WoS phase as a stateless predicate. */
 async function runWosPhaseInline() {
   if (!GROUP_CONFIG.wos) return 'drained';
   if (await isWosPhaseActive()) return 'busy';
+  // Backoff: if we just failed a probe, skip WoS this tick so other
+  // phases (Scopus / Scholar / PlumX / OpenAlex) keep moving. The
+  // probe itself will be retried after the cooldown expires.
+  if (wosSession.status === 'expired'
+      && (Date.now() - wosSession.lastVerifiedAt) < WOS_SESSION_RETRY_BACKOFF_MS) {
+    return 'drained';
+  }
+  // Pre-flight: make sure we have a logged-in WoS session BEFORE
+  // opening a task tab. Otherwise the task tab lands on the free-view
+  // banner and the redirect dance eats half the scrape window.
+  const sessionOk = await ensureWosSession();
+  if (!sessionOk) {
+    // Probe failed — return 'drained' so the orchestrator continues
+    // to the other phases. The backoff above prevents another probe
+    // from firing for the next 60s.
+    return 'drained';
+  }
   const picked = await pollScrapeSource('WOS');
   return picked ? 'picked' : 'drained';
+}
+
+/**
+ * Citation Report phase. Pulls one PENDING task from the broker and
+ * opens its URL in a fresh tab. Used for operator-triggered retries
+ * and for tasks that ended up PENDING without an inline trigger from
+ * {@code finalizeAndComplete} (e.g. announce arrived but the worker
+ * crashed before opening the tab).
+ *
+ * <p>Returns:
+ * <ul>
+ *   <li>{@code 'busy'}    — there's already a citation-report tab open</li>
+ *   <li>{@code 'picked'}  — claimed a task and opened a tab</li>
+ *   <li>{@code 'drained'} — broker has nothing PENDING for us</li>
+ * </ul>
+ */
+async function runCitationReportPhaseInline() {
+  if (!GROUP_CONFIG.wos) return 'drained';
+  // Don't open a second citation-report tab while one is still active
+  // — the per-paper times-cited table needs the tab focused, and racing
+  // two would just timeout one.
+  if (activeWosJobs.citationReportTab !== null) return 'busy';
+  if (pendingCitationReportTabs.size > 0) return 'busy';
+
+  let task;
+  try {
+    const h = await brokerHeaders();
+    const resp = await fetch(`${API_BASE}/api/citation-report-tasks/poll?batchSize=1`, {
+      method: 'GET',
+      headers: h,
+    });
+    if (resp.status === 204) return 'drained';
+    if (!resp.ok) {
+      console.warn('[Citation Report] poll returned HTTP', resp.status);
+      return 'drained';
+    }
+    const arr = await resp.json();
+    if (!Array.isArray(arr) || arr.length === 0) return 'drained';
+    task = arr[0];
+  } catch (err) {
+    console.warn('[Citation Report] poll failed:', err?.message || err);
+    return 'drained';
+  }
+
+  // Open a tab and inject the scraper. Use a synthetic article-task id
+  // (the broker task id itself) for the URL hash since we no longer have
+  // the originating WoS author scrape's task.
+  const fakeAuthorTaskId = `cr-${task.taskId}`;
+  // Stash citationReportTaskId so handleCitationReportComplete can find it.
+  // We do NOT use savedCitationReportLinks here because that map keys on
+  // the WoS author scrape's task id, which we don't have for retries.
+  const opened = await handleCitationReportLinkFound(
+      fakeAuthorTaskId,
+      task.citationReportUrl,
+      task.authorWosId || '',
+      task.taskId);
+  if (opened && opened.ok) {
+    addLog(`Citation Report retry started (broker task #${task.taskId})`, 'info');
+    return 'picked';
+  }
+  // Couldn't open the tab — mark task FAILED so it doesn't sit in PROCESSING
+  // forever (the broker flipped it on poll).
+  await reportCitationReportFailure(task.taskId,
+      'Worker could not open the citation-report tab: '
+      + (opened && opened.error ? opened.error : 'unknown'));
+  return 'drained';
 }
 
 /** Scopus author profile (METRICS_ONLY by default). */
@@ -1145,6 +1510,24 @@ async function processOpenAlexTask(task) {
   };
   const i10 = Number(summary.i10_index ?? -1);
   if (i10 >= 0) authorMetrics.i10Index = i10;
+
+  // OpenAlex's author endpoint returns a `counts_by_year` array with
+  // {year, works_count, cited_by_count} for the past ~10 years. Map it
+  // into the same {year, publications, citations} shape the WoS
+  // Citation Report uses so downstream consumers (operator panel,
+  // ApplySyncService, public profile) can read both side-by-side
+  // without source-specific code paths. Backend stores this as
+  // ResearcherProfile.rdlYearlyStats (parallel to wosYearlyStats).
+  if (Array.isArray(author?.counts_by_year)) {
+    authorMetrics.yearlyStats = author.counts_by_year
+      .map(c => ({
+        year: Number(c?.year) || 0,
+        publications: Number(c?.works_count ?? 0) || 0,
+        citations: Number(c?.cited_by_count ?? 0) || 0,
+      }))
+      .filter(y => y.year > 0)
+      .sort((a, b) => a.year - b.year);
+  }
 
   // 3) Works endpoint — page through every work the author has, not
   // just the top-100 most-cited. The historical SmartPublicationService
@@ -1996,6 +2379,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     postSessionEvent('WOS', 'LOGIN_SUCCESS', 'auto-login completed');
     handleWosLoginSuccess(tabId, tabUrl).catch(e =>
         console.warn('[WoS Session] handleWosLoginSuccess failed:', e?.message || e));
+    // A successful login also satisfies any in-flight pre-flight
+    // probe. The probe tab itself may have been the one driving the
+    // login flow (when the user logged out between sync runs); now
+    // that auth is restored, mark the cached session authenticated so
+    // the orchestrator can release the WoS phase gate.
+    if (wosSession.pendingResolve) {
+      finishWosProbe(true);
+    } else {
+      // Fresh login outside a probe — extend the cached TTL anyway so
+      // the next ensureWosSession() call short-circuits.
+      wosSession.status = 'authenticated';
+      wosSession.lastVerifiedAt = Date.now();
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // ── Pre-flight probe: session_handler reports session is OK ──
+  if (msg.type === 'WOS_SESSION_OK') {
+    if (wosSession.pendingResolve) {
+      finishWosProbe(true);
+    } else {
+      // Late signal (probe already timed out / resolved) — still
+      // bump the cache so subsequent ticks don't re-probe immediately.
+      wosSession.status = 'authenticated';
+      wosSession.lastVerifiedAt = Date.now();
+    }
     sendResponse({ ok: true });
     return true;
   }
@@ -3175,15 +3585,70 @@ async function reportDoiTaskFail(source, taskId, error) {
 //  CITATION REPORT — Link saved & Tab management
 // ═══════════════════════════════════════════════
 
-const pendingCitationReportTabs = new Map(); // tabId → { taskId, authorWosId }
-const savedCitationReportLinks = new Map(); // taskId → { citationReportUrl, authorWosId }
+const pendingCitationReportTabs = new Map(); // tabId → { taskId, authorWosId, citationReportTaskId }
+// Per-WOS-author-task Map. Each entry now also carries the broker-side
+// CitationReportTask.id we got back from /announce — needed when the
+// worker posts /complete or /fail later. The URL is still kept here as
+// well so the post-detail-scrape openCitationReportTab path doesn't need
+// a second round-trip to the broker.
+const savedCitationReportLinks = new Map(); // taskId → { citationReportUrl, authorWosId, citationReportTaskId }
+
+/**
+ * Announce a discovered Citation Report URL to the broker so it persists
+ * as a CitationReportTask row (survives extension reload) and shows up
+ * in the operator panel pipeline. Returns the broker-side task id so
+ * later /complete / /fail calls can target it. {@code null} on failure
+ * — caller can still proceed with the URL since the in-memory map keeps
+ * the worker functional without broker tracking.
+ */
+async function announceCitationReportToBroker(articleTaskId, citationReportUrl, authorWosId) {
+  try {
+    const h = await brokerHeaders();
+    const resp = await fetch(`${API_BASE}/api/citation-report-tasks/announce`, {
+      method: 'POST',
+      headers: h,
+      body: JSON.stringify({
+        articleTaskId,
+        citationReportUrl,
+        authorWosId: authorWosId || null,
+      }),
+    });
+    if (!resp.ok) {
+      console.warn(`[Citation Report] announce returned HTTP ${resp.status}`);
+      return null;
+    }
+    const body = await resp.json().catch(() => null);
+    const id = body && body.taskId;
+    if (id == null || id === '') {
+      console.warn('[Citation Report] announce ok but no taskId returned (article-task unknown to broker)');
+      return null;
+    }
+    return Number(id);
+  } catch (err) {
+    console.warn('[Citation Report] announce failed:', err?.message || err);
+    return null;
+  }
+}
 
 // Citation Report linki kaydet (detay scraping'den sonra açılacak)
 async function handleCitationReportLinkSaved(taskId, citationReportUrl, authorWosId) {
   console.log(`[WoS Worker] Citation Report link saved for task ${taskId}: ${citationReportUrl}`);
-  savedCitationReportLinks.set(taskId, { citationReportUrl, authorWosId });
-  addLog(`Citation Report link saved for later`, 'info');
-  return { ok: true };
+  // Persist to broker so the operator panel can show pipeline state
+  // and the URL survives an extension reload. Best-effort — if the
+  // broker is unreachable we still keep the in-memory copy and the
+  // post-detail-scrape openCitationReportTab path works.
+  const citationReportTaskId = await announceCitationReportToBroker(
+      taskId, citationReportUrl, authorWosId);
+  savedCitationReportLinks.set(taskId, {
+    citationReportUrl,
+    authorWosId,
+    citationReportTaskId,
+  });
+  addLog(citationReportTaskId
+      ? `Citation Report link saved (broker task #${citationReportTaskId})`
+      : `Citation Report link saved (broker announce failed; in-memory only)`,
+      'info');
+  return { ok: true, citationReportTaskId };
 }
 
 // Citation Report tab'ını aç (detay scraping tamamlandıktan sonra çağrılır)
@@ -3194,16 +3659,16 @@ async function openCitationReportTab(taskId) {
     return { ok: false, error: 'No saved link' };
   }
 
-  const { citationReportUrl, authorWosId } = savedLink;
+  const { citationReportUrl, authorWosId, citationReportTaskId } = savedLink;
   savedCitationReportLinks.delete(taskId);
 
   console.log(`[WoS Worker] Opening Citation Report tab for task ${taskId}: ${citationReportUrl}`);
   addLog(`Opening Citation Report tab...`, 'info');
 
-  return await handleCitationReportLinkFound(taskId, citationReportUrl, authorWosId);
+  return await handleCitationReportLinkFound(taskId, citationReportUrl, authorWosId, citationReportTaskId);
 }
 
-async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWosId) {
+async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWosId, citationReportTaskId) {
   // URL'e task ID'yi ekle
   let url = citationReportUrl;
   const sep = url.includes('#') ? '&' : '#';
@@ -3217,7 +3682,7 @@ async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWo
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
-    pendingCitationReportTabs.set(tab.id, { taskId, authorWosId, openedAt: Date.now() });
+    pendingCitationReportTabs.set(tab.id, { taskId, authorWosId, citationReportTaskId, openedAt: Date.now() });
     activeWosJobs.citationReportTab = tab.id;
     addLog(`[WOS Group] Citation report tab opened #${tab.id} for task ${taskId}`, 'info');
     console.log(`[WoS Worker] Opened Citation Report tab #${tab.id} for task ${taskId}`);
@@ -3239,17 +3704,10 @@ async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWo
         console.warn('[Citation Report] Failed to inject content script:', injectErr);
         addLog(`Failed to inject Citation Report script`, 'error');
 
-        // Report failure
-        const h = await brokerHeaders();
-        await fetch(`${API_BASE}/api/wos/citation-report/sync`, {
-          method: 'POST',
-          headers: h,
-          body: JSON.stringify({
-            authorWosId: authorWosId || 'unknown',
-            error: 'Injection failed',
-            taskId
-          }),
-        }).catch(() => null);
+        // Mark the broker task as FAILED so the operator panel can show
+        // the error and offer "Tekrar Dene".
+        await reportCitationReportFailure(citationReportTaskId,
+            'Content-script injection failed: ' + (injectErr?.message || injectErr));
 
         pendingCitationReportTabs.delete(tab.id);
         try { await chrome.tabs.remove(tab.id); } catch (_) { }
@@ -3261,6 +3719,8 @@ async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWo
     setTimeout(async () => {
       if (pendingCitationReportTabs.has(tab.id)) {
         console.warn(`[Citation Report] Tab ${tab.id} timed out`);
+        await reportCitationReportFailure(citationReportTaskId,
+            'Citation report tab timed out after 3 minutes');
         try { await chrome.tabs.remove(tab.id); } catch (_) { }
         pendingCitationReportTabs.delete(tab.id);
       }
@@ -3276,26 +3736,39 @@ async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWo
 
 async function handleCitationReportComplete(tabId, taskId, data) {
   console.log(`[Citation Report] Scrape complete for task ${taskId}`);
-  addLog(`Citation Report data received, sending to backend...`, 'info');
+  addLog(`Citation Report data received, sending to broker...`, 'info');
 
-  try {
-    const h = await brokerHeaders();
-    const response = await fetch(`${API_BASE}/api/wos/citation-report/sync`, {
-      method: 'POST',
-      headers: h,
-      body: JSON.stringify(data),
-    });
+  // Look up the broker-side CitationReportTask id we got back from the
+  // /announce call earlier. Without it, the broker can't route the
+  // payload to the right sync request — fall back to logging only.
+  const tabMeta = tabId != null ? pendingCitationReportTabs.get(tabId) : null;
+  const citationReportTaskId = tabMeta && tabMeta.citationReportTaskId;
 
-    if (response.ok) {
-      addLog(`Citation Report synced successfully!`, 'success');
-      console.log(`[Citation Report] Data synced to backend for task ${taskId}`);
-    } else {
-      addLog(`Citation Report sync failed: HTTP ${response.status}`, 'error');
-      console.warn(`[Citation Report] Backend returned ${response.status}`);
+  if (citationReportTaskId == null) {
+    console.warn('[Citation Report] No broker task id for tab', tabId,
+        '— payload will not reach the operator panel');
+    addLog(`Citation Report not linked to broker (no task id)`, 'warning');
+  } else {
+    try {
+      const h = await brokerHeaders();
+      const response = await fetch(
+          `${API_BASE}/api/citation-report-tasks/${citationReportTaskId}/complete`,
+          {
+            method: 'POST',
+            headers: h,
+            body: JSON.stringify({ rawData: data }),
+          });
+      if (response.ok) {
+        addLog(`Citation Report synced (broker task #${citationReportTaskId})`, 'success');
+        console.log(`[Citation Report] Data synced to broker for task ${citationReportTaskId}`);
+      } else {
+        addLog(`Citation Report sync failed: HTTP ${response.status}`, 'error');
+        console.warn(`[Citation Report] Broker returned ${response.status}`);
+      }
+    } catch (err) {
+      console.warn('[Citation Report] Failed to sync data to broker:', err);
+      addLog(`Failed to sync Citation Report data`, 'error');
     }
-  } catch (err) {
-    console.warn('[Citation Report] Failed to sync data to backend:', err);
-    addLog(`Failed to sync Citation Report data`, 'error');
   }
 
   // Tab'ı kapat
@@ -3309,4 +3782,25 @@ async function handleCitationReportComplete(tabId, taskId, data) {
   }
 
   return { ok: true };
+}
+
+/**
+ * Reports a citation-report failure to the broker so the operator panel
+ * can surface a "FAILED" status with the error message and offer Retry.
+ * Called from injection failures and the 3-minute tab timeout.
+ */
+async function reportCitationReportFailure(citationReportTaskId, errorMessage) {
+  if (citationReportTaskId == null) return;
+  try {
+    const h = await brokerHeaders();
+    await fetch(
+        `${API_BASE}/api/citation-report-tasks/${citationReportTaskId}/fail`,
+        {
+          method: 'POST',
+          headers: h,
+          body: JSON.stringify({ errorMessage: errorMessage || 'Worker reported failure' }),
+        });
+  } catch (e) {
+    console.warn('[Citation Report] Failed to report failure to broker:', e?.message || e);
+  }
 }

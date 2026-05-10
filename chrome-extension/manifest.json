@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "WoS Task Worker",
   "description": "Task Queue worker: polls broker API, scrapes WoS author profiles, and enriches publications via DOI-based WoS Smart-Search and Google Scholar lookup.",
-  "version": "1.2.1",
+  "version": "1.6.4",
   "permissions": [
     "tabs",
     "alarms",

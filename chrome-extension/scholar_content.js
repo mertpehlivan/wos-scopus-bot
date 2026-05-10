@@ -104,6 +104,29 @@
         const initialRows = document.querySelectorAll('.gsc_a_tr');
         authorMetrics.publications = initialRows.length;
 
+        // ── Yearly citations histogram ─────────────────────────────────
+        // Google Scholar renders a small bar chart on the right ("Citations
+        // per year"). Each <a class="gsc_g_a"> bar carries its citation
+        // count in <span class="gsc_g_al">N</span>; the year labels live
+        // in <span class="gsc_g_t">2024</span> beside them. Both elements
+        // are positioned via inline `right:Npx` styles — RTL layout — so
+        // the year and bar with the closest `right` value are paired.
+        //
+        // We open the larger modal first (#gsc_md_hist) to make sure the
+        // full year range is in the DOM (the inline strip occasionally
+        // truncates older years on narrow viewports), then parse, then
+        // close the modal.
+        try {
+            authorMetrics.yearlyStats = await extractScholarYearlyStats();
+            chrome.runtime.sendMessage({
+                type: 'PROGRESS_UPDATE',
+                log: `Scholar yıllık atıflar: ${authorMetrics.yearlyStats?.length ?? 0} yıl`,
+            });
+        } catch (e) {
+            console.warn('[Scholar] Yearly stats extraction failed:', e?.message || e);
+            authorMetrics.yearlyStats = [];
+        }
+
         chrome.runtime.sendMessage({
             type: 'PROGRESS_UPDATE',
             log: `Scholar metrikleri: h-index=${authorMetrics.hIndex}, atıf=${authorMetrics.sumOfTimesCited}`
@@ -214,3 +237,138 @@
         });
     }
 })();
+
+/* ════════════════════════════════════════════════════════════════
+ *  Yearly histogram extraction
+ * ════════════════════════════════════════════════════════════════ */
+
+/**
+ * Parses Google Scholar's "Citations per year" histogram and returns a
+ * sorted array of {@code [{year, citations}]}.
+ *
+ * Inline panel layout (always present on the right sidebar):
+ *   <div class="gsc_g_hist_wrp" dir="rtl">
+ *     ...
+ *     <div class="gsc_md_hist_w">
+ *       <div class="gsc_md_hist_b">
+ *         <span class="gsc_g_t" style="right:483px">2011</span>  ... 16 of these
+ *         <a class="gsc_g_a"  style="right:488px;...">
+ *           <span class="gsc_g_al">5</span>
+ *         </a>                                                  ... 16 of these
+ *       </div>
+ *     </div>
+ *   </div>
+ *
+ * Year labels and bars are siblings; pairing is by closest `right`
+ * inline-style. The same template is reused inside #gsc_md_hist (the
+ * "Yıllık alıntı sayısı" modal) and contains identical data, so we
+ * only fall back to opening that modal if the sidebar copy is missing.
+ *
+ * Returns an empty array on failure; downstream callers treat that as
+ * "no per-year data".
+ */
+async function extractScholarYearlyStats() {
+    // ── Step 1. Wait for the histogram to actually render. ──────────────
+    // Scholar populates this asynchronously, often a second or two after
+    // the rest of the sidebar. A fixed delay used to drop the data on
+    // slow loads — poll until both year-labels and bar-counts are in the
+    // DOM (not just the container element).
+    const INLINE_SEL = '.gsc_g_hist_wrp:not(#gsc_md_hist *) .gsc_md_hist_b';
+    let root = null;
+    for (let attempt = 0; attempt < 30; attempt++) { // up to ~12s
+        const candidate = document.querySelector(INLINE_SEL);
+        if (candidate) {
+            const yearCount = candidate.querySelectorAll('.gsc_g_t').length;
+            const barCount  = candidate.querySelectorAll('a.gsc_g_a .gsc_g_al').length;
+            if (yearCount > 0 && barCount > 0) {
+                root = candidate;
+                console.log(
+                    `[Scholar] Histogram ready after ${attempt} polls ` +
+                    `(${yearCount} years, ${barCount} bars)`);
+                break;
+            }
+        }
+        await _humanDelay(350, 500);
+    }
+
+    // ── Step 2. Modal fallback. ─────────────────────────────────────────
+    // Older / narrow viewports can hide the inline strip. Click a sidebar
+    // bar to pop the "Yıllık alıntı sayısı" modal, then read from there.
+    let openedModal = false;
+    if (!root) {
+        const inlineBars = document.querySelectorAll(
+            '.gsc_g_hist_wrp:not(#gsc_md_hist *) a.gsc_g_a');
+        if (inlineBars.length > 0) {
+            try { inlineBars[0].click(); openedModal = true; } catch (_) { /* ignore */ }
+            for (let i = 0; i < 20; i++) {
+                await _humanDelay(150, 250);
+                const modal = document.querySelector('#gsc_md_hist.gs_vis')
+                           || document.querySelector('#gsc_md_hist[style*="top"]');
+                if (modal) {
+                    const cand = modal.querySelector('.gsc_md_hist_b');
+                    if (cand && cand.querySelectorAll('a.gsc_g_a .gsc_g_al').length > 0) {
+                        root = cand;
+                        console.log('[Scholar] Histogram read from modal fallback');
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!root) {
+        console.warn('[Scholar] Yearly histogram not found (inline polling + modal both failed)');
+        // Diagnostic: log what we DID see.
+        const wrappers = document.querySelectorAll('.gsc_g_hist_wrp');
+        const bars     = document.querySelectorAll('a.gsc_g_a');
+        console.warn(
+            `[Scholar] DOM snapshot: .gsc_g_hist_wrp=${wrappers.length}, ` +
+            `a.gsc_g_a=${bars.length}`);
+        return [];
+    }
+
+    // ── Step 3. Parse years and their `right` offsets. ──────────────────
+    const yearEls = Array.from(root.querySelectorAll('.gsc_g_t'));
+    const years = yearEls.map(s => ({
+        right: parseFloat(s.style && s.style.right) || 0,
+        year:  parseInt((s.textContent || '').trim(), 10),
+    })).filter(y => Number.isFinite(y.year) && y.year >= 1900 && y.year <= 2100);
+
+    // ── Step 4. Pair each bar with the nearest year by `right` distance.
+    // Scholar renders bars at year_right + ~5px, but the offset is not
+    // strictly fixed across viewports — nearest-match is the safer rule.
+    const barEls = Array.from(root.querySelectorAll('a.gsc_g_a'));
+    const stats = [];
+    for (const b of barEls) {
+        const right = parseFloat(b.style && b.style.right) || 0;
+        const labelEl = b.querySelector('.gsc_g_al');
+        const cit = parseInt((labelEl?.textContent || '').trim(), 10);
+        if (!Number.isFinite(cit)) continue;
+
+        let bestYear = null, bestDx = Infinity;
+        for (const y of years) {
+            const dx = Math.abs(right - y.right);
+            if (dx < bestDx) { bestDx = dx; bestYear = y.year; }
+        }
+        if (bestYear != null) stats.push({ year: bestYear, citations: cit });
+    }
+
+    // ── Step 5. Close the modal if we opened it. Leave the page untouched
+    //    when we read from the inline panel.
+    if (openedModal) {
+        const closeBtn = document.querySelector('#gsc_md_hist-x');
+        if (closeBtn) { try { closeBtn.click(); } catch (_) { /* ignore */ } }
+    }
+
+    // De-dup by year (defense; should already be unique) and sort.
+    const byYear = new Map();
+    for (const s of stats) {
+        if (!byYear.has(s.year)) byYear.set(s.year, s);
+    }
+    const result = Array.from(byYear.values()).sort((a, b) => a.year - b.year);
+    const total = result.reduce((s, y) => s + y.citations, 0);
+    console.log(
+        `[Scholar] Extracted ${result.length} yearly entries, Σcitations=${total}`,
+        result);
+    return result;
+}

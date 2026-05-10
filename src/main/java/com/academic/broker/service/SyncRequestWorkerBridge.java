@@ -1,11 +1,13 @@
 package com.academic.broker.service;
 
 import com.academic.broker.domain.ArticleTask;
+import com.academic.broker.domain.CitationReportTask;
 import com.academic.broker.domain.PlumxTask;
 import com.academic.broker.domain.SyncRequest;
 import com.academic.broker.domain.SyncRequestStatus;
 import com.academic.broker.domain.TaskStatus;
 import com.academic.broker.repository.ArticleTaskRepository;
+import com.academic.broker.repository.CitationReportTaskRepository;
 import com.academic.broker.repository.PlumxTaskRepository;
 import com.academic.broker.repository.SyncRequestRepository;
 import lombok.RequiredArgsConstructor;
@@ -40,6 +42,7 @@ public class SyncRequestWorkerBridge {
     private final SyncRequestRepository syncRepository;
     private final ArticleTaskRepository articleRepository;
     private final PlumxTaskRepository plumxRepository;
+    private final CitationReportTaskRepository citationReportRepository;
     private final SyncRequestService syncService;
 
     /** Stamp existing article-tasks (or new ones) with this request id. */
@@ -216,11 +219,14 @@ public class SyncRequestWorkerBridge {
 
     /**
      * True when every task linked to this sync request — ArticleTasks
-     * (WOS/SCOPUS/SCHOLAR/OPENALEX) AND PlumX per-DOI tasks — has reached a
-     * terminal status. PlumX is part of the readiness gate because the
-     * operator panel shows Scopus citation counts pulled via PlumX, and
-     * surfacing the request before those land would mean half the citation
-     * column is blank on first review.
+     * (WOS/SCOPUS/SCHOLAR/OPENALEX), PlumX per-DOI tasks, and the WoS
+     * Citation Report (if one was queued) — has reached a terminal
+     * status. PlumX is part of the readiness gate because the operator
+     * panel shows Scopus citation counts pulled via PlumX, and surfacing
+     * the request before those land would mean half the citation column
+     * is blank on first review. The Citation Report is included for the
+     * same reason: showing a "ready" request before the per-year citation
+     * histogram lands would force the operator to refresh.
      */
     private boolean areAllLinkedTasksDone(UUID syncRequestId) {
         List<ArticleTask> linked = articleRepository.findBySyncRequestId(syncRequestId);
@@ -233,6 +239,15 @@ public class SyncRequestWorkerBridge {
         // those plumx_tasks that were stamped with this syncRequestId.
         List<PlumxTask> plumx = plumxRepository.findBySyncRequestId(syncRequestId);
         for (PlumxTask t : plumx) {
+            TaskStatus s = t.getStatus();
+            if (s == TaskStatus.PENDING || s == TaskStatus.PROCESSING) return false;
+        }
+        // Citation Report is opportunistic — only created if the WoS
+        // author scrape actually exposed a citation-report link. So a
+        // sync request without a CitationReportTask is fine; we only
+        // gate when one exists and isn't terminal yet.
+        List<CitationReportTask> crs = citationReportRepository.findBySyncRequestId(syncRequestId);
+        for (CitationReportTask t : crs) {
             TaskStatus s = t.getStatus();
             if (s == TaskStatus.PENDING || s == TaskStatus.PROCESSING) return false;
         }
@@ -331,6 +346,179 @@ public class SyncRequestWorkerBridge {
         if (v instanceof Number n) return n.intValue();
         try { return Integer.parseInt(String.valueOf(v).trim()); }
         catch (NumberFormatException e) { return null; }
+    }
+
+    /**
+     * Records a citation-report link discovered by the Chrome extension.
+     * The extension knows its originating task by numeric
+     * {@link ArticleTask#getId()} (the same id it received in
+     * {@code /api/tasks/next}). We resolve the {@code syncRequestId}
+     * from the article task and create a pending
+     * {@link CitationReportTask} so the URL survives a service-worker
+     * restart and the operator panel can show pipeline progress.
+     *
+     * <p>Idempotent: re-announces for the same sync update the URL/auth
+     * id and re-arm a previously FAILED row instead of creating a
+     * duplicate.
+     *
+     * @return persisted CitationReportTask id, or null on bad input /
+     *         missing article task / unlinked task
+     */
+    @Transactional
+    public Long announceCitationReportLink(Long articleTaskId,
+                                           String citationReportUrl,
+                                           String authorWosId) {
+        if (articleTaskId == null || citationReportUrl == null || citationReportUrl.isBlank()) {
+            return null;
+        }
+        ArticleTask article = articleRepository.findById(articleTaskId).orElse(null);
+        if (article == null) {
+            log.warn("[Bridge] announceCitationReportLink: ArticleTask {} not found", articleTaskId);
+            return null;
+        }
+        UUID syncReqId = article.getSyncRequestId();
+        if (syncReqId == null) {
+            log.warn("[Bridge] announceCitationReportLink: ArticleTask {} has no syncRequestId — dropping",
+                    articleTaskId);
+            return null;
+        }
+        // Idempotent: there's at most one WoS author scrape per sync in the
+        // current pipeline, so a re-announce should refresh the existing
+        // task rather than create a duplicate. If a previous attempt
+        // FAILED, the announce re-arms it back to PENDING.
+        List<CitationReportTask> existing = citationReportRepository.findBySyncRequestId(syncReqId);
+        if (!existing.isEmpty()) {
+            CitationReportTask et = existing.get(0);
+            et.setCitationReportUrl(citationReportUrl);
+            if (authorWosId != null && !authorWosId.isBlank()) et.setAuthorWosId(authorWosId);
+            if (et.getStatus() == TaskStatus.FAILED) {
+                et.setStatus(TaskStatus.PENDING);
+                et.setErrorMessage(null);
+            }
+            et.touch();
+            citationReportRepository.save(et);
+            log.info("[Bridge] Citation report URL refreshed for sync {} task #{}", syncReqId, et.getId());
+            return et.getId();
+        }
+        CitationReportTask t = CitationReportTask.builder()
+                .syncRequestId(syncReqId)
+                .citationReportUrl(citationReportUrl)
+                .authorWosId(authorWosId)
+                .status(TaskStatus.PENDING)
+                .retryCount(0)
+                .build();
+        CitationReportTask saved = citationReportRepository.save(t);
+        log.info("[Bridge] Created CitationReportTask {} for sync {} (article task {})",
+                saved.getId(), syncReqId, articleTaskId);
+        return saved.getId();
+    }
+
+    /**
+     * Folds a completed citation-report scrape into the sync request's
+     * stagedData. Mirrors {@link #ingestPlumxCompletion} in shape: writes
+     * the raw blob under {@code stagedData.WOS.citationReport} so the
+     * operator panel can render it, and overlays per-publication
+     * citation counts onto the rebuilt publications list.
+     *
+     * <p>The main backend's {@link com.rdlsis.service.ApplySyncService}
+     * is expected to read the same JSON shape on apply.
+     */
+    @Transactional
+    public void ingestCitationReportCompletion(CitationReportTask task) {
+        UUID reqId = task.getSyncRequestId();
+        if (reqId == null) return;
+        SyncRequest req = syncRepository.findById(reqId).orElse(null);
+        if (req == null) return;
+        if (req.getStatus() == SyncRequestStatus.APPROVED
+                || req.getStatus() == SyncRequestStatus.REJECTED
+                || req.getStatus() == SyncRequestStatus.EXPIRED) {
+            log.warn("[Bridge] CitationReportTask {} completed AFTER sync {} reached {} — dropping",
+                    task.getId(), reqId, req.getStatus());
+            return;
+        }
+
+        Map<String, Object> staged = req.getStagedData() != null
+                ? new HashMap<>(req.getStagedData()) : new HashMap<>();
+
+        // Stash the whole payload under stagedData.WOS.citationReport. If
+        // a WOS source blob exists already, augment it; otherwise create a
+        // shell so the apply service has a place to read from.
+        @SuppressWarnings("unchecked")
+        Map<String, Object> wos = staged.get("WOS") instanceof Map<?, ?> wm
+                ? new HashMap<>((Map<String, Object>) wm) : new HashMap<>();
+        Map<String, Object> crBlob = new HashMap<>();
+        crBlob.put("status", task.getStatus().name());
+        crBlob.put("scrapedAt", task.getUpdatedAt() != null ? task.getUpdatedAt().toString() : null);
+        crBlob.put("retryCount", task.getRetryCount());
+        crBlob.put("citationReportUrl", task.getCitationReportUrl());
+        if (task.getAuthorWosId() != null) crBlob.put("authorWosId", task.getAuthorWosId());
+        if (task.getErrorMessage() != null) crBlob.put("errorMessage", task.getErrorMessage());
+        if (task.getRawData() != null) crBlob.put("data", task.getRawData());
+        wos.put("citationReport", crBlob);
+        staged.put("WOS", wos);
+
+        // Per-publication citation overrides — apply to the unified
+        // publications list if the scrape produced per-pub entries with
+        // wosId+totalCitations. Match by wosId first, fall back to title.
+        if (task.getRawData() != null) {
+            Object pubsObj = task.getRawData().get("publications");
+            if (pubsObj instanceof List<?> crList) {
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> stagedPubs = staged.get("publications") instanceof List<?> existing
+                        ? new java.util.ArrayList<>((List<Map<String, Object>>) existing)
+                        : new java.util.ArrayList<>();
+                int matched = 0;
+                for (Object o : crList) {
+                    if (!(o instanceof Map<?, ?> crm)) continue;
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> crp = (Map<String, Object>) crm;
+                    Integer total = asInt(crp.get("totalCitations"));
+                    if (total == null) continue;
+                    String wosIdRaw = crp.get("wosId") != null ? crp.get("wosId").toString().trim() : null;
+                    String wosIdNorm = wosIdRaw == null ? null
+                            : (wosIdRaw.startsWith("WOS:") ? wosIdRaw.substring(4) : wosIdRaw);
+                    String title = crp.get("title") != null ? crp.get("title").toString().trim() : null;
+                    Map<String, Object> match = null;
+                    if (wosIdNorm != null && !wosIdNorm.isBlank()) {
+                        for (Map<String, Object> p : stagedPubs) {
+                            String pwos = stringField(p, "wosId");
+                            if (pwos == null) continue;
+                            String pwosNorm = pwos.startsWith("WOS:") ? pwos.substring(4) : pwos;
+                            if (pwosNorm.equalsIgnoreCase(wosIdNorm)) { match = p; break; }
+                        }
+                    }
+                    if (match == null && title != null && !title.isBlank()) {
+                        for (Map<String, Object> p : stagedPubs) {
+                            String pt = stringField(p, "title");
+                            if (pt != null && pt.trim().equalsIgnoreCase(title)) { match = p; break; }
+                        }
+                    }
+                    if (match != null) {
+                        putCitation(match, "wos", total);
+                        matched++;
+                    }
+                }
+                if (!stagedPubs.isEmpty()) staged.put("publications", stagedPubs);
+                log.info("[Bridge] Citation report task {}: matched {} of {} publications to staged list",
+                        task.getId(), matched, crList.size());
+            }
+        }
+
+        Map<String, Object> progress = req.getSourceProgress() != null
+                ? new HashMap<>(req.getSourceProgress()) : new HashMap<>();
+        progress.put("CITATION_REPORT", task.getStatus().name());
+        req.setSourceProgress(progress);
+        req.setStagedData(staged);
+
+        boolean allDone = areAllLinkedTasksDone(reqId);
+        if (allDone && req.getStatus() == SyncRequestStatus.PENDING_SCRAPE) {
+            syncService.markScrapeComplete(reqId, req.getStagedData(), progress);
+            log.info("[Bridge] Citation report closed sync {} — moved to READY_FOR_REVIEW", reqId);
+        } else {
+            req.touch();
+            syncRepository.save(req);
+            log.debug("[Bridge] Citation report of req {}: status={}", reqId, task.getStatus());
+        }
     }
 
     /**

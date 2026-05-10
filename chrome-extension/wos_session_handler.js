@@ -11,6 +11,29 @@
 
     console.log('[WoS Session] Handler initialized on URL:', window.location.href);
 
+    // Capture pre-flight probe mode at script load — the WoS Angular SPA
+    // strips URL fragments aggressively during its initial bootstrap, so
+    // by the time our 1.5s setup timer fires the #wos-session-probe=1
+    // marker is gone and the handler can't tell it's running on the
+    // hidden probe tab. Memoizing at module-init means subsequent reads
+    // (in attemptRecovery) see the original value regardless of what
+    // Angular did to the URL. Also accept the flag from sessionStorage
+    // — background sets it as a belt-and-suspenders for the case where
+    // even the initial document.location.hash has already been
+    // rewritten (rare but observed during forced reloads).
+    const __PROBE_MODE = (() => {
+        try {
+            const hash = window.location.hash || '';
+            if (hash.includes('wos-session-probe=1')) return true;
+            if (sessionStorage.getItem('__wos_probe_mode__') === '1') return true;
+        } catch (_) { /* sessionStorage may be blocked */ }
+        return false;
+    })();
+    if (__PROBE_MODE) {
+        try { sessionStorage.setItem('__wos_probe_mode__', '1'); } catch (_) {}
+        console.log('[WoS Session] Probe mode active for this tab');
+    }
+
     const CONFIG = {
         email: 'info@rawdatalibrary.net',
         password: 'sakarya54qA*',
@@ -562,10 +585,34 @@
             //   banner isn't there (banner means the page is anonymous,
             //   metrics are partial, scrape will be incomplete — we MUST
             //   log in even if author name etc. is rendered).
-            if (articleVisible && !ctrl && !loginFormVisible && !pendoVisible && !freeViewBanner) {
+            // Probe mode is captured at script init (Angular strips the
+            // hash before our timers fire). The probe lives on
+            // /wos/woscc/basic-search which has no article content, so
+            // the regular `articleVisible` precondition would never
+            // fire for a logged-in probe — leaving the handler looping
+            // until the 90s timeout and the orchestrator stuck in a
+            // probe → expire → re-probe cycle. In probe mode we accept
+            // "no Sign In, no login form, no free-view banner, no
+            // Pendo" as proof of an active session.
+            const isProbeMode = __PROBE_MODE;
+            const sessionLooksFine = !ctrl && !loginFormVisible && !pendoVisible && !freeViewBanner;
+            if (sessionLooksFine && (articleVisible || isProbeMode)) {
                 // Stop polling; nothing for us to do here.
                 clearInterval(intervalId);
-                console.log('[WoS Session] Session looks fine (content + no Sign In + no login form + no free-view banner). Standing down.');
+                console.log('[WoS Session] Session looks fine'
+                    + (isProbeMode ? ' (probe mode — no article content required)' : '')
+                    + '. Standing down.');
+                // Probe tab: tell background the session is verified so
+                // the orchestrator can release the WoS phase gate. The
+                // probe tab itself will be closed by background.
+                if (isProbeMode) {
+                    try {
+                        chrome.runtime.sendMessage({ type: 'WOS_SESSION_OK', reason: 'probe-clear' });
+                        console.log('[WoS Session] Probe: WOS_SESSION_OK sent');
+                    } catch (e) {
+                        // Swallow — background will time the probe out.
+                    }
+                }
                 return false;
             }
 

@@ -249,119 +249,90 @@ async function getTaskInfo() {
 // ─── Data Extraction Functions ────────────────────────────────────────────────
 
 /**
- * Extract yearly statistics from the SVG bar chart
+ * Extract yearly statistics (publications + citations per year) from the chart.
+ *
+ * The "Times Cited and Publications Over Time" chart in #snChart contains two
+ * kinds of SVG elements that both carry the same data in their aria-label:
+ *   - <rect class="bar"> for publications (purple bars)
+ *   - <circle class="circle"> for citations (line markers, opacity:0)
+ *
+ * Each aria-label has one of these formats — order of "Publications" and
+ * "Citations" depends on which element it is:
+ *   "For year 2010 with 1 Publications and 0 Citations"
+ *   "For year 2010 with 0 Citations and 1 Publications"
+ *
+ * Strategy: target every aria-labelled descendant of #snChart, parse the
+ * label using a single regex that captures both numbers + their kinds, then
+ * dedup by year.
  */
 async function extractYearlyStats() {
-    console.log('[WoS Citation Report] Extracting yearly stats from chart...');
+    console.log('[WoS Citation Report] Extracting yearly chart data...');
 
-    const statsMap = new Map();
+    const CHART_ARIA_SEL = '#snChart [aria-label*="For year"]';
+    // Format: "For year YYYY with N {Publications|Citations} and M {Publications|Citations}"
+    const ARIA_REGEX = /For year (\d{4}) with (\d+)\s*(Publications?|Citations?)\s+and\s+(\d+)\s*(Publications?|Citations?)/i;
 
     try {
-        // Wait for chart to render actually bars or circles
-        await waitForElements(CONFIG.SELECTORS.CHART_BARS, 1, 15000);
-        await humanDelay(1000, 2000);
+        // 1. Wait until the chart has rendered at least one labelled element.
+        await waitForElements([CHART_ARIA_SEL, ...CONFIG.SELECTORS.CHART_BARS], 1, 20000);
 
-        // Try getting all bars matching any of the selectors
-        const bars = [];
-        for (const selector of CONFIG.SELECTORS.CHART_BARS) {
-            try {
-                const elements = document.querySelectorAll(selector);
-                if (elements.length > 0) {
-                    elements.forEach(el => {
-                        if (!bars.includes(el)) bars.push(el);
-                    });
-                }
-            } catch (e) {
-                // ignore invalid selectors
+        // 2. Wait for the count to stabilise — the chart animates in and we
+        //    don't want to read it mid-render. Poll up to ~5s for the count
+        //    to stop changing.
+        let lastCount = -1;
+        for (let i = 0; i < 8; i++) {
+            const c = document.querySelectorAll(CHART_ARIA_SEL).length;
+            if (c > 0 && c === lastCount) break;
+            lastCount = c;
+            await humanDelay(500, 700);
+        }
+
+        const elements = Array.from(document.querySelectorAll(CHART_ARIA_SEL));
+        console.log(`[WoS Citation Report] Chart elements found: ${elements.length}`);
+
+        const statsMap = new Map();
+        let unparsed = 0;
+
+        for (const el of elements) {
+            const aria = (el.getAttribute('aria-label') || '').replace(/,/g, '');
+            const m = aria.match(ARIA_REGEX);
+            if (!m) {
+                unparsed++;
+                console.warn('[WoS Citation Report] Could not parse aria-label:', aria);
+                continue;
+            }
+
+            const year = parseInt(m[1], 10);
+            const firstNum = parseInt(m[2], 10);
+            const firstIsPub = /^publ/i.test(m[3]);
+            const secondNum = parseInt(m[4], 10);
+
+            const publications = firstIsPub ? firstNum : secondNum;
+            const citations = firstIsPub ? secondNum : firstNum;
+
+            // Both rect (publications-first label) and circle (citations-first
+            // label) carry identical numbers, so the first occurrence per
+            // year is authoritative.
+            if (!statsMap.has(year)) {
+                statsMap.set(year, { year, publications, citations });
             }
         }
 
-        console.log(`[WoS Citation Report] Found ${bars.length} unique chart bars/circles`);
+        if (unparsed > 0) {
+            console.warn(`[WoS Citation Report] ${unparsed} aria-labels failed to parse`);
+        }
 
-        bars.forEach((bar, index) => {
-            const ariaLabel = bar.getAttribute('aria-label');
-            if (!ariaLabel) {
-                // Try to get data from other attributes
-                const dataYear = bar.getAttribute('data-year');
-                const dataPub = bar.getAttribute('data-publications');
-                const dataCit = bar.getAttribute('data-citations');
+        const yearlyStats = Array.from(statsMap.values()).sort((a, b) => a.year - b.year);
 
-                if (dataYear) {
-                    const year = parseInt(dataYear, 10);
-                    if (!statsMap.has(year)) {
-                        statsMap.set(year, {
-                            year: year,
-                            publications: parseInt(dataPub || '0', 10),
-                            citations: parseInt(dataCit || '0', 10)
-                        });
-                    }
-                    return;
-                }
+        // Sanity check: log totals so we can compare against the page header.
+        const totalCit = yearlyStats.reduce((s, y) => s + y.citations, 0);
+        const totalPub = yearlyStats.reduce((s, y) => s + y.publications, 0);
+        console.log(
+            `[WoS Citation Report] Extracted ${yearlyStats.length} years; ` +
+            `Σpublications=${totalPub}, Σcitations=${totalCit}`,
+            yearlyStats
+        );
 
-                console.log(`[WoS Citation Report] Bar ${index}: No aria-label, trying title...`);
-                // Try title attribute
-                const title = bar.getAttribute('title');
-                if (title) {
-                    const cleanTitle = title.replace(/,/g, '');
-                    const match = cleanTitle.match(/(\d{4}).*?(\d+).*?(\d+)/i);
-                    if (match) {
-                        const year = parseInt(match[1], 10);
-                        if (!statsMap.has(year)) {
-                            statsMap.set(year, {
-                                year: year,
-                                publications: parseInt(match[2], 10),
-                                citations: parseInt(match[3], 10)
-                            });
-                        }
-                    }
-                }
-                return;
-            }
-
-            console.log(`[WoS Citation Report] Bar ${index} aria-label:`, ariaLabel);
-            const cleanAria = ariaLabel.replace(/,/g, '');
-
-            // Parse aria-label: "For year 2010 with 1 Publications and 0 Citations"
-            // Also try alternative formats
-            let match = cleanAria.match(/For year (\d{4}) with (\d+)\s*Publications? and (\d+)\s*Citations?/i);
-            if (!match) {
-                // Alternative order: For year 2010 with 0 Citations and 1 Publications
-                let altMatch = cleanAria.match(/For year (\d{4}) with (\d+)\s*Citations? and (\d+)\s*Publications?/i);
-                if (altMatch) {
-                    match = [altMatch[0], altMatch[1], altMatch[3], altMatch[2]]; // Output as [full, year, pub, cit]
-                }
-            }
-            if (!match) {
-                match = cleanAria.match(/(\d{4})[.:]\s*(\d+)\s*pub.*?,\s*(\d+)\s*cit/i);
-            }
-            if (!match) {
-                match = cleanAria.match(/Year\s*(\d{4}).*?(\d+)\s*pub.*?(\d+)\s*cit/i);
-            }
-
-            if (match) {
-                const year = parseInt(match[1], 10);
-                const pubs = parseInt(match[2], 10);
-                const cits = parseInt(match[3], 10);
-
-                // Deduplicate by year since circles and rects contain the same data
-                if (!statsMap.has(year)) {
-                    statsMap.set(year, {
-                        year: year,
-                        publications: pubs,
-                        citations: cits
-                    });
-                }
-            } else {
-                console.log(`[WoS Citation Report] Bar ${index}: Failed to parse aria-label "${ariaLabel}"`);
-            }
-        });
-
-        const yearlyStats = Array.from(statsMap.values());
-
-        // Sort by year
-        yearlyStats.sort((a, b) => a.year - b.year);
-
-        console.log(`[WoS Citation Report] Extracted ${yearlyStats.length} yearly stats:`, yearlyStats);
         return yearlyStats;
     } catch (error) {
         console.warn('[WoS Citation Report] Could not extract yearly stats:', error.message);
@@ -379,6 +350,51 @@ async function extractTotals() {
     let overallTotalCitations = null;
 
     try {
+        // ── Strategy A: explicit "Sum of Times Cited" / "Total Citations"
+        //    metric block. Modern WoS Citation Report renders these as
+        //    discrete metric tiles (`app-citation-report-summary` /
+        //    `.summary-metrics`) — find the value paired with each label.
+        const findMetricByLabel = (labelKeywords) => {
+            const all = document.querySelectorAll(
+                'app-citation-report-summary *, .summary-metrics *, .citation-report-summary *, app-citation-report-totals *, mat-card *, .summary-section *');
+            for (const el of all) {
+                const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                if (text.length === 0 || text.length > 60) continue;
+                if (!labelKeywords.some(k => text.includes(k))) continue;
+                // Look near this element for a numeric sibling/child.
+                const container = el.closest('[class*="metric"], [class*="summary-item"], div, p, mat-card-content') || el.parentElement;
+                if (!container) continue;
+                const numberEl = container.querySelector(
+                    '.metric-value, .stat-number, .summary-count, [class*="metric-value"], [class*="summary-count"]');
+                if (numberEl) {
+                    const n = parseNumber(numberEl.textContent);
+                    if (n !== null) return n;
+                }
+                // Fallback: scan container's text for the first big integer.
+                const m = (container.textContent || '').match(/(\d[\d,]*)/);
+                if (m) {
+                    const n = parseNumber(m[1]);
+                    if (n !== null && n > 0) return n;
+                }
+            }
+            return null;
+        };
+
+        const sumCited = findMetricByLabel(['sum of times cited', 'times cited', 'total citations']);
+        if (sumCited !== null) {
+            overallTotalCitations = sumCited;
+            console.log('[WoS Citation Report] Strategy A: Sum of Times Cited =', sumCited);
+        }
+        const avgCited = findMetricByLabel(['average citations per item', 'average per item', 'average per year']);
+        if (avgCited !== null) {
+            totalAveragePerYear = avgCited;
+            console.log('[WoS Citation Report] Strategy A: Average =', avgCited);
+        }
+
+        // ── Strategy B (existing): table totals row. Used when the
+        //    page exposes a classic <tr> "Total" row alongside the
+        //    metric tiles, or when Strategy A misses one of the two
+        //    fields.
         // Find the totals row - look for "Total" text in any cell
         const allRows = document.querySelectorAll('tr, .total-row, app-citation-report-totals, .summary-metrics, .citation-report-summary');
         let totalsRow = null;
@@ -634,13 +650,35 @@ async function syncCitationReport() {
         // Extract totals (optional)
         const totals = (await extractTotals()) || {};
 
+        // Fallback: derive totals from the yearly chart when the totals
+        // row scrape failed. The bar chart's aria-labels are the most
+        // reliable signal on the page — every year is reported with both
+        // its citation and publication counts, so summing them gives the
+        // overall total. The "average per year" displayed by WoS is the
+        // simple arithmetic mean across the years shown.
+        let overallTotalCitations = totals.overallTotalCitations;
+        let totalAveragePerYear = totals.totalAveragePerYear;
+        if ((overallTotalCitations == null || totalAveragePerYear == null)
+                && yearlyStats && yearlyStats.length > 0) {
+            const sumCit = yearlyStats.reduce(
+                (s, y) => s + (typeof y.citations === 'number' ? y.citations : 0), 0);
+            if (overallTotalCitations == null) {
+                overallTotalCitations = sumCit;
+                console.log('[WoS Citation Report] overallTotalCitations derived from yearlyStats:', sumCit);
+            }
+            if (totalAveragePerYear == null && yearlyStats.length > 0) {
+                totalAveragePerYear = +(sumCit / yearlyStats.length).toFixed(2);
+                console.log('[WoS Citation Report] totalAveragePerYear derived from yearlyStats:', totalAveragePerYear);
+            }
+        }
+
         // Build the payload
         const authorWosId = urlAuthorId || getAuthorWosIdFromPage();
         const payload = {
             authorWosId: authorWosId || 'unknown',
             researcherProfileStats: {
-                totalAveragePerYear: totals.totalAveragePerYear || null,
-                overallTotalCitations: totals.overallTotalCitations || null,
+                totalAveragePerYear: totalAveragePerYear ?? null,
+                overallTotalCitations: overallTotalCitations ?? null,
                 yearlyStats: yearlyStats || []
             },
             publications

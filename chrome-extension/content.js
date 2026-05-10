@@ -353,20 +353,88 @@ async function expandAbstracts() {
 // ═══════════════════════════════════════════════
 
 function scrapeAuthorMetrics() {
-  const metrics = { hIndex: 0, publications: 0, sumOfTimesCited: 0, citingArticles: 0, subjectCategories: [] };
+  const metrics = {
+    // Core metrics that have always been here.
+    hIndex: 0,
+    publications: 0,
+    sumOfTimesCited: 0,
+    citingArticles: 0,
+    subjectCategories: [],
+    // Extended WoS Core Collection metrics — Sum without self-cites,
+    // Citing Articles without self-cites, Patents, Policy. Available
+    // on the modern <app-citation-network> sidebar; default 0 means
+    // "either not on the page or genuinely zero" — both are fine for
+    // downstream consumers.
+    sumOfTimesCitedWithoutSelf: 0,
+    citingArticlesWithoutSelf: 0,
+    timesCitedByPatents: 0,
+    citingPatents: 0,
+    timesCitedByPolicy: 0,
+    citingPolicyDocuments: 0,
+    // Profile summary block — counts that distinguish "claimed" vs
+    // "indexed" vs "Core Collection" vs preprints / dissertations etc.
+    profileSummary: {
+      totalDocuments: null,
+      publicationsIndexedInWos: null,
+      wosCoreCollectionPublications: null,
+      preprints: null,
+      dissertationsOrTheses: null,
+      nonIndexedPublications: null,
+      verifiedPeerReviews: null,
+      verifiedEditorRecords: null,
+      awardedGrants: null,
+    },
+    // Author Position percentages from the small bar chart
+    // ("First / Last / Corresponding"). Highcharts builds them as
+    // <path role="img" aria-label="First, 60.">.
+    authorPosition: {
+      firstAuthorPercent: null,
+      lastAuthorPercent: null,
+      correspondingAuthorPercent: null,
+    },
+  };
   try {
     const summaryItems = document.querySelectorAll(
       '.summary-item, .metrics-item, [class*="metric-item"], [data-ta="summary-item"], .wat-author-metric-inline-block'
     );
     summaryItems.forEach(item => {
-      const label = item.textContent.toLowerCase();
-      if (label.includes('without self')) return;
+      const labelRaw = item.textContent || '';
+      const label = labelRaw.toLowerCase();
 
       const rawCountTxt = item.querySelector(
         '.summary-count, .count, .value, .number, [data-ta*="count"], [data-ta*="value"], .wat-author-metric'
       )?.textContent || item.innerText || item.textContent;
 
       const count = parseCount(rawCountTxt);
+      // Core Collection metric block (.wat-author-metric-inline-block)
+      // — order matters: detect the more specific "without self" /
+      // "by patents" / "by policy" labels BEFORE the generic
+      // "sum of times cited" / "citing articles" branches so the
+      // basic counts don't swallow them.
+      if (count > 0 || count === 0) {
+        if (label.includes('without self')) {
+          if (label.includes('citing article')) {
+            if (metrics.citingArticlesWithoutSelf === 0) metrics.citingArticlesWithoutSelf = count;
+            return;
+          }
+          if (label.includes('sum of times cited') || label.includes('times cited')) {
+            if (metrics.sumOfTimesCitedWithoutSelf === 0) metrics.sumOfTimesCitedWithoutSelf = count;
+            return;
+          }
+        }
+        if (label.includes('cited by patents')) {
+          if (metrics.timesCitedByPatents === 0) metrics.timesCitedByPatents = count; return;
+        }
+        if (label.includes('citing patents')) {
+          if (metrics.citingPatents === 0) metrics.citingPatents = count; return;
+        }
+        if (label.includes('cited by policy')) {
+          if (metrics.timesCitedByPolicy === 0) metrics.timesCitedByPolicy = count; return;
+        }
+        if (label.includes('citing policy')) {
+          if (metrics.citingPolicyDocuments === 0) metrics.citingPolicyDocuments = count; return;
+        }
+      }
       if (count > 0) {
         if (label.includes('h-index') || label.includes('h index')) { metrics.hIndex = count; return; }
         if (label.includes('sum of times cited') || label.includes('total citations')) { if (metrics.sumOfTimesCited === 0) metrics.sumOfTimesCited = count; return; }
@@ -375,6 +443,61 @@ function scrapeAuthorMetrics() {
         if (label.includes('publication') || label.includes('document')) { if (metrics.publications === 0) metrics.publications = count; return; }
       }
     });
+
+    // ── Profile summary block ─────────────────────────────────────
+    // Sidebar's "Profile summary" lists distinct categories of records.
+    // Each <p class="summary-item"> contains a .summary-count + .summary-label.
+    // We map well-known labels into a structured object so downstream
+    // code can read them by key without re-scraping. The label text on
+    // WoS occasionally has trailing whitespace and multi-line breaks,
+    // so normalize before comparing.
+    const summaryLabelToKey = {
+      'total documents': 'totalDocuments',
+      'publications indexed in web of science': 'publicationsIndexedInWos',
+      'web of science core collection publications': 'wosCoreCollectionPublications',
+      'preprints': 'preprints',
+      'dissertations or theses': 'dissertationsOrTheses',
+      'non-indexed publications': 'nonIndexedPublications',
+      'verified peer reviews': 'verifiedPeerReviews',
+      'verified editor records': 'verifiedEditorRecords',
+      'awarded grants': 'awardedGrants',
+    };
+    const profileSection = document.querySelector('app-publication-metrics .summary-section')
+        || document.querySelector('.summary-section');
+    if (profileSection) {
+      profileSection.querySelectorAll('.summary-item').forEach(p => {
+        const label = (p.querySelector('.summary-label')?.textContent || '')
+            .replace(/\s+/g, ' ').trim().toLowerCase();
+        const countTxt = p.querySelector('.summary-count')?.textContent || '';
+        const count = parseCount(countTxt);
+        const key = summaryLabelToKey[label];
+        if (key && Number.isFinite(count)) {
+          metrics.profileSummary[key] = count;
+        }
+      });
+    }
+
+    // ── Author Position chart ─────────────────────────────────────
+    // Highcharts renders each bar as a <path role="img" aria-label="First, 60.">.
+    // The chart container is <app-author-position-length-chart> inside
+    // <app-author-position>. The aria-label form is "<Position>, <number>."
+    // — with a trailing period — so allow optional dot/space.
+    const positionChart = document.querySelector(
+        'app-author-position-length-chart, [data-ta="author-position-length-chart"]');
+    if (positionChart) {
+      positionChart.querySelectorAll('path[role="img"][aria-label]').forEach(p => {
+        const al = p.getAttribute('aria-label') || '';
+        const m = al.match(/^([A-Za-z]+)\s*,\s*(\d+)/);
+        if (!m) return;
+        const pos = m[1].toLowerCase();
+        const pct = parseInt(m[2], 10);
+        if (!Number.isFinite(pct)) return;
+        if (pos === 'first') metrics.authorPosition.firstAuthorPercent = pct;
+        else if (pos === 'last') metrics.authorPosition.lastAuthorPercent = pct;
+        else if (pos === 'corresponding') metrics.authorPosition.correspondingAuthorPercent = pct;
+      });
+    }
+
 
     const testSelectors = [
       { key: 'hIndex', tests: ['h-index', 'hindex', 'h_index'] },
@@ -670,8 +793,15 @@ async function getTaskId() {
 
 async function findAndSaveCitationReportLink(taskId, authorWosId) {
   try {
-    // "View citation report" linkini bul - çeşitli seçiciler dene
+    // "View citation report" linkini bul - çeşitli seçiciler dene.
+    // Modern WoS Angular Material layout marks the button with
+    // `cdxanalyticscategory="WOS-authorrecord-citation-report"` and
+    // `dest=citation-report` in the href; both are stable and beat
+    // text-content scraping when the i18n label changes.
     const citationReportSelectors = [
+      'a[cdxanalyticscategory="WOS-authorrecord-citation-report"]',
+      'a[cdxanalyticscategory*="citation-report" i]',
+      'a[href*="dest=citation-report"]',
       'a[href*="citation-report"]',
       'a[data-ta="view-citation-report"]',
       'a[cdxanalyticslabel*="citation-report"]',

@@ -7,6 +7,9 @@ import com.academic.broker.domain.SyncRequest;
 import com.academic.broker.domain.SyncRequestStatus;
 import com.academic.broker.domain.TargetSource;
 import com.academic.broker.domain.TaskType;
+import com.academic.broker.domain.CitationReportTask;
+import com.academic.broker.domain.TaskStatus;
+import com.academic.broker.repository.CitationReportTaskRepository;
 import com.academic.broker.service.ArticleTaskService;
 import com.academic.broker.service.BackendApplyService;
 import com.academic.broker.service.SyncRequestService;
@@ -36,6 +39,7 @@ public class SyncRequestOperatorController {
     private final SyncRequestService service;
     private final BackendApplyService applyService;
     private final ArticleTaskService articleTaskService;
+    private final CitationReportTaskRepository citationReportRepository;
 
     // ── List / detail ────────────────────────────────────────────────
 
@@ -217,6 +221,64 @@ public class SyncRequestOperatorController {
      * in this request's staged publications list. Useful after a partial
      * scrape where PlumX numbers came back missing or zero.
      */
+    /**
+     * Operator panel: read-only summary of the WoS Citation Report task
+     * tied to this sync (status, retry count, error, scraped payload).
+     * Returns 200 with {@code task: null} when no citation report has
+     * been queued for this sync — the panel renders "Atıf raporu yok"
+     * in that case.
+     */
+    @GetMapping("/{id}/citation-report")
+    public Map<String, Object> citationReportStatus(@PathVariable UUID id) {
+        service.get(id); // existence check
+        java.util.List<CitationReportTask> tasks = citationReportRepository.findBySyncRequestId(id);
+        if (tasks.isEmpty()) return Map.of("task", "");
+        CitationReportTask t = tasks.get(0);
+        java.util.Map<String, Object> dto = new java.util.HashMap<>();
+        dto.put("taskId", t.getId());
+        dto.put("status", t.getStatus().name());
+        dto.put("citationReportUrl", t.getCitationReportUrl());
+        dto.put("authorWosId", t.getAuthorWosId());
+        dto.put("retryCount", t.getRetryCount());
+        dto.put("errorMessage", t.getErrorMessage());
+        dto.put("createdAt", t.getCreatedAt() != null ? t.getCreatedAt().toString() : null);
+        dto.put("updatedAt", t.getUpdatedAt() != null ? t.getUpdatedAt().toString() : null);
+        dto.put("rawData", t.getRawData());
+        return Map.of("task", dto);
+    }
+
+    /**
+     * Operator action — re-fetch the WoS Citation Report for this sync.
+     * Flips the request's CitationReportTask back to PENDING so the
+     * worker re-scrapes when it next polls. No-op for syncs without a
+     * recorded citation-report task (returns 200 with {@code ok:false}).
+     */
+    @PostMapping("/{id}/retry/citation-report")
+    public Map<String, Object> retryCitationReport(
+            @PathVariable UUID id,
+            @RequestAttribute(OperatorAuthFilter.OPERATOR_ID_ATTR) UUID operatorId) {
+        service.get(id); // existence check
+        java.util.List<CitationReportTask> tasks = citationReportRepository.findBySyncRequestId(id);
+        if (tasks.isEmpty()) {
+            return Map.of("ok", false,
+                    "error", "Bu istek için kaydedilmiş Atıf Raporu görevi yok",
+                    "reason", "no-task");
+        }
+        CitationReportTask t = tasks.get(0);
+        TaskStatus s = t.getStatus();
+        if (s == TaskStatus.PENDING || s == TaskStatus.PROCESSING) {
+            return Map.of("ok", false, "reason", "already active", "status", s.name());
+        }
+        t.setStatus(TaskStatus.PENDING);
+        t.setErrorMessage(null);
+        t.setRetryCount(t.getRetryCount() + 1);
+        t.touch();
+        citationReportRepository.save(t);
+        service.audit(id, operatorId, "OPERATOR", "RETRY_CITATION_REPORT",
+                Map.of("taskId", t.getId(), "retryCount", t.getRetryCount()));
+        return Map.of("ok", true, "taskId", t.getId(), "retryCount", t.getRetryCount());
+    }
+
     @PostMapping("/{id}/retry/plumx")
     public Map<String, Object> retryPlumx(
             @PathVariable UUID id,
