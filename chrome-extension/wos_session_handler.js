@@ -111,6 +111,32 @@
     }
 
     /**
+     * Detects the "Welcome, <name>! As a new user, please follow the
+     * steps to build your profile." onboarding screen WoS shows for
+     * accounts that haven't created a researcher profile yet. Trying
+     * to load /wos/woscc/citation-report on such an account silently
+     * redirects to the Smart Search home with this banner — the
+     * scrape can't recover and an operator sitting there with a
+     * stuck task never finds out why.
+     *
+     * <p>Returns true if the page is showing this onboarding state.
+     * Caller should stop polling and report ONBOARDING_REQUIRED so
+     * the operator panel can surface a clear "WoS account needs
+     * profile setup" error.
+     */
+    function hasOnboardingProfileRequired() {
+        const text = (document.body && document.body.innerText) || '';
+        if (!text) return false;
+        // Match the English screen the user sees; cover Turkish wording too
+        // in case Clarivate localizes the onboarding banner.
+        const en = /create your researcher profile/i.test(text)
+            && /follow the steps to build your profile/i.test(text);
+        const tr = /araştırmacı profilinizi oluşturun/i.test(text)
+            && /profilinizi oluşturmak için adımları takip edin/i.test(text);
+        return en || tr;
+    }
+
+    /**
      * Saves the current page URL as the post-login return target — but
      * only if the URL is a data page worth coming back to. Saving an
      * already-on-login-page URL would create a redirect loop after
@@ -612,6 +638,29 @@
                     } catch (e) {
                         // Swallow — background will time the probe out.
                     }
+                }
+                return false;
+            }
+
+            // ★ WoS onboarding screen — account lacks a researcher
+            //   profile and WoS is forcing /create-profile flow,
+            //   silently redirecting away from /citation-report
+            //   and /full-record pages. The scrape can never
+            //   succeed in this state; loop forever doesn't help.
+            //   Stop polling and report so the operator panel can
+            //   surface a clear "account needs profile setup" error.
+            if (hasOnboardingProfileRequired()) {
+                clearInterval(intervalId);
+                console.warn('[WoS Session] Onboarding required — WoS is blocking access until a researcher profile is created. Standing down.');
+                try {
+                    chrome.runtime.sendMessage({
+                        type: 'SESSION_EVENT',
+                        source: 'WOS',
+                        event: 'ONBOARDING_REQUIRED',
+                        detail: 'WoS account has no researcher profile; citation report is redirected to onboarding screen',
+                    });
+                } catch (e) {
+                    // Ignore — extension context may be closed
                 }
                 return false;
             }

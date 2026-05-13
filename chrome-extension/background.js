@@ -2621,6 +2621,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // ── Citation Report URL stale → WoS redirected us to Smart Search ──
+  // Content-script noticed the tab is NOT on /citation-report and
+  // bailed out early. Close the tab, report failure to the broker so
+  // operator panel surfaces a real error, and free the slot for the
+  // next task. (See wos_citation_report_content.js
+  // `isStaleCitationReportRedirect`.)
+  if (msg.type === 'CITATION_REPORT_STALE_REDIRECT') {
+    const tabId = sender.tab?.id;
+    const entry = tabId != null ? pendingCitationReportTabs.get(tabId) : null;
+    const taskId = msg.taskId || (entry ? entry.taskId : null);
+    const citationReportTaskId = entry?.citationReportTaskId || null;
+    console.warn(`[WoS Worker] Citation Report tab landed on ${msg.redirectedTo} — qid likely expired (task ${taskId})`);
+    addLog('Citation Report URL stale (qid expired) — closing tab and failing task', 'warning');
+    (async () => {
+      try {
+        if (citationReportTaskId) {
+          await reportCitationReportFailure(citationReportTaskId,
+              'WoS redirected the citation-report URL to Smart Search (qid expired). '
+              + 'Re-run the worker sync — a fresh URL will be captured.');
+        }
+      } catch (e) {
+        console.warn('[WoS Worker] Failed to report stale-redirect failure:', e);
+      }
+      try { if (tabId != null) await chrome.tabs.remove(tabId); } catch (_) { }
+      if (tabId != null) {
+        pendingCitationReportTabs.delete(tabId);
+        if (activeWosJobs.citationReportTab === tabId) {
+          activeWosJobs.citationReportTab = null;
+        }
+      }
+    })();
+    sendResponse({ ok: true });
+    return true;
+  }
+
   // ── Citation Report Link Found (doğrudan açılacak - backward compatibility) ──
   if (msg.type === 'CITATION_REPORT_LINK_FOUND') {
     const { taskId, citationReportUrl, authorWosId } = msg;

@@ -762,15 +762,77 @@ function showNotification(message, type = 'info') {
 
 console.log('[WoS Citation Report] Setting up initialization...');
 
-// Run after page stabilizes
-const startDelay = CONFIG.TIMEOUTS.INITIAL_DELAY + Math.random() * 1000;
+/**
+ * Detect WoS's "stale qid → Smart Search redirect" failure mode.
+ * The Citation-Report URL we saved on the author page embeds a query
+ * id (`qid`) that's session-bound; by the time the worker re-opens
+ * the URL after detail-scraping (which can take many minutes) the qid
+ * has expired and WoS silently sends the tab to the Smart Search
+ * home (or /search/eo/) instead of rendering the report. Our scraper
+ * then sits there waiting for selectors that never appear, eats the
+ * 90 s timeout, and the task fails with an unhelpful "no chart bars
+ * found".
+ *
+ * <p>This helper runs early and reports the redirect to background.js
+ * so it can recover (re-open the author profile, fetch a fresh
+ * Citation-Report URL with a live qid, retry) instead of letting the
+ * scraper churn against the wrong page.
+ */
+function isStaleCitationReportRedirect() {
+    const path = window.location.pathname || '';
+    // Anything outside /citation-report/* is the wrong page. WoS
+    // redirects most commonly to /wos/woscc/basic-search,
+    // /wos/woscc/search, /wos/alldb/basic-search, or the bare
+    // /wos/woscc/ home.
+    if (path.includes('/citation-report')) return false;
+    return path.includes('/basic-search')
+        || path.includes('/search')
+        || path === '/wos/woscc/'
+        || path === '/wos/alldb/'
+        || path === '/wos/';
+}
 
-setTimeout(() => {
-    console.log('[WoS Citation Report] Starting after initial delay...');
-    syncCitationReport().catch(err => {
-        console.error('[WoS Citation Report] Unhandled error:', err);
-    });
-}, startDelay);
+function reportStaleRedirect() {
+    try {
+        const taskId = (window.location.hash || '').match(/citation-report-task-id=([^&]+)/);
+        const wosId = (window.location.hash || '').match(/author-wos-id=([^&]+)/);
+        chrome.runtime.sendMessage({
+            type: 'CITATION_REPORT_STALE_REDIRECT',
+            redirectedTo: window.location.href,
+            taskId: taskId ? decodeURIComponent(taskId[1]) : null,
+            authorWosId: wosId ? decodeURIComponent(wosId[1]) : null,
+        });
+    } catch (e) {
+        console.warn('[WoS Citation Report] Could not notify background of stale redirect:', e);
+    }
+}
+
+// Early redirect check — runs immediately, no startDelay. The user
+// sees this as Smart Search "Welcome, ..." with no citation report
+// content; trying to scrape that wastes 90 s waiting for selectors
+// that will never match.
+if (isStaleCitationReportRedirect()) {
+    console.warn('[WoS Citation Report] Redirected away from /citation-report; URL is stale:',
+            window.location.href);
+    reportStaleRedirect();
+} else {
+    // Run after page stabilizes
+    const startDelay = CONFIG.TIMEOUTS.INITIAL_DELAY + Math.random() * 1000;
+
+    setTimeout(() => {
+        // Recheck — Angular sometimes navigates client-side between
+        // load and our timer firing.
+        if (isStaleCitationReportRedirect()) {
+            console.warn('[WoS Citation Report] Stale redirect detected after delay');
+            reportStaleRedirect();
+            return;
+        }
+        console.log('[WoS Citation Report] Starting after initial delay...');
+        syncCitationReport().catch(err => {
+            console.error('[WoS Citation Report] Unhandled error:', err);
+        });
+    }, startDelay);
+}
 
 // Listen for messages from popup/background
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {

@@ -60,8 +60,13 @@ public class BackendApplyService {
         }
     }
 
-    /** Background retry — every 30 seconds, retry any unapplied approvals. */
-    @Scheduled(fixedDelay = 30_000L, initialDelay = 30_000L)
+    /**
+     * Background retry — every 5 seconds, retry any unapplied approvals.
+     * Previously 30s, which meant the dashboard sat on stale metric cards
+     * for a full half-minute on every transient backend hiccup. 5s is short
+     * enough to feel instant to the operator without overloading the backend.
+     */
+    @Scheduled(fixedDelay = 5_000L, initialDelay = 5_000L)
     public void retryLoop() {
         List<SyncRequest> pending = service.findUnappliedApprovals();
         if (pending.isEmpty()) return;
