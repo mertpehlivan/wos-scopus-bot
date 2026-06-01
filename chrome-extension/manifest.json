@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "WoS Task Worker",
   "description": "Task Queue worker: polls broker API, scrapes WoS author profiles, and enriches publications via DOI-based WoS Smart-Search and Google Scholar lookup.",
-  "version": "1.6.6",
+  "version": "1.6.8",
   "permissions": [
     "tabs",
     "alarms",
@@ -13,6 +13,7 @@
   ],
   "host_permissions": [
     "*://*.webofscience.com/*",
+    "*://*.webofknowledge.com/*",
     "*://*.scopus.com/*",
     "*://*.elsevier.com/*",
     "*://*.plu.mx/*",
@@ -149,8 +150,8 @@
     {
       "matches": [
         "*://*.webofscience.com/wos/*",
-        "*://*.clarivate.com/login*",
-        "*://*.clarivate.com/auth/login*"
+        "*://*.webofknowledge.com/*",
+        "*://*.clarivate.com/*"
       ],
       "js": [
         "wos_session_handler.js"

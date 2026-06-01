@@ -137,6 +137,103 @@
     }
 
     /**
+     * Detects the access.clarivate.com "Currently Signed In" interstitial:
+     *
+     *   Currently Signed In
+     *   You are currently signed in as [name]. You can stay signed in
+     *   to access Web of Science or sign out.
+     *   [ Stay Signed In ]  [ Sign Out ]
+     *
+     * Clarivate shows this page periodically when the SSO session is
+     * still valid but the user has been idle for a while. The worker
+     * navigates to WoS, gets redirected here, and sits forever because
+     * neither "free view banner" nor "Sign In control" appears — the
+     * loop just expires after 90s without recovering.
+     *
+     * <p>Returns the "Stay Signed In" button element when this page is
+     * shown, or null otherwise. Caller clicks the button to continue.
+     */
+    function findStaySignedInButton() {
+        // Only run the DOM scan when we're actually on the consent host —
+        // this is a tiny page, no need to check on every WoS poll.
+        if (!window.location.host.includes('access.clarivate.com')) return null;
+        const text = (document.body && document.body.innerText) || '';
+        // Both English and Turkish forms — Clarivate localizes by Accept-Language.
+        const looksLikePrompt = /currently signed in/i.test(text)
+            || /halen oturum açık/i.test(text)
+            || /oturumda kal/i.test(text);
+        if (!looksLikePrompt) return null;
+        // The button is a plain <button> with the label text inside.
+        // We don't have a stable id/class so match by visible text.
+        const candidates = Array.from(document.querySelectorAll('button, a[role="button"], input[type="button"], input[type="submit"]'));
+        for (const el of candidates) {
+            const label = (el.textContent || el.value || '').trim().toLowerCase();
+            if (label === 'stay signed in'
+                || label === 'oturumda kal'
+                || label === 'oturumu sürdür'
+                || /^stay\s+signed\s+in$/i.test(label)) {
+                if (isVisible(el)) return el;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Detects the legacy webofknowledge.com "A session already exists"
+     * interstitial:
+     *
+     *   Thank you for using Web of Science
+     *   A SESSION ALREADY EXISTS WITH THESE LOGIN CREDENTIALS.
+     *   You can [continue and establish a new session] (closes the
+     *   other session), or [return to the Sign In page] (keeps the
+     *   existing session open).
+     *
+     * Clarivate shows this when a second device / tab tries to sign
+     * in while another session is alive on the same account. For an
+     * automated scraper that's the expected case — we always want to
+     * take over and continue. Without a handler the worker sits
+     * forever because there's no Sign In control, no login form,
+     * and no free-view banner.
+     *
+     * <p>Returns the "continue and establish a new session" anchor
+     * when present; caller clicks it.
+     */
+    function findContinueNewSessionLink() {
+        const host = window.location.host;
+        // The page lives on webofknowledge.com (legacy domain) but
+        // future variants might surface on webofscience.com too.
+        if (!host.includes('webofknowledge.com') && !host.includes('webofscience.com')) return null;
+        const text = (document.body && document.body.innerText) || '';
+        const looksLikePrompt = /session already exists with these login credentials/i.test(text)
+            || /bu giriş bilgileriyle.{0,20}oturum.{0,20}zaten var/i.test(text);
+        if (!looksLikePrompt) return null;
+        // Match by visible link text. Prefer "continue and establish a
+        // new session"; fall back to any link starting with "continue".
+        const anchors = Array.from(document.querySelectorAll('a, button'));
+        for (const el of anchors) {
+            const label = (el.textContent || '').trim().toLowerCase();
+            if (label.startsWith('continue and establish')
+                || label === 'continue and establish a new session'
+                || label.startsWith('devam et ve yeni')
+                || /yeni\s+oturum.{0,15}aç/i.test(label)) {
+                if (isVisible(el)) return el;
+            }
+        }
+        // Fall back: any visible "continue …" anchor that ISN'T the
+        // "return to Sign In page" alternative.
+        for (const el of anchors) {
+            const label = (el.textContent || '').trim().toLowerCase();
+            if (label.startsWith('continue')
+                && !label.includes('return')
+                && !label.includes('sign in')
+                && isVisible(el)) {
+                return el;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Saves the current page URL as the post-login return target — but
      * only if the URL is a data page worth coming back to. Saving an
      * already-on-login-page URL would create a redirect loop after
@@ -640,6 +737,34 @@
                     }
                 }
                 return false;
+            }
+
+            // ★ Clarivate "Currently Signed In" consent interstitial —
+            //   shown after idle SSO sessions. The user (or in our case
+            //   the worker) must click "Stay Signed In" to continue.
+            //   Without this branch the handler hung here for the full
+            //   90s timeout because neither the free-view banner nor a
+            //   Sign In control appears on this page.
+            const staySignedIn = findStaySignedInButton();
+            if (staySignedIn) {
+                console.log('[WoS Session] "Currently Signed In" prompt detected — auto-clicking Stay Signed In');
+                reportSession('STAY_SIGNED_IN_CLICKED', 'access.clarivate.com idle-session interstitial');
+                try { staySignedIn.click(); } catch (e) { /* ignore */ }
+                // Don't return — let the next poll observe the redirect
+                // that follows the click, which lands us on WoS proper.
+                return true;
+            }
+
+            // ★ Legacy webofknowledge.com "A session already exists with
+            //   these login credentials" interstitial. We always want to
+            //   reclaim the session (the worker is the legitimate owner),
+            //   so auto-click "continue and establish a new session".
+            const continueNewSession = findContinueNewSessionLink();
+            if (continueNewSession) {
+                console.log('[WoS Session] "Session already exists" prompt detected — auto-clicking continue+establish');
+                reportSession('CONTINUE_NEW_SESSION_CLICKED', 'webofknowledge.com session-conflict interstitial');
+                try { continueNewSession.click(); } catch (e) { /* ignore */ }
+                return true;
             }
 
             // ★ WoS onboarding screen — account lacks a researcher
