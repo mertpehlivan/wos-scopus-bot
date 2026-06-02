@@ -23,9 +23,11 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
     private static final String DEFAULT_INSECURE_KEY = "change-me-in-production";
 
     private final String expectedApiKey;
+    private final TenantRegistry tenantRegistry;
 
-    public ApiKeyAuthFilter(String expectedApiKey) {
+    public ApiKeyAuthFilter(String expectedApiKey, TenantRegistry tenantRegistry) {
         this.expectedApiKey = expectedApiKey;
+        this.tenantRegistry = tenantRegistry;
         if (DEFAULT_INSECURE_KEY.equals(expectedApiKey)) {
             log.warn("[SECURITY] Broker is running with the default insecure API key! "
                     + "Set BROKER_API_KEY environment variable before deploying to production.");
@@ -49,7 +51,12 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
 
         String providedKey = request.getHeader(HEADER);
-        if (expectedApiKey == null || !expectedApiKey.equals(providedKey)) {
+        // Accept the shared broker key OR any registered tenant's inbound key
+        // (multi-tenant). The shared key keeps working → backward compatible.
+        boolean authorized = providedKey != null
+                && ((expectedApiKey != null && expectedApiKey.equals(providedKey))
+                    || (tenantRegistry != null && tenantRegistry.isValidInboundKey(providedKey)));
+        if (!authorized) {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
             response.setContentType("application/json");
             response.getWriter().write("{\"error\":\"Unauthorized: missing or invalid X-Api-Key header\"}");

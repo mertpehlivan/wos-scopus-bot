@@ -26,7 +26,8 @@ public class OperatorResearcherController {
     @GetMapping("/search")
     public ResponseEntity<Map<String, Object>> search(
             @RequestParam(name = "q", required = false, defaultValue = "") String q,
-            @RequestParam(name = "limit", required = false, defaultValue = "10") int limit) {
-        return ResponseEntity.ok(backendProxy.searchResearchers(q, limit));
+            @RequestParam(name = "limit", required = false, defaultValue = "10") int limit,
+            @RequestParam(name = "backend", required = false) String backend) {
+        return ResponseEntity.ok(backendProxy.searchResearchers(q, limit, backend));
     }
 }

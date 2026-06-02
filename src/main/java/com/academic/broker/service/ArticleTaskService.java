@@ -275,7 +275,24 @@ public class ArticleTaskService {
      */
     @Transactional
     public ConsumeTasksResponse consumeCompletedTasks() {
+        return consumeCompletedTasks(null);
+    }
+
+    /**
+     * Multi-tenant defensive variant: when {@code syncRequestId} is non-null,
+     * only tasks belonging to that sync request are consumed (in-memory filter,
+     * no new query). {@code null} = legacy behaviour (all completed tasks). Lets
+     * a tenant-scoped caller avoid pulling another tenant's completed tasks if
+     * the (currently disabled) consume path is ever re-enabled.
+     */
+    @Transactional
+    public ConsumeTasksResponse consumeCompletedTasks(java.util.UUID syncRequestId) {
         List<ArticleTask> completed = repository.findCompletedForConsume();
+        if (syncRequestId != null) {
+            completed = completed.stream()
+                    .filter(t -> syncRequestId.equals(t.getSyncRequestId()))
+                    .collect(Collectors.toList());
+        }
         List<ConsumedTaskDto> dtos = completed.stream()
                 .map(this::toConsumedDto)
                 .collect(Collectors.toList());

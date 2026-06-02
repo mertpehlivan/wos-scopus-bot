@@ -6,7 +6,7 @@
  * v1.1 — Anti-bot detection + Source-based parallel scraping + Adaptive pooling
  */
 
-const API_BASE = 'http://localhost:8081';
+const API_BASE = 'https://operator.rawdatalibrary.net';
 
 // ═══════════════════════════════════════════════
 //  STEALTH UTILITIES (inline for service worker context)

@@ -33,20 +33,41 @@ public class BackendProxyService {
     private String backendApiKey;
 
     private final ObjectMapper objectMapper;
+    private final com.academic.broker.config.TenantRegistry tenantRegistry;
 
-    public BackendProxyService(ObjectMapper objectMapper) {
+    public BackendProxyService(ObjectMapper objectMapper,
+                               com.academic.broker.config.TenantRegistry tenantRegistry) {
         this.objectMapper = objectMapper;
+        this.tenantRegistry = tenantRegistry;
     }
 
-    /** Typeahead search used by the manual-entry wizard. */
+    /** Typeahead search used by the manual-entry wizard (global backend). */
     public Map<String, Object> searchResearchers(String q, int limit) {
+        return searchResearchers(q, limit, null);
+    }
+
+    /**
+     * Multi-tenant variant: search a specific backend by base URL. When the URL
+     * matches a registered tenant, that tenant's URL + callback token are used;
+     * otherwise falls back to the global backend (single-tenant / unknown URL).
+     */
+    public Map<String, Object> searchResearchers(String q, int limit, String backendBaseUrlOverride) {
         try {
-            String url = trim(backendUrl) + "/api/v1/internal/researchers/search?q="
+            String base = backendUrl;
+            String token = backendApiKey;
+            if (backendBaseUrlOverride != null && !backendBaseUrlOverride.isBlank()) {
+                var tenant = tenantRegistry.byUrl(backendBaseUrlOverride);
+                if (tenant.isPresent()) {
+                    base = tenant.get().url;
+                    token = tenant.get().callbackToken;
+                }
+            }
+            String url = trim(base) + "/api/v1/internal/researchers/search?q="
                     + java.net.URLEncoder.encode(q == null ? "" : q, java.nio.charset.StandardCharsets.UTF_8)
                     + "&limit=" + Math.max(1, Math.min(limit, 25));
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
-                    .header("X-Internal-Key", backendApiKey)
+                    .header("X-Internal-Key", token)
                     .GET()
                     .timeout(Duration.ofSeconds(10))
                     .build();

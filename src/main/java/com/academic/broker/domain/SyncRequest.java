@@ -56,6 +56,26 @@ public class SyncRequest {
     @Column(name = "requester_profile_snapshot", columnDefinition = "jsonb")
     private Map<String, Object> requesterProfileSnapshot;
 
+    /**
+     * Multi-tenant routing: base URL of the main backend that opened this
+     * request (e.g. {@code https://rdlsis.sisli.edu.tr}). The broker posts the
+     * approved sync back to THIS backend's {@code /api/v1/internal/apply-sync}
+     * — not a single global one. Null for legacy requests / backends that
+     * haven't adopted the field, in which case {@code BackendApplyService}
+     * falls back to the global {@code broker.backend-url}.
+     */
+    @Column(name = "backend_base_url", length = 512)
+    private String backendBaseUrl;
+
+    /**
+     * The {@code X-Internal-Key} the broker must present when calling THIS
+     * backend back. Supplied by the backend at request time (its own
+     * {@code rdlsis.internal.api-key}). Stored per-request so the apply-sync
+     * callback authenticates against the correct tenant.
+     */
+    @Column(name = "backend_callback_token", length = 512)
+    private String backendCallbackToken;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 16)
     private SyncRequestOrigin origin;

@@ -109,8 +109,11 @@ public class ArticleTaskController {
      * silinir (ephemeral).
      */
     @GetMapping(value = "/consume", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<ConsumeTasksResponse> consumeCompletedTasks() {
-        ConsumeTasksResponse response = taskService.consumeCompletedTasks();
+    public ResponseEntity<ConsumeTasksResponse> consumeCompletedTasks(
+            @RequestParam(name = "syncRequestId", required = false) java.util.UUID syncRequestId) {
+        // Multi-tenant defensive scoping: when a syncRequestId is supplied, only
+        // that request's completed tasks are returned. Omitted = legacy behaviour.
+        ConsumeTasksResponse response = taskService.consumeCompletedTasks(syncRequestId);
         return ResponseEntity.ok(response);
     }
 

@@ -42,7 +42,8 @@ public class SecurityConfig {
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http,
-                                           OperatorAuthService operatorAuthService) throws Exception {
+                                           OperatorAuthService operatorAuthService,
+                                           TenantRegistry tenantRegistry) throws Exception {
         http
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .csrf(csrf -> csrf.disable())
@@ -51,7 +52,7 @@ public class SecurityConfig {
                 // Order matters: ApiKey first (for backend/extension calls),
                 // then operator-token filter for /api/operator/sync-requests/**.
                 // Each filter's shouldNotFilter() bows out for the other's path.
-                .addFilterBefore(new ApiKeyAuthFilter(brokerApiKey),
+                .addFilterBefore(new ApiKeyAuthFilter(brokerApiKey, tenantRegistry),
                         UsernamePasswordAuthenticationFilter.class)
                 .addFilterAfter(new OperatorAuthFilter(operatorAuthService),
                         ApiKeyAuthFilter.class);

@@ -19,7 +19,7 @@
     "*://*.plu.mx/*",
     "*://scholar.google.com/*",
     "*://*.clarivate.com/*",
-    "http://localhost:8081/*"
+    "https://operator.rawdatalibrary.net/*"
   ],
   "background": {
     "service_worker": "background.js"

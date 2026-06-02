@@ -153,7 +153,7 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const stored = await chrome.storage.local.get(['brokerApiKey']);
       const apiKey = stored.brokerApiKey || 'change-me-in-production';
-      const apiBase = 'http://localhost:8081'; // Same as background.js
+      const apiBase = 'https://operator.rawdatalibrary.net'; // Same as background.js
 
       // 1. Reset backend
       const resp = await fetch(`${apiBase}/api/tasks/reset-all?confirm=RESET_EVERYTHING`, {

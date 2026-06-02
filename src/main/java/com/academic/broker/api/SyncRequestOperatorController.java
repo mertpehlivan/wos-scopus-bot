@@ -106,9 +106,13 @@ public class SyncRequestOperatorController {
         try {
             SyncRequest created = service.createManual(
                     req.getRequesterUserId(), operatorId,
-                    req.getProfileSnapshot(), req.getStagedData(), req.getOperatorNote());
+                    req.getProfileSnapshot(), req.getStagedData(), req.getOperatorNote(),
+                    req.getBackendBaseUrl());
             return ResponseEntity.status(HttpStatus.CREATED)
                     .body(SyncRequestDtos.OperatorView.from(created));
+        } catch (IllegalArgumentException e) {
+            // Unknown/disallowed tenant URL.
+            return ResponseEntity.badRequest().build();
         } catch (IllegalStateException e) {
             return ResponseEntity.status(HttpStatus.CONFLICT).build();
         }

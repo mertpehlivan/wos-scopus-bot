@@ -101,11 +101,19 @@ public class BackendApplyService {
             throw new RuntimeException("Apply payload serialization failed", e);
         }
 
-        String url = trimTrailingSlash(backendUrl) + "/api/v1/internal/apply-sync";
+        // Multi-tenant: route the callback to the backend that opened THIS
+        // request, with the token it supplied. Falls back to the global
+        // broker.backend-url / backend-api-key for legacy requests that carry
+        // no per-tenant routing info (single-tenant / not-yet-migrated).
+        String targetBase = (req.getBackendBaseUrl() != null && !req.getBackendBaseUrl().isBlank())
+                ? req.getBackendBaseUrl() : backendUrl;
+        String targetToken = (req.getBackendCallbackToken() != null && !req.getBackendCallbackToken().isBlank())
+                ? req.getBackendCallbackToken() : backendApiKey;
+        String url = trimTrailingSlash(targetBase) + "/api/v1/internal/apply-sync";
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("Content-Type", "application/json")
-                .header("X-Internal-Key", backendApiKey)
+                .header("X-Internal-Key", targetToken)
                 .timeout(Duration.ofSeconds(30))
                 .POST(HttpRequest.BodyPublishers.ofString(json))
                 .build();

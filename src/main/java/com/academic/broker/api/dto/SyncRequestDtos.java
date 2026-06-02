@@ -59,6 +59,8 @@ public final class SyncRequestDtos {
         UUID requesterUserId;
         Map<String, Object> requesterProfileSnapshot;
         SyncRequestOrigin origin;
+        /** Multi-tenant: which backend (institution) opened this request. The callback token is NEVER exposed. */
+        String backendBaseUrl;
         SyncRequestStatus status;
         Instant requestedAt;
         Instant expiresAt;
@@ -89,6 +91,7 @@ public final class SyncRequestDtos {
                     .requesterUserId(r.getRequesterUserId())
                     .requesterProfileSnapshot(r.getRequesterProfileSnapshot())
                     .origin(r.getOrigin())
+                    .backendBaseUrl(r.getBackendBaseUrl())
                     .status(r.getStatus())
                     .requestedAt(r.getRequestedAt())
                     .expiresAt(r.getExpiresAt())
@@ -121,6 +124,10 @@ public final class SyncRequestDtos {
     public static class CreateFromBackendReq {
         UUID requesterUserId;
         Map<String, Object> profileSnapshot;
+        /** Multi-tenant: base URL of the calling backend (where to apply the approved sync back). */
+        String backendBaseUrl;
+        /** Multi-tenant: the X-Internal-Key the broker should present on the apply-sync callback. */
+        String callbackToken;
     }
 
     @Value @Builder @Jacksonized
@@ -129,6 +136,8 @@ public final class SyncRequestDtos {
         Map<String, Object> profileSnapshot;
         Map<String, Object> stagedData;
         String operatorNote;
+        /** Multi-tenant: which registered backend this manual sync targets (its base URL). */
+        String backendBaseUrl;
     }
 
     @Value @Builder @Jacksonized

@@ -36,9 +36,13 @@ public class SyncRequestBackendController {
         }
         try {
             SyncRequest created = service.createFromBackend(
-                    req.getRequesterUserId(), req.getProfileSnapshot());
+                    req.getRequesterUserId(), req.getProfileSnapshot(),
+                    req.getBackendBaseUrl(), req.getCallbackToken());
             return ResponseEntity.status(HttpStatus.CREATED)
                     .body(SyncRequestDtos.CallerView.from(created));
+        } catch (IllegalArgumentException e) {
+            // Backend callback URL not in the configured allowlist — reject.
+            return ResponseEntity.badRequest().build();
         } catch (IllegalStateException e) {
             // Already an active request — return 409 with the existing one
             SyncRequest existing = service.findActive(req.getRequesterUserId()).orElseThrow();

@@ -1,5 +1,6 @@
 package com.academic.broker.service;
 
+import com.academic.broker.config.TenantRegistry;
 import com.academic.broker.domain.SyncAuditLog;
 import com.academic.broker.domain.SyncRequest;
 import com.academic.broker.domain.SyncRequestOrigin;
@@ -57,12 +58,49 @@ public class SyncRequestService {
     private final SyncAuditLogRepository auditRepository;
     private final ArticleTaskRepository articleTaskRepository;
     private final PlumxTaskRepository plumxTaskRepository;
+    private final TenantRegistry tenantRegistry;
 
     @Value("${broker.sla-review-hours:24}")
     private int slaReviewHours;
 
+    /**
+     * Multi-tenant allowlist: comma-separated base URLs of the main backends
+     * permitted to open sync requests (e.g. {@code https://rdlsis.sisli.edu.tr,
+     * https://rawdatalibrary.net}). Empty = no restriction (single-tenant /
+     * back-compat). Guards against the broker being coerced into POSTing
+     * approved data + a token to an arbitrary attacker URL (SSRF).
+     */
+    @Value("${broker.allowed-backend-urls:}")
+    private String allowedBackendUrls;
+
     private Duration reviewWindow() {
         return Duration.ofHours(slaReviewHours);
+    }
+
+    /**
+     * Validates a backend callback URL against {@link #allowedBackendUrls} and
+     * returns it trailing-slash-normalised, or {@code null} if none supplied
+     * (→ apply falls back to the global target). Throws
+     * {@link IllegalArgumentException} when an allowlist is configured and the
+     * URL is not on it.
+     */
+    private String validateBackendUrl(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        String url = trimSlash(raw.trim());
+        // Registered tenants are implicitly allowed (registry is the source of truth).
+        if (tenantRegistry.byUrl(url).isPresent()) return url;
+        if (allowedBackendUrls == null || allowedBackendUrls.isBlank()) {
+            return url; // no allowlist configured → accept (back-compat)
+        }
+        for (String allowed : allowedBackendUrls.split(",")) {
+            String a = trimSlash(allowed.trim());
+            if (!a.isEmpty() && a.equalsIgnoreCase(url)) return url;
+        }
+        throw new IllegalArgumentException("Backend URL not in broker allowlist: " + url);
+    }
+
+    private static String trimSlash(String s) {
+        return s.endsWith("/") ? s.substring(0, s.length() - 1) : s;
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -76,7 +114,12 @@ public class SyncRequestService {
      */
     @Transactional
     public SyncRequest createFromBackend(UUID requesterUserId,
-                                         Map<String, Object> profileSnapshot) {
+                                         Map<String, Object> profileSnapshot,
+                                         String backendBaseUrl,
+                                         String callbackToken) {
+        // Validate (and normalise) the per-tenant callback URL up front so a
+        // disallowed backend fails fast with 400 before any state changes.
+        String validatedBackendUrl = validateBackendUrl(backendBaseUrl);
         ensureNoActive(requesterUserId);
         // Critical pre-flight: clear out any worker tasks tied to closed
         // sync requests (or to nothing). Without this, a leftover Scholar
@@ -98,6 +141,8 @@ public class SyncRequestService {
         SyncRequest req = SyncRequest.builder()
                 .requesterUserId(requesterUserId)
                 .requesterProfileSnapshot(profileSnapshot)
+                .backendBaseUrl(validatedBackendUrl)
+                .backendCallbackToken(validatedBackendUrl == null ? null : callbackToken)
                 .origin(SyncRequestOrigin.WORKER)
                 .status(SyncRequestStatus.PENDING_SCRAPE)
                 .expiresAt(now.plus(reviewWindow()))
@@ -118,12 +163,27 @@ public class SyncRequestService {
                                     UUID operatorUserId,
                                     Map<String, Object> profileSnapshot,
                                     Map<String, Object> stagedData,
-                                    String operatorNote) {
+                                    String operatorNote,
+                                    String backendBaseUrl) {
+        // Multi-tenant: if the operator chose a target backend, resolve its
+        // callback token from the registry so the approved sync routes there.
+        // Unknown URL → IllegalArgumentException (caller maps to 400). Blank →
+        // null → apply falls back to the global broker.backend-url (single-tenant).
+        String tenantUrl = null;
+        String tenantToken = null;
+        if (backendBaseUrl != null && !backendBaseUrl.isBlank()) {
+            TenantRegistry.Tenant t = tenantRegistry.byUrl(backendBaseUrl)
+                    .orElseThrow(() -> new IllegalArgumentException("Unknown tenant URL: " + backendBaseUrl));
+            tenantUrl = t.url;
+            tenantToken = t.callbackToken;
+        }
         ensureNoActive(requesterUserId);
         Instant now = Instant.now();
         SyncRequest req = SyncRequest.builder()
                 .requesterUserId(requesterUserId)
                 .requesterProfileSnapshot(profileSnapshot)
+                .backendBaseUrl(tenantUrl)
+                .backendCallbackToken(tenantToken)
                 .origin(SyncRequestOrigin.MANUAL)
                 .status(SyncRequestStatus.READY_FOR_REVIEW)
                 .expiresAt(now.plus(reviewWindow()))

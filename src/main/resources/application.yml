@@ -34,6 +34,20 @@ broker:
   # Shared secret used by the broker when calling the main backend's
   # /api/v1/internal/apply-sync endpoint. Defaults to broker.api-key.
   backend-api-key: ${BACKEND_API_KEY:${BROKER_API_KEY:change-me-in-production}}
+  # Multi-tenant allowlist: comma-separated base URLs of the main backends
+  # permitted to open sync requests (e.g.
+  # https://rdlsis.sisli.edu.tr,https://rawdatalibrary.net). Each request
+  # carries its own callback URL + token; the broker validates the URL against
+  # this list before storing it and posting approved data back. Empty = no
+  # restriction (single-tenant / back-compat).
+  allowed-backend-urls: ${BROKER_ALLOWED_BACKEND_URLS:}
+  # Multi-tenant registry (JSON array). Each entry:
+  #   {"id":"sisli","name":"Şişli Üniv.","url":"https://rdlsis.sisli.edu.tr",
+  #    "inboundKey":"<that backend's X-Api-Key>","callbackToken":"<its X-Internal-Key>"}
+  # Empty = single-tenant mode (no behaviour change). Enables per-tenant inbound
+  # keys + operator manual-create routing + researcher-search routing. Registry
+  # URLs are implicitly allowed as callback targets (see allowed-backend-urls).
+  tenants-json: ${BROKER_TENANTS_JSON:[]}
   # Chrome extension origin for CORS (set to exact extension ID in production)
   # Example: BROKER_EXTENSION_ORIGIN=chrome-extension://abcdefghijklmnopabcdefghijklmnop
   extension-origin: ${BROKER_EXTENSION_ORIGIN:chrome-extension://*}
