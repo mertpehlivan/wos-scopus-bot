@@ -41,11 +41,31 @@ public interface SyncRequestRepository extends JpaRepository<SyncRequest, UUID> 
     List<SyncRequest> findOverdue(@Param("statuses") List<SyncRequestStatus> statuses,
                                   @Param("cutoff") Instant cutoff);
 
+    /**
+     * Still scraping but created before {@code cutoff} — candidates for the
+     * scrape-start watchdog. A request whose worker never engaged within the
+     * watchdog window would otherwise hang in PENDING_SCRAPE for the full 24h.
+     */
+    @Query("SELECT r FROM SyncRequest r WHERE r.status = com.academic.broker.domain.SyncRequestStatus.PENDING_SCRAPE "
+            + "AND r.requestedAt < :cutoff")
+    List<SyncRequest> findStalledScrapes(@Param("cutoff") Instant cutoff);
+
     /** Approved-but-not-yet-applied — used by the apply-to-backend retry loop. */
     @Query("SELECT r FROM SyncRequest r WHERE r.status = com.academic.broker.domain.SyncRequestStatus.APPROVED "
             + "AND r.appliedToBackend = false AND r.applyAttempts < :maxAttempts "
             + "ORDER BY r.reviewedAt ASC")
     List<SyncRequest> findUnappliedApprovals(@Param("maxAttempts") int maxAttempts);
+
+    /**
+     * Approved-but-exhausted: apply to backend failed {@code maxAttempts}
+     * times so the request dropped out of {@link #findUnappliedApprovals}.
+     * Without surfacing these they are silently lost (stuck APPROVED +
+     * appliedToBackend=false) — used by the parked-approvals warner/alert.
+     */
+    @Query("SELECT r FROM SyncRequest r WHERE r.status = com.academic.broker.domain.SyncRequestStatus.APPROVED "
+            + "AND r.appliedToBackend = false AND r.applyAttempts >= :maxAttempts "
+            + "ORDER BY r.reviewedAt ASC")
+    List<SyncRequest> findParkedApprovals(@Param("maxAttempts") int maxAttempts);
 
     long countByStatus(SyncRequestStatus status);
 

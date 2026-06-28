@@ -19,7 +19,8 @@
     "*://*.plu.mx/*",
     "*://scholar.google.com/*",
     "*://*.clarivate.com/*",
-    "https://operator.rawdatalibrary.net/*"
+    "https://operator.rawdatalibrary.net/*",
+    "https://api.openalex.org/*"
   ],
   "background": {
     "service_worker": "background.js"

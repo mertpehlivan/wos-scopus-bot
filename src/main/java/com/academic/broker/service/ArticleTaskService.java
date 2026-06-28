@@ -248,6 +248,14 @@ public class ArticleTaskService {
         task.touch();
         repository.save(task);
         log.info("Author metrics saved for task {} (source={})", taskId, task.getTargetSource());
+        // Fold metrics into staging immediately (publications-preserving), so
+        // they aren't stranded on the task row until a later /complete that may
+        // never arrive (METRICS_ONLY) or may land after the request is gated
+        // READY_FOR_REVIEW by other sources.
+        if (task.getSyncRequestId() != null) {
+            SyncRequestWorkerBridge bridge = syncBridge.getIfAvailable();
+            if (bridge != null) bridge.ingestAuthorMetrics(task);
+        }
     }
 
     /**

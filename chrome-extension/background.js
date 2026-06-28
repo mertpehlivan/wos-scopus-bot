@@ -159,6 +159,7 @@ const detailJobs = new Map();
 // of where the worker idled in the previous cycle.
 
 let GROUP_CONFIG = {
+  openalex: true,
   wos: true,
   scopusPlumx: true,
   scholar: true,
@@ -641,11 +642,42 @@ function resetScrapeTimeout(tabId) {
 
 let pollAlarmName = 'poll-master-orchestrator';
 
+// ── MV3 reliability: permanent periodic heartbeat alarm ────────────────
+// The fast self-rescheduling one-shot `poll-master-orchestrator` chain is
+// fragile: if any tick is suspended by Chrome before it re-arms (most
+// likely during the long OpenAlex fetch, which is awaited inside the tick),
+// the loop dies until the extension is reloaded — which is exactly the
+// "OpenAlex only arrives after a refresh" bug. This periodic alarm is an
+// independent safety net that re-fires the orchestrator at least once a
+// minute no matter what, so the loop self-heals without a manual reload.
+const HEARTBEAT_ALARM = 'poll-heartbeat';
+
+// Guards against the two alarms (master one-shot + periodic heartbeat)
+// firing close together and running runPriorityOrchestrator() concurrently,
+// which would race on the shared activeProfileTask / pendingTabs state and
+// could open duplicate scrape tabs. In-memory by design: resets to false on
+// every SW restart (so a worker that died mid-tick is never wedged).
+let orchestratorInFlight = false;
+
 function scheduleOrchestrator(delayMs) {
   chrome.alarms.create(pollAlarmName, { when: Date.now() + delayMs });
 }
 
+// Idempotently (re)create the periodic heartbeat. Safe to call from any
+// lifecycle event and on every SW cold start.
+function ensureHeartbeatAlarm() {
+  chrome.alarms.get(HEARTBEAT_ALARM, (a) => {
+    if (!a) chrome.alarms.create(HEARTBEAT_ALARM, { periodInMinutes: 1 });
+  });
+}
+
+// Top-level bootstrap: runs on EVERY service-worker cold start (module
+// re-evaluation), not just onInstalled — so the heartbeat exists even after
+// a browser restart where onInstalled never fires.
+ensureHeartbeatAlarm();
+
 chrome.runtime.onInstalled.addListener(() => {
+  ensureHeartbeatAlarm();
   scheduleOrchestrator(2000); // Start after 2s
   cleanupOnStartup('install').catch(e => console.warn('[Startup] cleanup failed:', e?.message || e));
 });
@@ -655,7 +687,16 @@ chrome.runtime.onInstalled.addListener(() => {
 // browser tabs from prior runs may still be open. Without cleanup, those
 // tabs become orphaned (no taskId → no scrape → eventually time out).
 chrome.runtime.onStartup.addListener(() => {
-  cleanupOnStartup('browser-start').catch(e => console.warn('[Startup] cleanup failed:', e?.message || e));
+  cleanupOnStartup('browser-start')
+    .catch(e => console.warn('[Startup] cleanup failed:', e?.message || e))
+    .finally(() => {
+      // Re-arm the loop after a browser restart. Alarms usually persist, but
+      // if the persisted alarm was lost (or a prior tick died without
+      // re-arming), nothing else would restart polling until a manual reload
+      // — onStartup must not be a dead end.
+      ensureHeartbeatAlarm();
+      chrome.alarms.get(pollAlarmName, (a) => { if (!a) scheduleOrchestrator(2000); });
+    });
 });
 
 /**
@@ -708,6 +749,24 @@ async function cleanupOnStartup(reason) {
     if (keysToRemove.length > 0) {
       await chrome.storage.session.remove(keysToRemove);
       console.log(`[Startup] Cleared ${keysToRemove.length} stale session keys`);
+    }
+  } catch (_) { /* ignore */ }
+
+  // 4. Reconcile a stale in-flight OpenAlex task. If the SW was killed mid
+  //    processOpenAlexTask, the broker still has the task PROCESSING. Fail it
+  //    so it can be re-queued cleanly instead of waiting for the broker's
+  //    own reset-stuck sweep. Only fail genuinely stale ones (>6 min) so we
+  //    never race a task another (live) instance just claimed.
+  try {
+    const { openalex_inflight } = await chrome.storage.session.get('openalex_inflight');
+    if (openalex_inflight?.taskId) {
+      const ageMs = Date.now() - (openalex_inflight.startedAt || 0);
+      const STALE_MS = 6 * 60 * 1000;
+      if (ageMs > STALE_MS) {
+        console.warn(`[Startup] Failing stale in-flight OpenAlex task ${openalex_inflight.taskId} (age ${Math.round(ageMs / 1000)}s)`);
+        await openAlexFailTask(openalex_inflight.taskId, 'worker restarted mid-OpenAlex (stale in-flight reconcile)');
+      }
+      await chrome.storage.session.remove('openalex_inflight');
     }
   } catch (_) { /* ignore */ }
 }
@@ -1343,12 +1402,20 @@ async function runScholarPhaseInline() {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === pollAlarmName) {
-    runPriorityOrchestrator().catch(err => {
+  if (alarm.name !== pollAlarmName && alarm.name !== HEARTBEAT_ALARM) return;
+  // Coalesce concurrent triggers (master one-shot + periodic heartbeat) so
+  // we never run two orchestrator ticks at once.
+  if (orchestratorInFlight) return;
+  orchestratorInFlight = true;
+  // Return the promise so MV3 keeps the service worker alive through the
+  // orchestrator's awaits (including the long OpenAlex fetch) instead of
+  // suspending it mid-tick and dropping the next scheduleOrchestrator call.
+  return runPriorityOrchestrator()
+    .catch(err => {
       console.warn("[Orchestrator]", err);
       scheduleOrchestrator(15000);
-    });
-  }
+    })
+    .finally(() => { orchestratorInFlight = false; });
 });
 
 // ═══════════════════════════════════════════════
@@ -1458,6 +1525,11 @@ async function pollOpenAlex() {
     if (!data?.taskId || !data?.externalId) return false;
 
     activeOpenAlexTask = data;
+    // Crash-safe breadcrumb: if Chrome kills the SW mid-processing, the
+    // in-memory slot is lost but this lets the next cold start reconcile a
+    // stale in-flight task (fail it on the broker) instead of leaving it
+    // stuck PROCESSING. See cleanupOnStartup.
+    try { await chrome.storage.session.set({ openalex_inflight: { taskId: data.taskId, startedAt: Date.now() } }); } catch (_) { /* ignore */ }
     try {
       // Run synchronously — caller awaits, ordering downstream is preserved.
       await processOpenAlexTask(data);
@@ -1465,6 +1537,7 @@ async function pollOpenAlex() {
       console.warn('[OpenAlex] Task processing failed:', e?.message || e);
     } finally {
       activeOpenAlexTask = null;
+      try { await chrome.storage.session.remove('openalex_inflight'); } catch (_) { /* ignore */ }
     }
     return true;
   } catch (e) {
@@ -1486,13 +1559,15 @@ async function processOpenAlexTask(task) {
   addLog(`OpenAlex task started (ID: ${taskId}, ORCID: ${externalId}, ${metricsOnly ? 'metrics-only' : 'full'})`, 'info');
 
   const cleanedOrcid = stripOrcidPrefix(externalId);
-  const ua = 'rdlsis-worker (mailto:rdlsis@example.com)';
+  // OpenAlex "polite pool" identification is done via the ?mailto= query
+  // param on every URL below — a 'User-Agent' fetch header is a forbidden
+  // header name that the browser silently drops, so we don't set it.
 
   // 1) Author endpoint
   let author;
   try {
     const url = `https://api.openalex.org/authors/orcid:${encodeURIComponent(cleanedOrcid)}?mailto=rdlsis@example.com`;
-    const r = await fetch(url, { headers: { 'User-Agent': ua, Accept: 'application/json' } });
+    const r = await fetch(url, { headers: { Accept: 'application/json' } });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     author = await r.json();
   } catch (e) {
@@ -1555,7 +1630,7 @@ async function processOpenAlexTask(task) {
           `https://api.openalex.org/works?filter=${baseFilter}` +
           `&per_page=${PER_PAGE}&sort=cited_by_count:desc&cursor=${encodeURIComponent(cursor)}` +
           `&mailto=rdlsis@example.com`;
-        const r = await fetch(worksUrl, { headers: { 'User-Agent': ua, Accept: 'application/json' } });
+        const r = await fetch(worksUrl, { headers: { Accept: 'application/json' } });
         if (!r.ok) {
           console.warn('[OpenAlex] Works HTTP', r.status, '(page', pages, ')');
           break;
@@ -2249,7 +2324,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'FORCE_POLL') {
-    pollScrape();
+    // Drive the REAL orchestrator (which re-arms its own alarm) so a manual
+    // poll also revives the loop if it had died. The legacy pollScrape()
+    // path never re-armed the alarm — that's why a full extension reload
+    // used to be the only way to restore steady-state polling.
+    if (!orchestratorInFlight) {
+      orchestratorInFlight = true;
+      runPriorityOrchestrator()
+        .catch(err => { console.warn('[Orchestrator]', err); scheduleOrchestrator(15000); })
+        .finally(() => { orchestratorInFlight = false; });
+    }
+    ensureHeartbeatAlarm();
     pollWosDoi();
     pollScholarDoi();
     pollPlumx();

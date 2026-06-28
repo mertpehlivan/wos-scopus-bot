@@ -218,6 +218,61 @@ public class SyncRequestWorkerBridge {
     }
 
     /**
+     * Folds author-metrics (h-index, citations, documents, i10Index,
+     * yearlyStats) into the staged blob as soon as they arrive via the
+     * dedicated {@code /author-metrics} endpoint — instead of leaving them
+     * stranded on the task row until a later {@code /complete} (which may
+     * never come for METRICS_ONLY refreshes, or may land after the request
+     * was gated READY_FOR_REVIEW by other sources).
+     *
+     * <p>Unlike {@link #ingestTaskCompletion} this MERGES into any existing
+     * source blob, so a metrics update that arrives AFTER {@code /complete}
+     * does not drop the publications rawData that the complete already stored
+     * (a from-scratch rebuild would have wiped it). It never marks the request
+     * ready on its own — the task stays PROCESSING here, so the readiness gate
+     * only fires once the real terminal completion lands.
+     */
+    @Transactional
+    public void ingestAuthorMetrics(ArticleTask task) {
+        UUID reqId = task.getSyncRequestId();
+        if (reqId == null || task.getAuthorMetricsData() == null) return;
+        SyncRequest req = syncRepository.findById(reqId).orElse(null);
+        if (req == null) return;
+        // Same terminal-status guard as ingestTaskCompletion — never mutate a
+        // request the operator already signed off on.
+        if (req.getStatus() == SyncRequestStatus.APPROVED
+                || req.getStatus() == SyncRequestStatus.REJECTED
+                || req.getStatus() == SyncRequestStatus.EXPIRED) {
+            return;
+        }
+
+        String sourceKey = task.getTargetSource().name();
+        Map<String, Object> staged = req.getStagedData() != null
+                ? new HashMap<>(req.getStagedData()) : new HashMap<>();
+        // Merge into the existing blob (preserve rawData/publications a prior
+        // /complete stored) rather than replacing it.
+        Map<String, Object> sourceBlob;
+        Object existing = staged.get(sourceKey);
+        if (existing instanceof Map<?, ?> em) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> casted = (Map<String, Object>) em;
+            sourceBlob = new HashMap<>(casted);
+        } else {
+            sourceBlob = new HashMap<>();
+        }
+        sourceBlob.put("metrics", canonicalizeMetrics(task.getAuthorMetricsData()));
+        sourceBlob.put("scrapedAt", task.getUpdatedAt() != null ? task.getUpdatedAt().toString() : null);
+        sourceBlob.put("provenance", "WORKER");
+        staged.put(sourceKey, sourceBlob);
+
+        rebuildPublications(staged);
+        req.setStagedData(staged);
+        req.touch();
+        syncRepository.save(req);
+        log.debug("[Bridge] author-metrics staged for {} of req {} (publications preserved)", sourceKey, reqId);
+    }
+
+    /**
      * True when every task linked to this sync request — ArticleTasks
      * (WOS/SCOPUS/SCHOLAR/OPENALEX), PlumX per-DOI tasks, and the WoS
      * Citation Report (if one was queued) — has reached a terminal
@@ -303,21 +358,27 @@ public class SyncRequestWorkerBridge {
                 ? new java.util.ArrayList<>((List<Map<String, Object>>) existingObj)
                 : new java.util.ArrayList<>();
 
-        Map<String, Object> match = null;
+        // Apply to EVERY row sharing this DOI, not just the first. WoS-added
+        // baseline rows can duplicate an OpenAlex row by DOI; matching only
+        // the first left the duplicate with blank PlumX citations. Candidate
+        // DOI is trimmed before compare so surrounding whitespace can't miss.
+        int matched = 0;
         for (Map<String, Object> p : pubs) {
             String pdoi = stringField(p, "doi");
-            if (pdoi != null && doiKey.equals(pdoi.toLowerCase())) { match = p; break; }
+            if (pdoi != null && doiKey.equals(pdoi.trim().toLowerCase())) {
+                if (scopus != null) putCitation(p, "scopus", scopus);
+                if (mendeley != null) putCitation(p, "mendeley", mendeley);
+                if (crossref != null) putCitation(p, "crossref", crossref);
+                addSource(p, "PLUMX");
+                matched++;
+            }
         }
 
         // Enrichment-only — if no OpenAlex entry has this DOI, the PlumX
         // result has nothing to attach to and is dropped. The worker should
         // never get into this state because it queues PlumX AFTER OpenAlex
         // produces the publications list, but be defensive.
-        if (match != null) {
-            if (scopus != null) putCitation(match, "scopus", scopus);
-            if (mendeley != null) putCitation(match, "mendeley", mendeley);
-            if (crossref != null) putCitation(match, "crossref", crossref);
-            addSource(match, "PLUMX");
+        if (matched > 0) {
             staged.put("publications", pubs);
         } else {
             log.debug("[Bridge] PlumX completion for req {} doi={} — no matching baseline pub, dropped",
@@ -789,6 +850,16 @@ public class SyncRequestWorkerBridge {
      * Aliases the legacy field but ALSO keeps the original key, so any
      * existing consumer that still reads e.g. {@code sumOfTimesCited} keeps
      * working. Returns a NEW map — never mutates the JSONB blob in place.
+     *
+     * <p><b>CONTRACT (broker ⇄ backend):</b> this map is stored at
+     * {@code stagedData.<SOURCE>.metrics} and read back verbatim by the main
+     * backend's {@code ApplySyncService.applyMetricsBlock} via
+     * {@code block.get("metrics")}. Passthrough fields {@code yearlyStats}
+     * (the per-year {year,publications,citations} histogram) and
+     * {@code i10Index} have no canonical alias and are persisted ONLY by the
+     * backend reading this exact nested path — so do NOT rename the
+     * {@code "metrics"} key or those field names on either side without
+     * updating both. There is no test guarding this coupling.
      */
     private static Map<String, Object> canonicalizeMetrics(Map<String, Object> raw) {
         Map<String, Object> out = new HashMap<>(raw);
@@ -917,7 +988,7 @@ public class SyncRequestWorkerBridge {
                 Map<String, Object> p = (Map<String, Object>) m;
                 String doi = stringField(p, "doi");
                 if (doi == null) continue;
-                Map<String, Object> match = byDoi.get(doi.toLowerCase());
+                Map<String, Object> match = byDoi.get(doi.trim().toLowerCase());
                 if (match == null) continue;
                 Object cit = p.get("citations");
                 if (cit instanceof Map<?, ?> cm) {
@@ -936,7 +1007,57 @@ public class SyncRequestWorkerBridge {
             }
         }
 
-        staged.put("publications", baseline);
+        // 4) Safety-net coalesce: merge baseline rows that share a normalized
+        //    DOI (same DOI == same paper). DOI-only and gap-filling — it never
+        //    overwrites an existing citation value and never merges by title,
+        //    so distinct papers can't be wrongly collapsed. Belt-and-suspenders
+        //    on top of the trim-normalized DOI indexing above.
+        staged.put("publications", coalesceByDoi(baseline));
+    }
+
+    /**
+     * Merges baseline rows sharing a normalized (trim+lowercase) DOI into the
+     * first occurrence, folding sources and filling MISSING citation keys
+     * only. DOI-less rows pass through untouched.
+     */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> coalesceByDoi(List<Map<String, Object>> pubs) {
+        java.util.LinkedHashMap<String, Map<String, Object>> firstByDoi = new java.util.LinkedHashMap<>();
+        List<Map<String, Object>> out = new java.util.ArrayList<>();
+        for (Map<String, Object> p : pubs) {
+            String doi = stringField(p, "doi");
+            String key = doi == null ? null : doi.trim().toLowerCase();
+            if (key == null) { out.add(p); continue; }
+            Map<String, Object> first = firstByDoi.get(key);
+            if (first == null) {
+                firstByDoi.put(key, p);
+                out.add(p);
+                continue;
+            }
+            // Duplicate DOI — fold into the first occurrence.
+            Object firstCitObj = first.get("citations");
+            Map<String, Object> firstCit = firstCitObj instanceof Map<?, ?> fm
+                    ? (Map<String, Object>) fm : null;
+            Object cit = p.get("citations");
+            if (cit instanceof Map<?, ?> cm) {
+                for (Map.Entry<String, Object> e : ((Map<String, Object>) cm).entrySet()) {
+                    String ck = String.valueOf(e.getKey()).toLowerCase();
+                    Object v = e.getValue();
+                    // Gap-fill only — never clobber a value the first row already has.
+                    if (v instanceof Number n && (firstCit == null || firstCit.get(ck) == null)) {
+                        putCitation(first, ck, n.intValue());
+                    }
+                }
+            }
+            Object srcs = p.get("sources");
+            if (srcs instanceof List<?> sl) {
+                for (Object s : sl) addSource(first, String.valueOf(s));
+            }
+        }
+        if (out.size() != pubs.size()) {
+            log.info("[Rebuild] Coalesced {} baseline rows into {} by DOI", pubs.size(), out.size());
+        }
+        return out;
     }
 
     /** Adds {@code p}'s DOI and title to the running indexes. Tolerant of
@@ -945,7 +1066,7 @@ public class SyncRequestWorkerBridge {
             java.util.LinkedHashMap<String, Map<String, Object>> byDoi,
             java.util.LinkedHashMap<String, Map<String, Object>> byTitle) {
         String doi = stringField(p, "doi");
-        if (doi != null) byDoi.put(doi.toLowerCase(), p);
+        if (doi != null) byDoi.put(doi.trim().toLowerCase(), p);
         String title = stringField(p, "title");
         if (title != null) byTitle.put(title.toLowerCase().trim(), p);
     }
@@ -985,7 +1106,7 @@ public class SyncRequestWorkerBridge {
             List<Map<String, Object>> all) {
         String doi = stringField(incoming, "doi");
         if (doi != null) {
-            Map<String, Object> m = byDoi.get(doi.toLowerCase());
+            Map<String, Object> m = byDoi.get(doi.trim().toLowerCase());
             if (m != null) return m;
         }
         String title = stringField(incoming, "title");

@@ -591,6 +591,41 @@ public class SyncRequestService {
         repository.save(req);
         audit(id, null, "SYSTEM", "APPLY_RETRY",
                 Map.of("attempt", req.getApplyAttempts(), "error", error == null ? "" : error));
+        // Once attempts reach the cap, the request drops out of
+        // findUnappliedApprovals (applyAttempts < MAX) and would otherwise be
+        // silently abandoned in APPROVED+appliedToBackend=false forever. Make
+        // that loud + auditable so the data loss can't go unnoticed.
+        if (req.getApplyAttempts() >= MAX_APPLY_ATTEMPTS) {
+            log.error("[Apply] PARKED sync {} after {} failed apply attempts — backend never received it; "
+                    + "needs manual attention (last error: {})", id, req.getApplyAttempts(), error);
+            audit(id, null, "SYSTEM", "APPLY_PARKED",
+                    Map.of("attempts", req.getApplyAttempts(), "error", error == null ? "" : error));
+        }
+    }
+
+    /**
+     * Immediately parks an approval that failed with a NON-retryable error
+     * (4xx: wrong internal key, malformed payload, too large). Bumps
+     * applyAttempts to the cap so the retry loop won't keep burning identical
+     * attempts (~20s of futile retries) before parking, and records a distinct
+     * APPLY_REJECTED audit action so a config error is never mistaken for a
+     * transient outage.
+     */
+    @Transactional
+    public void parkApplyNonRetryable(UUID id, String error) {
+        SyncRequest req = get(id);
+        req.setApplyAttempts(MAX_APPLY_ATTEMPTS);
+        req.touch();
+        repository.save(req);
+        log.error("[Apply] PARKED sync {} — non-retryable backend rejection: {}", id, error);
+        audit(id, null, "SYSTEM", "APPLY_REJECTED",
+                Map.of("attempts", req.getApplyAttempts(), "error", error == null ? "" : error));
+    }
+
+    /** Approved requests whose backend apply permanently failed — needs manual attention. */
+    @Transactional(readOnly = true)
+    public List<SyncRequest> findParkedApprovals() {
+        return repository.findParkedApprovals(MAX_APPLY_ATTEMPTS);
     }
 
     // ──────────────────────────────────────────────────────────────────

@@ -86,6 +86,10 @@ public class BackendApplyService {
         body.put("syncRequestId", req.getId().toString());
         body.put("requesterUserId", req.getRequesterUserId().toString());
         body.put("origin", req.getOrigin().name());
+        // Contract: forwarded RAW — the broker does NO field-level merge.
+        // The backend (ApplySyncService.mergeEdits + allowed()) is the single
+        // authority that applies editedData over stagedData gated by
+        // approvedFields. Keep these three keys in sync with that reader.
         body.put("stagedData", req.getStagedData());
         body.put("editedData", req.getEditedData());
         body.put("approvedFields", req.getApprovedFields());
@@ -119,16 +123,42 @@ public class BackendApplyService {
                 .build();
 
         HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
-        if (response.statusCode() >= 200 && response.statusCode() < 300) {
+        int code = response.statusCode();
+        if (code >= 200 && code < 300) {
             service.markApplied(req.getId());
-            log.info("[Apply] {} applied to backend (HTTP {})", req.getId(), response.statusCode());
+            log.info("[Apply] {} applied to backend (HTTP {})", req.getId(), code);
             return true;
-        } else {
-            String error = "HTTP " + response.statusCode() + " — " + truncate(response.body());
-            service.recordApplyAttempt(req.getId(), error);
-            log.warn("[Apply] {} apply failed: {}", req.getId(), error);
-            return false;
         }
+        String error = "HTTP " + code + " — " + truncate(response.body());
+        if (code >= 400 && code < 500) {
+            // Non-retryable: a 401 (bad X-Internal-Key / tenant token), 400
+            // (malformed body) or 413 (too large) will NEVER succeed on retry.
+            // Park immediately with a distinct signal instead of burning all 5
+            // attempts and then silently abandoning it — config errors must be
+            // diagnosable, not indistinguishable from a transient outage.
+            service.parkApplyNonRetryable(req.getId(), error);
+            log.error("[Apply] {} non-retryable apply rejection, parked: {}", req.getId(), error);
+        } else {
+            // 5xx / unexpected — retryable, keep the backoff loop going.
+            service.recordApplyAttempt(req.getId(), error);
+            log.warn("[Apply] {} apply failed (retryable): {}", req.getId(), error);
+        }
+        return false;
+    }
+
+    /**
+     * Surfaces parked approvals — approved requests whose backend apply
+     * permanently failed and dropped out of the retry loop. Without this they
+     * are silently lost (stuck APPROVED + appliedToBackend=false). Logged at
+     * ERROR every 5 min so monitoring/operators can act; the list is also
+     * queryable via {@link SyncRequestService#findParkedApprovals()}.
+     */
+    @Scheduled(fixedDelay = 300_000L, initialDelay = 60_000L)
+    public void warnParkedApprovals() {
+        List<SyncRequest> parked = service.findParkedApprovals();
+        if (parked.isEmpty()) return;
+        log.error("[Apply] {} approved sync request(s) PARKED (backend apply failed permanently) — manual attention needed: {}",
+                parked.size(), parked.stream().map(r -> r.getId().toString()).toList());
     }
 
     private static String trimTrailingSlash(String s) {
