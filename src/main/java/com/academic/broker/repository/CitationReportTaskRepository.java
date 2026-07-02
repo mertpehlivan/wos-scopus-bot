@@ -10,6 +10,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -55,4 +56,11 @@ public interface CitationReportTaskRepository extends JpaRepository<CitationRepo
     @Query("DELETE FROM CitationReportTask t WHERE t.syncRequestId = :reqId AND t.status IN :statuses")
     int deleteBySyncRequestIdAndStatusIn(@Param("reqId") UUID syncRequestId,
                                           @Param("statuses") List<TaskStatus> statuses);
+
+    /**
+     * Watchdog query (derived — no custom JPQL, so it can't break app startup):
+     * tasks in a given status not touched since {@code cutoff}. The watchdog
+     * calls this with PROCESSING and filters out terminal-sync tasks in Java.
+     */
+    List<CitationReportTask> findByStatusAndUpdatedAtBefore(TaskStatus status, Instant cutoff);
 }

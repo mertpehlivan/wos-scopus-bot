@@ -12,9 +12,11 @@ import com.academic.broker.repository.PlumxTaskRepository;
 import com.academic.broker.repository.SyncRequestRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +46,51 @@ public class SyncRequestWorkerBridge {
     private final PlumxTaskRepository plumxRepository;
     private final CitationReportTaskRepository citationReportRepository;
     private final SyncRequestService syncService;
+
+    /**
+     * How long a citation-report task may sit PROCESSING before the watchdog
+     * reclaims it. WoS Citation Report scrapes normally finish in under a
+     * minute; anything stuck this long is a dead claim (tab closed, WoS session
+     * lost, or starved by repeated re-scrapes).
+     */
+    private static final long CR_STUCK_MINUTES = 10;
+
+    /**
+     * Watchdog for stuck WoS Citation Report scrapes. Citation-report tasks have
+     * no reclaim path of their own — the extension poll only picks PENDING and
+     * the operator "Tekrar Dene" is a no-op on PROCESSING — so an abandoned
+     * PROCESSING task hangs forever and pins its sync in PENDING_SCRAPE. Every
+     * minute, reset stale PROCESSING tasks (active syncs only) back to PENDING so
+     * the extension re-scrapes them. Mirrors
+     * {@code ArticleTaskService.resetStuckProcessingTasks}.
+     */
+    @Scheduled(fixedDelay = 60_000, initialDelay = 120_000)
+    @Transactional
+    public void resetStuckCitationReportTasks() {
+        Instant cutoff = Instant.now().minusSeconds(CR_STUCK_MINUTES * 60L);
+        List<CitationReportTask> stuck =
+                citationReportRepository.findByStatusAndUpdatedAtBefore(TaskStatus.PROCESSING, cutoff);
+        int reset = 0;
+        for (CitationReportTask t : stuck) {
+            // Skip tasks whose sync already closed — re-scraping them is
+            // pointless (ingestCitationReportCompletion drops a terminal sync).
+            SyncRequest s = syncRepository.findById(t.getSyncRequestId()).orElse(null);
+            if (s == null) continue;
+            SyncRequestStatus st = s.getStatus();
+            if (st == SyncRequestStatus.APPROVED
+                    || st == SyncRequestStatus.REJECTED
+                    || st == SyncRequestStatus.EXPIRED) {
+                continue;
+            }
+            t.setStatus(TaskStatus.PENDING);
+            t.touch();
+            citationReportRepository.save(t);
+            reset++;
+        }
+        if (reset > 0) {
+            log.info("[Watchdog] Reset {} stuck PROCESSING citation-report task(s) to PENDING", reset);
+        }
+    }
 
     /** Stamp existing article-tasks (or new ones) with this request id. */
     @Transactional
