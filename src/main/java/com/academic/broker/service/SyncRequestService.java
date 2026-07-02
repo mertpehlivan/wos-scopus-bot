@@ -1,6 +1,7 @@
 package com.academic.broker.service;
 
 import com.academic.broker.config.TenantRegistry;
+import com.academic.broker.domain.ArticleTask;
 import com.academic.broker.domain.SyncAuditLog;
 import com.academic.broker.domain.SyncRequest;
 import com.academic.broker.domain.SyncRequestOrigin;
@@ -513,6 +514,54 @@ public class SyncRequestService {
         repository.save(req);
         audit(id, operatorUserId, "OPERATOR", "EDIT",
                 Map.of("hasEdits", editedData != null));
+        // Promote operator-entered identifiers onto the snapshot on SAVE, so the
+        // panel's top IDs (MEVCUT links) flip to the typed values immediately and
+        // a subsequent re-scrape resolves the external id from them.
+        return promoteEditedIdentifiers(id, operatorUserId);
+    }
+
+    /**
+     * Promotes operator-entered external identifiers (from
+     * {@code editedData.identifiers}) onto the {@code requesterProfileSnapshot}
+     * so re-scrapes can use a freshly-typed WoS/Scopus/Scholar/ORCID id, the id
+     * survives a {@code resetForRescrape}, and it shows as MEVCUT in the panel.
+     *
+     * <p>Non-blank values only (never wipes a known id with a blank field).
+     * Idempotent — a no-op when nothing changed. Leaves {@code editedData}
+     * untouched so the approve → apply-sync path still writes the id onto the
+     * researcher's ResearcherProfile.
+     */
+    @Transactional
+    public SyncRequest promoteEditedIdentifiers(UUID id, UUID operatorUserId) {
+        SyncRequest req = get(id);
+        Object idsObj = req.getEditedData() == null ? null : req.getEditedData().get("identifiers");
+        if (!(idsObj instanceof Map<?, ?> im)) return req;
+        @SuppressWarnings("unchecked")
+        Map<String, Object> ids = (Map<String, Object>) im;
+
+        Map<String, Object> snap = req.getRequesterProfileSnapshot();
+        Map<String, Object> newSnap = (snap == null)
+                ? new java.util.HashMap<>() : new java.util.HashMap<>(snap);
+
+        boolean changed = false;
+        for (String key : new String[]{"orcid", "publonsId", "scopusId", "googleScholarId"}) {
+            Object v = ids.get(key);
+            if (v == null) continue;
+            String s = v.toString().trim();
+            if (s.isEmpty()) continue;
+            String current = newSnap.get(key) == null ? null : newSnap.get(key).toString();
+            if (!s.equals(current)) {
+                newSnap.put(key, s);
+                changed = true;
+            }
+        }
+        if (!changed) return req;
+
+        req.setRequesterProfileSnapshot(newSnap);
+        req.touch();
+        repository.save(req);
+        audit(id, operatorUserId, "OPERATOR", "PROMOTE_IDENTIFIERS",
+                Map.of("fields", new java.util.ArrayList<>(ids.keySet())));
         return req;
     }
 
@@ -520,8 +569,23 @@ public class SyncRequestService {
     @Transactional
     public SyncRequest approve(UUID id, UUID operatorUserId, String notes) {
         SyncRequest req = get(id);
-        if (req.getStatus() != SyncRequestStatus.READY_FOR_REVIEW
-                && req.getStatus() != SyncRequestStatus.FAILED) {
+        boolean reviewable = req.getStatus() == SyncRequestStatus.READY_FOR_REVIEW
+                || req.getStatus() == SyncRequestStatus.FAILED;
+        // Stuck-PlumX escape hatch. A request normally waits for the PlumX /
+        // citation-report enrichment to land before auto-flipping to
+        // READY_FOR_REVIEW (so the operator sees Scopus citations on first
+        // review). But PlumX can stall indefinitely when no worker picks the
+        // task up — which used to pin the request in PENDING_SCRAPE forever, so
+        // every "Onayla ve Gönder" returned 409 Conflict. Allow approval
+        // straight from PENDING_SCRAPE once the CORE scrapes (WoS/Scopus/
+        // Scholar/OpenAlex article tasks) are all terminal; only the enrichment
+        // overlay is outstanding and the operator has chosen to send what landed.
+        if (!reviewable && req.getStatus() == SyncRequestStatus.PENDING_SCRAPE
+                && coreScrapeTasksDone(id)) {
+            reviewable = true;
+            log.info("[SyncRequest] {} approved from PENDING_SCRAPE — core scrape done, enrichment (PlumX) still pending", id);
+        }
+        if (!reviewable) {
             throw new TaskNotProcessableException(0L, null,
                     "approve (status: " + req.getStatus() + ")");
         }
@@ -538,6 +602,23 @@ public class SyncRequestService {
                 Map.of("elapsedSec", elapsedSec));
         log.info("[SyncRequest] {} APPROVED by operator {} (took {}s)", id, operatorUserId, elapsedSec);
         return req;
+    }
+
+    /**
+     * True when every WoS/Scopus/Scholar/OpenAlex article task for this request
+     * has reached a terminal status (COMPLETED/FAILED) — i.e., the real source
+     * scrape is finished and only the PlumX / citation-report enrichment overlay
+     * (separate task pools) may still be outstanding. Backs the approval escape
+     * hatch so a stalled enrichment task can't lock a request forever.
+     */
+    private boolean coreScrapeTasksDone(UUID syncRequestId) {
+        List<ArticleTask> linked = articleTaskRepository.findBySyncRequestId(syncRequestId);
+        if (linked.isEmpty()) return false;
+        for (ArticleTask t : linked) {
+            TaskStatus s = t.getStatus();
+            if (s == TaskStatus.PENDING || s == TaskStatus.PROCESSING) return false;
+        }
+        return true;
     }
 
     @Transactional

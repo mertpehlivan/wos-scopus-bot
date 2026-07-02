@@ -184,6 +184,10 @@ public class SyncRequestOperatorController {
         // flips status back to PENDING_SCRAPE. Different from the
         // per-source "Tekrar Çek" button, which does an in-place
         // METRICS_ONLY refresh and preserves operator edits.
+        // Promote operator-entered identifiers onto the snapshot BEFORE the
+        // reset — resetForRescrape wipes editedData but not the snapshot, so a
+        // freshly-typed WoS/Scopus id survives and the re-scrape can use it.
+        service.promoteEditedIdentifiers(id, operatorId);
         SyncRequest req = service.resetForRescrape(id, operatorId);
         Map<String, Object> snap = req.getRequesterProfileSnapshot();
         Map<String, Object> progress = new java.util.HashMap<>();
@@ -395,6 +399,10 @@ public class SyncRequestOperatorController {
             return Map.of("ok", false, "error", "Invalid source: " + source);
         }
 
+        // Promote any operator-entered id (editedData.identifiers) onto the
+        // snapshot first, so a freshly-typed WoS/Scopus/Scholar id is usable
+        // for this re-scrape and shows as MEVCUT afterwards.
+        req = service.promoteEditedIdentifiers(id, operatorId);
         // Resolve the externalId from the profile snapshot (broker stays
         // user-agnostic — it only knows what the backend told it).
         Map<String, Object> snap = req.getRequesterProfileSnapshot();
