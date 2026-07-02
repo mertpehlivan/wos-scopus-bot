@@ -172,6 +172,16 @@ public class SyncRequestWorkerBridge {
         sourceBlob.put("scrapedAt", task.getUpdatedAt() != null
                 ? task.getUpdatedAt().toString() : null);
         sourceBlob.put("provenance", "WORKER");
+        // Preserve the WoS Citation Report blob that
+        // ingestCitationReportCompletion folded into staged.WOS.citationReport.
+        // This method rebuilds a FRESH sourceBlob and overwrites staged.WOS, so
+        // a WoS source rescrape that lands AFTER the citation report would
+        // otherwise drop it — and the per-year WoS citations (wosYearlyStats)
+        // never reach the backend on approval. Carry it over.
+        if ("WOS".equals(sourceKey) && staged.get("WOS") instanceof Map<?, ?> prevWos) {
+            Object cr = prevWos.get("citationReport");
+            if (cr != null) sourceBlob.put("citationReport", cr);
+        }
         staged.put(sourceKey, sourceBlob);
 
         // Rebuild the unified publications list every time a new source
@@ -366,9 +376,21 @@ public class SyncRequestWorkerBridge {
         for (Map<String, Object> p : pubs) {
             String pdoi = stringField(p, "doi");
             if (pdoi != null && doiKey.equals(pdoi.trim().toLowerCase())) {
-                if (scopus != null) putCitation(p, "scopus", scopus);
+                if (scopus != null) {
+                    putCitation(p, "scopus", scopus);
+                    // A Scopus citation figure from PlumX means the paper has a
+                    // Scopus record — attribute SCOPUS as a real source, not just
+                    // the PLUMX overlay marker. Scopus author tasks are pulled
+                    // METRICS_ONLY (empty articles array), so the scrape path
+                    // never adds SCOPUS itself; without this, Scopus-indexed
+                    // papers would be badged only "PLUMX"/baseline.
+                    addSource(p, "SCOPUS");
+                }
                 if (mendeley != null) putCitation(p, "mendeley", mendeley);
                 if (crossref != null) putCitation(p, "crossref", crossref);
+                // PLUMX marker stays: rebuildPublications() relies on it to
+                // re-apply PlumX citations across rebuilds. The backend drops
+                // PLUMX from the persisted sources (it's an overlay, not a source).
                 addSource(p, "PLUMX");
                 matched++;
             }
