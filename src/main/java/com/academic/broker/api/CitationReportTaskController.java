@@ -192,6 +192,7 @@ public class CitationReportTaskController {
         task.setStatus(TaskStatus.PENDING);
         task.setErrorMessage(null);
         task.setRetryCount(task.getRetryCount() + 1);
+        task.setWatchdogResets(0); // fresh watchdog budget on an operator retry
         task.touch();
         repository.save(task);
         log.info("[CitationReport] Task {} retried (count={})", taskId, task.getRetryCount());

@@ -56,6 +56,15 @@ public class SyncRequestWorkerBridge {
     private static final long CR_STUCK_MINUTES = 10;
 
     /**
+     * After this many watchdog re-queues with no completion, give up and mark
+     * the citation-report task FAILED instead of re-queuing forever — WoS is
+     * blocking / the session is dead, so more attempts just churn. The operator
+     * then sees a clear "başarısız" state and can "Tekrar Dene" later (which
+     * resets the counter for a fresh set of attempts).
+     */
+    private static final int CR_MAX_WATCHDOG_RESETS = 3;
+
+    /**
      * Watchdog for stuck WoS Citation Report scrapes. Citation-report tasks have
      * no reclaim path of their own — the extension poll only picks PENDING and
      * the operator "Tekrar Dene" is a no-op on PROCESSING — so an abandoned
@@ -70,7 +79,7 @@ public class SyncRequestWorkerBridge {
         Instant cutoff = Instant.now().minusSeconds(CR_STUCK_MINUTES * 60L);
         List<CitationReportTask> stuck =
                 citationReportRepository.findByStatusAndUpdatedAtBefore(TaskStatus.PROCESSING, cutoff);
-        int reset = 0;
+        int reset = 0, failed = 0;
         for (CitationReportTask t : stuck) {
             // Skip tasks whose sync already closed — re-scraping them is
             // pointless (ingestCitationReportCompletion drops a terminal sync).
@@ -82,13 +91,27 @@ public class SyncRequestWorkerBridge {
                     || st == SyncRequestStatus.EXPIRED) {
                 continue;
             }
-            t.setStatus(TaskStatus.PENDING);
+            int resets = t.getWatchdogResets() == null ? 0 : t.getWatchdogResets();
+            if (resets >= CR_MAX_WATCHDOG_RESETS) {
+                // Give up — WoS keeps failing to complete this report. Mark
+                // FAILED so the panel shows a clear state (and the operator can
+                // "Tekrar Dene" later once WoS access recovers).
+                t.setStatus(TaskStatus.FAILED);
+                t.setErrorMessage("Otomatik: " + CR_MAX_WATCHDOG_RESETS
+                        + " denemede WoS Atıf Raporu tamamlanamadı (WoS oturumu/erişimi engelli olabilir). "
+                        + "WoS'a girip 'Tekrar Dene' ile yeniden başlatın.");
+                failed++;
+            } else {
+                t.setStatus(TaskStatus.PENDING);
+                t.setWatchdogResets(resets + 1);
+                reset++;
+            }
             t.touch();
             citationReportRepository.save(t);
-            reset++;
         }
-        if (reset > 0) {
-            log.info("[Watchdog] Reset {} stuck PROCESSING citation-report task(s) to PENDING", reset);
+        if (reset > 0 || failed > 0) {
+            log.info("[Watchdog] Citation-report tasks: {} re-queued, {} marked FAILED (cap {})",
+                    reset, failed, CR_MAX_WATCHDOG_RESETS);
         }
     }
 

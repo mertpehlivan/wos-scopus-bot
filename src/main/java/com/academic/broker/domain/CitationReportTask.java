@@ -134,6 +134,17 @@ public class CitationReportTask {
     @Builder.Default
     private int retryCount = 0;
 
+    /**
+     * How many times the stuck-task watchdog has re-queued this task. After a
+     * cap the watchdog marks the task FAILED instead of re-queuing it forever
+     * (WoS blocking / session dead) so the operator sees a clear state rather
+     * than endless "Çekiliyor". Reset to 0 when the operator hits "Tekrar Dene".
+     * Nullable so the ddl-auto column-add is safe on existing rows — treat
+     * null as 0.
+     */
+    @Column(name = "watchdog_resets")
+    private Integer watchdogResets;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
