@@ -1,6 +1,7 @@
 package com.academic.broker.service;
 
 import com.academic.broker.domain.SyncRequest;
+import com.academic.broker.service.yearly.YearlyStatsSanitizerService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -43,10 +44,13 @@ public class BackendApplyService {
 
     private final SyncRequestService service;
     private final ObjectMapper objectMapper;
+    private final YearlyStatsSanitizerService yearlySanitizer;
 
-    public BackendApplyService(SyncRequestService service, ObjectMapper objectMapper) {
+    public BackendApplyService(SyncRequestService service, ObjectMapper objectMapper,
+                               YearlyStatsSanitizerService yearlySanitizer) {
         this.service = service;
         this.objectMapper = objectMapper;
+        this.yearlySanitizer = yearlySanitizer;
     }
 
     /** Try to push the given approval immediately. Falls back to scheduled retry on failure. */
@@ -90,7 +94,7 @@ public class BackendApplyService {
         // The backend (ApplySyncService.mergeEdits + allowed()) is the single
         // authority that applies editedData over stagedData gated by
         // approvedFields. Keep these three keys in sync with that reader.
-        body.put("stagedData", req.getStagedData());
+        body.put("stagedData", outgoingStaged(req));
         body.put("editedData", req.getEditedData());
         body.put("approvedFields", req.getApprovedFields());
         body.put("reviewedByUserId", req.getReviewedByUserId() == null
@@ -159,6 +163,26 @@ public class BackendApplyService {
         if (parked.isEmpty()) return;
         log.error("[Apply] {} approved sync request(s) PARKED (backend apply failed permanently) — manual attention needed: {}",
                 parked.size(), parked.stream().map(r -> r.getId().toString()).toList());
+    }
+
+    /**
+     * Safety net for requests staged before the yearly sanitizer existed (or
+     * whose last rebuild predates a mode change): re-run it on a shallow copy
+     * of stagedData. The sanitizer only replaces the OPENALEX block with new
+     * maps, so the persisted entity JSON is never mutated here.
+     */
+    private Map<String, Object> outgoingStaged(SyncRequest req) {
+        Map<String, Object> staged = req.getStagedData();
+        if (staged == null) return null;
+        Map<String, Object> copy = new HashMap<>(staged);
+        try {
+            yearlySanitizer.apply(copy);
+        } catch (RuntimeException e) {
+            // Never block an approval on the sanitizer — send the original.
+            log.warn("[Apply] Yearly sanitizer failed for {}: {}", req.getId(), e.getMessage());
+            return staged;
+        }
+        return copy;
     }
 
     private static String trimTrailingSlash(String s) {

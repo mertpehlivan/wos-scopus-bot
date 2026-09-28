@@ -46,6 +46,7 @@ public class SyncRequestWorkerBridge {
     private final PlumxTaskRepository plumxRepository;
     private final CitationReportTaskRepository citationReportRepository;
     private final SyncRequestService syncService;
+    private final com.academic.broker.service.yearly.YearlyStatsSanitizerService yearlySanitizer;
 
     /**
      * How long a citation-report task may sit PROCESSING before the watchdog
@@ -113,6 +114,42 @@ public class SyncRequestWorkerBridge {
             log.info("[Watchdog] Citation-report tasks: {} re-queued, {} marked FAILED (cap {})",
                     reset, failed, CR_MAX_WATCHDOG_RESETS);
         }
+    }
+
+    /**
+     * Keeps the yearly-stats report current on requests still awaiting the
+     * operator — covers requests staged before the sanitizer shipped and mode
+     * switches (shadow → on) without waiting for a re-scrape. Only saves when
+     * the OPENALEX metrics actually change, so it is quiet in steady state.
+     */
+    @Scheduled(fixedDelay = 600_000, initialDelay = 90_000)
+    public void refreshOpenYearlyReports() {
+        List<SyncRequest> open = syncRepository.findByStatusIn(
+                List.of(SyncRequestStatus.PENDING_SCRAPE, SyncRequestStatus.READY_FOR_REVIEW),
+                org.springframework.data.domain.PageRequest.of(0, 500)).getContent();
+        int updated = 0;
+        for (SyncRequest req : open) {
+            try {
+                if (refreshYearlyReport(req)) updated++;
+            } catch (RuntimeException e) {
+                // Optimistic-lock race with a concurrent ingest is harmless —
+                // that ingest re-runs the sanitizer itself.
+                log.debug("[YearlyStats] refresh skipped for {}: {}", req.getId(), e.getMessage());
+            }
+        }
+        if (updated > 0) log.info("[YearlyStats] refreshed report on {} open request(s)", updated);
+    }
+
+    private boolean refreshYearlyReport(SyncRequest req) {
+        Map<String, Object> staged = req.getStagedData();
+        if (staged == null || !(staged.get("OPENALEX") instanceof Map<?, ?> before)) return false;
+        Map<String, Object> copy = new HashMap<>(staged);
+        yearlySanitizer.apply(copy);
+        Object after = copy.get("OPENALEX");
+        if (java.util.Objects.equals(before, after)) return false;
+        req.setStagedData(copy);
+        syncRepository.save(req);
+        return true;
     }
 
     /** Stamp existing article-tasks (or new ones) with this request id. */
@@ -661,6 +698,8 @@ public class SyncRequestWorkerBridge {
                 ? new HashMap<>(req.getSourceProgress()) : new HashMap<>();
         progress.put("CITATION_REPORT", task.getStatus().name());
         req.setSourceProgress(progress);
+        // The WoS histogram is one of the window inputs — re-evaluate.
+        yearlySanitizer.apply(staged);
         req.setStagedData(staged);
 
         boolean allDone = areAllLinkedTasksDone(reqId);
@@ -1105,6 +1144,12 @@ public class SyncRequestWorkerBridge {
         //    so distinct papers can't be wrongly collapsed. Belt-and-suspenders
         //    on top of the trim-normalized DOI indexing above.
         staged.put("publications", coalesceByDoi(baseline));
+
+        // 5) Clean the OpenAlex per-year histogram against the career window
+        //    derived from the list we just rebuilt (+ Scholar/WoS series).
+        //    Runs on every rebuild because corroboration changes as sources
+        //    land; idempotent (always restarts from yearlyStatsRaw).
+        yearlySanitizer.apply(staged);
     }
 
     /**

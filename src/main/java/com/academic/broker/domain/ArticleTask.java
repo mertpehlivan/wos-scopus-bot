@@ -88,6 +88,22 @@ public class ArticleTask {
     @Column(name = "sync_request_id")
     private UUID syncRequestId;
 
+    /**
+     * Why the task last failed (or was re-queued by the watchdog). Sent by the
+     * worker in the {@code /fail} body; previously discarded, which made stalls
+     * undiagnosable from the DB. Nullable — added column, no backfill.
+     */
+    @Column(name = "error_message", length = 1000)
+    private String errorMessage;
+
+    /** When a worker last claimed the task (PENDING → PROCESSING via poll). */
+    @Column(name = "started_at")
+    private Instant startedAt;
+
+    /** When the task last reached a terminal state (COMPLETED / FAILED). */
+    @Column(name = "finished_at")
+    private Instant finishedAt;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;

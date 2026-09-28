@@ -28,6 +28,11 @@ spring:
 # Timeout: PROCESSING -> PENDING after this many minutes
 broker:
   processing-timeout-minutes: 120
+  # OpenAlex per-year citation cleanup (YearlyStatsSanitizer): off | shadow | on.
+  #   shadow = compute + report only (panel shows what WOULD be removed),
+  #   on     = cleaned series is what gets approved/applied to the tenant.
+  # Needs YEARLY_SANITIZE_MODE passed through the compose `environment:` block.
+  yearly-sanitize-mode: ${YEARLY_SANITIZE_MODE:shadow}
   api-key: ${BROKER_API_KEY:change-me-in-production}
   # URL of the main backend system that receives Citation Report data
   backend-url: ${BACKEND_URL:http://localhost:8080}

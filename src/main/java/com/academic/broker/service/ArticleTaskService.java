@@ -187,6 +187,8 @@ public class ArticleTaskService {
         }
         ArticleTask task = pending.get(0);
         task.setStatus(TaskStatus.PROCESSING);
+        task.setStartedAt(Instant.now());
+        task.setFinishedAt(null);
         task.touch();
         repository.save(task);
         log.info("Task {} polled by extension (source={}, externalId={})", task.getId(), task.getTargetSource(), task.getExternalId());
@@ -218,6 +220,8 @@ public class ArticleTaskService {
         }
         task.setRawData(request.getRawData());
         task.setStatus(TaskStatus.COMPLETED);
+        task.setErrorMessage(null);
+        task.setFinishedAt(Instant.now());
         task.touch();
         repository.save(task);
         log.info("Task {} completed by extension (source={}, externalId={})", taskId, task.getTargetSource(), task.getExternalId());
@@ -263,14 +267,27 @@ public class ArticleTaskService {
      */
     @Transactional
     public void failTask(Long taskId) {
+        failTask(taskId, null);
+    }
+
+    /**
+     * Same as {@link #failTask(Long)} but records the worker-supplied reason
+     * (e.g. "Timeout", "Tab closed unexpectedly") on the task row.
+     */
+    @Transactional
+    public void failTask(Long taskId, String error) {
         ArticleTask task = repository.findByIdForUpdate(taskId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
         if (task.getStatus() != TaskStatus.PROCESSING) {
             throw new TaskNotProcessableException(taskId, task.getStatus(), "fail");
         }
         task.setStatus(TaskStatus.FAILED);
+        task.setErrorMessage(truncateError(error));
+        task.setFinishedAt(Instant.now());
         task.touch();
         repository.save(task);
+        log.info("Task {} failed by extension (source={}, externalId={}): {}",
+                taskId, task.getTargetSource(), task.getExternalId(), task.getErrorMessage());
         if (task.getSyncRequestId() != null) {
             SyncRequestWorkerBridge bridge = syncBridge.getIfAvailable();
             if (bridge != null) bridge.ingestTaskCompletion(task);
@@ -339,14 +356,23 @@ public class ArticleTaskService {
             for (ArticleTask task : stuck) {
                 if (task.getRawData() != null) {
                     task.setStatus(TaskStatus.COMPLETED);
+                    task.setFinishedAt(Instant.now());
                 } else {
                     task.setStatus(TaskStatus.PENDING);
+                    task.setErrorMessage("Watchdog: " + processingTimeoutMinutes
+                            + " dk PROCESSING kaldı, yeniden kuyruğa alındı");
                 }
                 task.touch();
                 repository.save(task);
             }
             log.info("Reset {} stuck PROCESSING task(s) to PENDING", stuck.size());
         }
+    }
+
+    private static String truncateError(String error) {
+        if (error == null || error.isBlank()) return null;
+        String e = error.trim();
+        return e.length() > 1000 ? e.substring(0, 1000) : e;
     }
 
     private ConsumedTaskDto toConsumedDto(ArticleTask t) {
@@ -374,7 +400,10 @@ public class ArticleTaskService {
                         "source", t.getTargetSource().name(),
                         "externalId", t.getExternalId(),
                         "status", t.getStatus().name(),
-                        "updatedAt", t.getUpdatedAt() != null ? t.getUpdatedAt().toString() : ""));
+                        "updatedAt", t.getUpdatedAt() != null ? t.getUpdatedAt().toString() : "",
+                        "startedAt", t.getStartedAt() != null ? t.getStartedAt().toString() : "",
+                        "finishedAt", t.getFinishedAt() != null ? t.getFinishedAt().toString() : "",
+                        "errorMessage", t.getErrorMessage() != null ? t.getErrorMessage() : ""));
     }
 
     /**

@@ -47,6 +47,17 @@
     let forceNavigatedToLogin = false;
     /** Number of times we've tried clicking the in-page Sign In control. */
     let signInClickAttempts = 0;
+    /**
+     * Consecutive polls on which the anonymous signal (free-view banner or
+     * Sign In control) was observed. The new WoS header flashes a Sign In
+     * control for a tick or two during Angular bootstrap even when logged in;
+     * acting on the FIRST sighting bounced healthy data pages to the login →
+     * smart-search. A real anonymous session keeps the signal up permanently,
+     * so requiring it to persist across several polls costs ~6s on genuine
+     * recovery and eliminates the false positives.
+     */
+    let anonSightings = 0;
+    const ANON_SIGHTINGS_REQUIRED = 3;
     /** Max click retries before we give up on the dropdown and jump straight
      *  to the canonical login URL. WoS's new Angular layout sometimes opens
      *  the sign-in dropdown but closes it again before we can click the menu
@@ -54,13 +65,50 @@
      *  navigate to access.clarivate.com/login directly. */
     const MAX_SIGN_IN_CLICK_ATTEMPTS = 2;
 
+    // ── Messaging to background via the ISOLATED-world bridge ──
+    // This script runs in the MAIN world, where chrome.runtime.sendMessage
+    // does not exist. wos_session_bridge.js (ISOLATED, document_start) relays
+    // these postMessage requests to background and posts the response back.
+    const _bridgePending = new Map();
+    let _bridgeSeq = 0;
+    window.addEventListener('message', (event) => {
+        if (event.source !== window) return;
+        const data = event.data;
+        if (!data || data.__wosBridge !== 'res' || typeof data.id !== 'string') return;
+        const resolve = _bridgePending.get(data.id);
+        if (!resolve) return;
+        _bridgePending.delete(data.id);
+        resolve(data.response);
+    });
+
+    /**
+     * Sends {@code msg} to background.js. Resolves with the response, or
+     * {@code undefined} if the bridge doesn't answer within {@code timeoutMs}
+     * (never rejects — callers treat a missing answer as "not delivered").
+     */
+    function bridgeSend(msg, timeoutMs = 5000) {
+        return new Promise((resolve) => {
+            const id = 'wsb-' + Date.now() + '-' + (++_bridgeSeq);
+            const timer = setTimeout(() => {
+                if (_bridgePending.delete(id)) {
+                    console.warn('[WoS Session] Bridge timeout for', msg && msg.type);
+                    resolve(undefined);
+                }
+            }, timeoutMs);
+            _bridgePending.set(id, (response) => { clearTimeout(timer); resolve(response); });
+            try {
+                window.postMessage({ __wosBridge: 'req', id, msg }, window.location.origin);
+            } catch (e) {
+                clearTimeout(timer);
+                _bridgePending.delete(id);
+                resolve(undefined);
+            }
+        });
+    }
+
     /** Best-effort report to background → broker → backend. */
     function reportSession(event, detail) {
-        try {
-            chrome.runtime.sendMessage({ type: 'SESSION_EVENT', source: 'WOS', event, detail });
-        } catch (e) {
-            // Ignore — extension context may be closed
-        }
+        bridgeSend({ type: 'SESSION_EVENT', source: 'WOS', event, detail });
     }
 
     /**
@@ -81,14 +129,36 @@
 
     function hasArticleContent() {
         // Heuristic: if any of these are present, the page is rendering real
-        // content and we shouldn't intervene.
+        // content and we shouldn't intervene. Includes the NEW full-record
+        // layout anchors (confirmed on a live DOM dump: #snMainArticle,
+        // app-full-record, FullRTa-fullRecordtitle-0 — note lowercase 't').
         return !!(
             document.querySelector('[data-ta="record-summary"]')
             || document.querySelector('app-record-content')
             || document.querySelector('app-author-name-link')
             || document.querySelector('app-records-list')
             || document.querySelector('[data-author-metrics-h-index]')
+            || document.querySelector('#snMainArticle')
+            || document.querySelector('app-full-record')
+            || document.querySelector('[id^="FullRTa-fullRecordtitle"]')
+            || document.querySelector('[data-ta="FullRTa-abstract-basic"]')
         );
+    }
+
+    /**
+     * TRUE when the header shows the logged-in account control
+     * (`data-ta="wos-header-user_name"` — "Account options dropdown for user
+     * <name>"). If this is visible the session is DEFINITELY authenticated,
+     * no matter what other heuristics say. Critical guard: the new WoS
+     * Angular header briefly renders a "Sign In" control during bootstrap
+     * even for logged-in users; without this check the handler misread that
+     * flash as an anonymous session and force-navigated data pages to the
+     * Clarivate login, which bounced already-authenticated tabs to the
+     * smart-search home and killed the scrape.
+     */
+    function hasLoggedInHeader() {
+        const el = document.querySelector('[data-ta="wos-header-user_name"]');
+        return !!el && isVisible(el);
     }
 
     /**
@@ -239,7 +309,7 @@
      * already-on-login-page URL would create a redirect loop after
      * successful auth.
      *
-     * <p>Awaitable: sends WOS_SET_RETURN_URL via chrome.runtime.sendMessage
+     * <p>Awaitable: sends WOS_SET_RETURN_URL via the ISOLATED-world bridge
      * and resolves only after the background's storage write returns.
      * Critical because the caller (forceNavigateToLogin) follows up with
      * window.location.href = ... that kills the JS context — without
@@ -257,17 +327,15 @@
         const path = window.location.pathname;
         if (path.startsWith('/login') || path.startsWith('/signin')) return false;
 
-        try {
-            // Await delivery so the storage write completes before the
-            // caller initiates navigation. chrome.runtime.sendMessage
-            // returns a Promise in Manifest V3.
-            await chrome.runtime.sendMessage({ type: 'WOS_SET_RETURN_URL', url });
+        // Await delivery so the storage write completes before the caller
+        // initiates navigation.
+        const resp = await bridgeSend({ type: 'WOS_SET_RETURN_URL', url });
+        if (resp && resp.ok) {
             console.log('[WoS Session] Saved return URL (' + reason + '):', url);
             return true;
-        } catch (e) {
-            console.warn('[WoS Session] Could not save return URL:', e?.message || e);
-            return false;
         }
+        console.warn('[WoS Session] Return URL not saved (' + reason + '):', url, resp && resp.error);
+        return false;
     }
 
     async function forceNavigateToLogin() {
@@ -453,7 +521,7 @@
             }
         }
 
-        console.log(`[WoS Session] ✓ ${fieldName} = "${input.value}"`);
+        console.log(`[WoS Session] ✓ ${fieldName} set (${input.value === value ? 'ok' : 'mismatch'})`);
         return input.value === value;
     }
 
@@ -597,9 +665,10 @@
         await _humanDelay(3000, 5000);
 
         // STEP 3: SUBMIT
-        console.log('[WoS Session] 📤 Submitting form...');
-        console.log(`[WoS Session] Email: "${emailInput.value}"`);
-        console.log(`[WoS Session] Password: "${passwordInput.value}"`);
+        // Never log credential values — this runs in the page's MAIN world,
+        // so its console is readable by the page and any analytics script.
+        console.log('[WoS Session] 📤 Submitting form... (email filled: ' + !!emailInput.value
+            + ', password filled: ' + !!passwordInput.value + ')');
 
         // Persist a "login was just submitted" sentinel BEFORE clicking
         // submit. The form post triggers a redirect chain that kills
@@ -611,11 +680,11 @@
         // Storage survives navigation so the post-login attemptRecovery
         // on the landed-on WoS page picks up the breadcrumb and asks
         // background to fire WOS_LOGIN_SUCCESS.
-        try {
-            await chrome.runtime.sendMessage({ type: 'WOS_SET_LOGIN_PENDING' });
+        const pendingResp = await bridgeSend({ type: 'WOS_SET_LOGIN_PENDING' });
+        if (pendingResp && pendingResp.ok) {
             console.log('[WoS Session] wos_login_pending sentinel set via background');
-        } catch (e) {
-            console.warn('[WoS Session] Could not set login-pending sentinel:', e?.message || e);
+        } else {
+            console.warn('[WoS Session] Could not set login-pending sentinel:', pendingResp && pendingResp.error);
         }
 
         const form = document.querySelector('form[name="loginForm"], form.steam-login-panel');
@@ -665,7 +734,7 @@
             // Only fire on WoS pages — login redirects through Clarivate,
             // and we don't want to ask while still on the auth domain.
             if (!host.includes('webofscience.com')) return false;
-            const resp = await chrome.runtime.sendMessage({ type: 'WOS_CHECK_POST_LOGIN' });
+            const resp = await bridgeSend({ type: 'WOS_CHECK_POST_LOGIN' });
             if (resp?.fired) {
                 console.log('[WoS Session] Post-login breadcrumb consumed by background — login success dispatched');
             }
@@ -691,6 +760,7 @@
             const loginFormVisible = !!document.querySelector('input[name="email"], input[formcontrolname="email"], input#mat-input-1')
             const pendoVisible = !!document.querySelector('[id^="pendo-g-"]')
             const freeViewBanner = hasFreeViewBanner()
+            const loggedInHeader = hasLoggedInHeader()
 
             console.log('[WoS Session] attempt', checkAttempts + 1,
                 'host=', window.location.host,
@@ -718,7 +788,9 @@
             // "no Sign In, no login form, no free-view banner, no
             // Pendo" as proof of an active session.
             const isProbeMode = __PROBE_MODE;
-            const sessionLooksFine = !ctrl && !loginFormVisible && !pendoVisible && !freeViewBanner;
+            // A visible logged-in account control overrides the Sign-In-control
+            // heuristic — the new header can render both during bootstrap.
+            const sessionLooksFine = (!ctrl || loggedInHeader) && !loginFormVisible && !pendoVisible && !freeViewBanner;
             if (sessionLooksFine && (articleVisible || isProbeMode)) {
                 // Stop polling; nothing for us to do here.
                 clearInterval(intervalId);
@@ -729,12 +801,9 @@
                 // the orchestrator can release the WoS phase gate. The
                 // probe tab itself will be closed by background.
                 if (isProbeMode) {
-                    try {
-                        chrome.runtime.sendMessage({ type: 'WOS_SESSION_OK', reason: 'probe-clear' });
-                        console.log('[WoS Session] Probe: WOS_SESSION_OK sent');
-                    } catch (e) {
-                        // Swallow — background will time the probe out.
-                    }
+                    // Fire-and-forget; background times the probe out if lost.
+                    bridgeSend({ type: 'WOS_SESSION_OK', reason: 'probe-clear' });
+                    console.log('[WoS Session] Probe: WOS_SESSION_OK sent');
                 }
                 return false;
             }
@@ -749,6 +818,9 @@
             if (staySignedIn) {
                 console.log('[WoS Session] "Currently Signed In" prompt detected — auto-clicking Stay Signed In');
                 reportSession('STAY_SIGNED_IN_CLICKED', 'access.clarivate.com idle-session interstitial');
+                // Arm the post-login breadcrumb so background returns this tab
+                // to its task page if Clarivate lands it on the search home.
+                await bridgeSend({ type: 'WOS_SET_LOGIN_PENDING' });
                 try { staySignedIn.click(); } catch (e) { /* ignore */ }
                 // Don't return — let the next poll observe the redirect
                 // that follows the click, which lands us on WoS proper.
@@ -763,6 +835,7 @@
             if (continueNewSession) {
                 console.log('[WoS Session] "Session already exists" prompt detected — auto-clicking continue+establish');
                 reportSession('CONTINUE_NEW_SESSION_CLICKED', 'webofknowledge.com session-conflict interstitial');
+                await bridgeSend({ type: 'WOS_SET_LOGIN_PENDING' });
                 try { continueNewSession.click(); } catch (e) { /* ignore */ }
                 return true;
             }
@@ -777,38 +850,45 @@
             if (hasOnboardingProfileRequired()) {
                 clearInterval(intervalId);
                 console.warn('[WoS Session] Onboarding required — WoS is blocking access until a researcher profile is created. Standing down.');
-                try {
-                    chrome.runtime.sendMessage({
-                        type: 'SESSION_EVENT',
-                        source: 'WOS',
-                        event: 'ONBOARDING_REQUIRED',
-                        detail: 'WoS account has no researcher profile; citation report is redirected to onboarding screen',
-                    });
-                } catch (e) {
-                    // Ignore — extension context may be closed
-                }
+                reportSession('ONBOARDING_REQUIRED',
+                    'WoS account has no researcher profile; citation report is redirected to onboarding screen');
                 return false;
             }
 
             // Anonymous mode on a data page → go straight to login.
-            // Trigger conditions (any of):
-            //   • free-view banner is visible (English or Turkish), OR
-            //   • a Sign In control is visible (modern WoS layouts often
-            //     drop the banner but still show Sign In in the header
-            //     when anonymous).
-            // Both reliably mean "we're not logged in and the scrape will
-            // come back partial". The previous code tried to click the
-            // header Sign In button up to 2 times before giving up — but
-            // clicking it on the new Angular layout often opens-and-
-            // closes the dropdown in the same tick, so we'd loop. Direct
-            // navigation to access.clarivate.com/login is deterministic
-            // and the form-fill code there picks up automatically.
-            if ((freeViewBanner || ctrl) && !loginFormVisible && isDataPage()) {
-                const reason = freeViewBanner ? 'free-view banner' : 'Sign In control';
-                console.log('[WoS Session] Anonymous data page detected (' + reason + ') — forcing login URL immediately');
+            //
+            // TRIGGER IS THE FREE-VIEW BANNER ONLY. The old code also treated a
+            // visible "Sign In" control as an anonymous signal — that was the
+            // root cause of the smart-search bounces: the new WoS Angular header
+            // renders a Sign In control for a tick during bootstrap (and keeps
+            // hidden "Sign in" menu items even when logged in), so on a fully
+            // authenticated profile/full-record page findSignInControl() matched,
+            // this branch force-navigated to access.clarivate.com, and — since
+            // we were ALREADY signed in — Clarivate bounced the tab to the
+            // smart-search home, killing the scrape. The free-view banner
+            // ("You are accessing a free view of the Web of Science") is the
+            // only RELIABLE anonymous signal: it appears iff the session is
+            // genuinely anonymous. Genuine expiry is also covered by the
+            // login-form branch below and the background pre-flight session
+            // probe, so dropping the Sign-In-control trigger loses no real
+            // recovery. Guards kept: never act when the logged-in account
+            // control is visible; require the banner to persist a few polls
+            // (defends against any transient render).
+            if (freeViewBanner && !loginFormVisible && !loggedInHeader && isDataPage()) {
+                anonSightings++;
+                if (anonSightings < ANON_SIGHTINGS_REQUIRED) {
+                    console.log('[WoS Session] Free-view banner sighting '
+                        + anonSightings + '/' + ANON_SIGHTINGS_REQUIRED + ' — waiting for it to persist before acting');
+                    return true;
+                }
+                console.log('[WoS Session] Anonymous data page confirmed on ' + anonSightings
+                    + ' consecutive polls (free-view banner) — forcing login URL');
                 await forceNavigateToLogin();
                 return true;
             }
+            // Banner absent → reset streak. (A bare Sign In control is NO LONGER
+            // a trigger — it flashes on logged-in pages and caused false bounces.)
+            anonSightings = 0;
 
             // 1. Dismiss Pendo if present
             const pendoDismissed = await dismissPendoPopup();

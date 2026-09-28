@@ -90,8 +90,12 @@ public class ArticleTaskController {
      * Eklenti: Scrape başarısız; durum FAILED olur.
      */
     @PostMapping(value = "/{taskId}/fail")
-    public ResponseEntity<Void> failTask(@PathVariable Long taskId) {
-        taskService.failTask(taskId);
+    public ResponseEntity<Void> failTask(
+            @PathVariable Long taskId,
+            @RequestBody(required = false) Map<String, Object> body) {
+        // The extension sends {"error": "<reason>"}; older callers send no body.
+        Object error = body == null ? null : body.get("error");
+        taskService.failTask(taskId, error == null ? null : String.valueOf(error));
         return ResponseEntity.ok().build();
     }
 

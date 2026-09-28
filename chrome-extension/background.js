@@ -511,25 +511,67 @@ async function postSessionEvent(source, event, detail) {
  * @param {number} tabId   the tab to navigate
  * @param {string} [tabUrl] the tab's current URL (best-effort fallback)
  */
+// ── Tab-scoped login breadcrumbs ────────────────────────────────────────
+// The return URL and the "login just submitted" sentinel used to be single
+// GLOBAL keys, so whichever WoS tab asked first consumed another tab's
+// breadcrumb — e.g. the pre-flight probe's basic-search URL got applied to
+// the author-profile tab, which then sat on the search page for 60 minutes.
+// Login happens inside the same tab (task tab → access.clarivate.com → back),
+// so keying by tab id is exact.
+function wosReturnUrlKey(tabId) { return `wos_return_url:${tabId}`; }
+function wosLoginPendingKey(tabId) { return `wos_login_pending:${tabId}`; }
+
+/**
+ * WoS pages that never carry scrape data: site root, /wos, the smart/basic
+ * search pages and home/welcome. A task tab landing here after login is lost.
+ */
+function isWosSearchOrHomeUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    if (!/(^|\.)webofscience\.com$/i.test(u.hostname)) return false;
+    const p = u.pathname.replace(/\/+$/, '');
+    return p === ''
+      || /^\/wos(\/(woscc|alldb))?(\/(smart-search|basic-search|home|welcome)(\/.*)?)?$/i.test(p);
+  } catch (_) {
+    return false;
+  }
+}
+
+/** A URL we are willing to navigate a tab back to after login. */
+function isAcceptableWosReturnUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:') return false;
+    if (!/(^|\.)webofscience\.com$/i.test(u.hostname)) return false;
+    return !isWosSearchOrHomeUrl(url);
+  } catch (_) {
+    return false;
+  }
+}
+
+function urlPathOf(url) {
+  try { const u = new URL(url); return u.host + u.pathname.replace(/\/+$/, ''); } catch (_) { return null; }
+}
+
 async function handleWosLoginSuccess(tabId, tabUrl) {
   if (tabId == null) return;
   const entry = pendingTabs.get(tabId);
 
-  // Priority 1: the URL the user was on when login was triggered. The
-  // session handler now saves this on every sign-in path (button,
-  // dropdown, force-navigate), so it should virtually always be set.
-  // Also consume the wos_login_pending breadcrumb so a double-fire
-  // (pre-nav best-effort + post-nav storage trigger) doesn't navigate
-  // twice. Both flags survive the form-submit redirect; first
-  // consumer wins.
+  // Priority 1: the URL this tab was on when login was triggered (saved by
+  // the session handler via the bridge). Consume both breadcrumbs so a
+  // double delivery doesn't navigate twice; first consumer wins.
   let returnUrl = null;
   let hadAnyFlag = false;
+  const urlKey = wosReturnUrlKey(tabId);
+  const pendingKey = wosLoginPendingKey(tabId);
   try {
-    const stored = await chrome.storage.session.get(['wos_return_url', 'wos_login_pending']);
-    returnUrl = stored.wos_return_url || null;
+    const stored = await chrome.storage.session.get([urlKey, pendingKey]);
+    returnUrl = stored[urlKey] || null;
     const toRemove = [];
-    if (stored.wos_return_url != null) toRemove.push('wos_return_url');
-    if (stored.wos_login_pending != null) toRemove.push('wos_login_pending');
+    if (stored[urlKey] != null) toRemove.push(urlKey);
+    if (stored[pendingKey] != null) toRemove.push(pendingKey);
     hadAnyFlag = toRemove.length > 0;
     if (toRemove.length > 0) {
       await chrome.storage.session.remove(toRemove);
@@ -544,19 +586,31 @@ async function handleWosLoginSuccess(tabId, tabUrl) {
     return;
   }
 
-  // Priority 2: derive from pendingTabs entry. SAFE only when the task
-  // is an author-profile scrape (FULL_SCRAPE on /wos/author/record/).
-  // For article-detail / citation-report tasks the externalId is a DOI
-  // or article id and the wos/author/record/<id> URL would be wrong.
+  // The pre-flight probe and non-bot tabs just needed the session; never
+  // navigate them anywhere.
+  const isBotTaskTab = !!entry || pendingCitationReportTabs.has(tabId);
+  if (tabId === wosSession.pendingProbeTabId || !isBotTaskTab) {
+    console.log(`[WoS Session] Login success on non-task tab #${tabId} — no navigation needed`);
+    return;
+  }
+
+  if (returnUrl && !isAcceptableWosReturnUrl(returnUrl)) {
+    console.warn('[WoS Session] Discarding unusable return URL:', returnUrl);
+    returnUrl = null;
+  }
+
+  // Priority 2: rebuild the author-profile URL from the pendingTabs entry.
+  // SAFE only for author-profile tasks — for detail / citation-report tabs
+  // the externalId isn't a WoS author id.
   let retryUrl = returnUrl;
-  if (!retryUrl && entry?.externalId && entry?.source === 'WOS' &&
-      (entry.taskType === 'FULL_SCRAPE' || !entry.taskType)) {
+  if (!retryUrl && entry?.externalId && entry?.source === 'WOS' && entry.type !== 'DETAIL') {
     const baseUrl = `https://www.webofscience.com/wos/author/record/${encodeURIComponent(entry.externalId)}`;
     retryUrl = `${baseUrl}#wos-task-id=${entry.taskId}`;
   }
 
-  // Priority 3: whatever URL the tab is currently on. Last-ditch.
-  if (!retryUrl) retryUrl = tabUrl;
+  // Priority 3: whatever URL the tab is currently on — only if it is a real
+  // data page (never the search page the login chain dumped us on).
+  if (!retryUrl && isAcceptableWosReturnUrl(tabUrl)) retryUrl = tabUrl;
 
   // Sanity: never navigate back to a login URL (would loop).
   if (retryUrl && (retryUrl.includes('access.clarivate.com')
@@ -564,6 +618,13 @@ async function handleWosLoginSuccess(tabId, tabUrl) {
           || retryUrl.includes('/signin'))) {
     console.warn('[WoS Session] retryUrl looks like a login page, skipping navigation:', retryUrl);
     retryUrl = null;
+  }
+
+  // Already on the target page (e.g. Clarivate returned us straight to it):
+  // no extra navigation — WoS request volume is the scarce resource.
+  if (retryUrl && tabUrl && urlPathOf(retryUrl) === urlPathOf(tabUrl)) {
+    console.log(`[WoS Session] Tab #${tabId} already on its task page after login — no navigation`);
+    return;
   }
 
   // Always re-stamp the task-id hash. The saved returnUrl (Priority 1)
@@ -591,9 +652,13 @@ async function handleWosLoginSuccess(tabId, tabUrl) {
 
   console.log(`[WoS Session] Login success on tab #${tabId}, navigating to: ${retryUrl}`);
   addLog('WoS session restored, retrying scrape on original URL', 'success');
-  if (entry) {
+  if (entry && entry.type !== 'DETAIL') {
     entry.readyAt = null; // allow next SCRAPE_READY from reloaded content.js
     resetScrapeTimeout(tabId); // extend the overall task timeout
+    // The original 3-min pre-ready timer is one-shot and long spent; without
+    // re-arming it a tab whose content script never loads waits the full
+    // 60-min scrape timeout.
+    armPreReadyTimeout(tabId);
   }
 
   try {
@@ -745,7 +810,8 @@ async function cleanupOnStartup(reason) {
     const keysToRemove = Object.keys(all).filter(k =>
       /^\d+$/.test(k)                   // numeric tab-id keys
       || k.startsWith('scopus_recovery_') // recovery counters
-      || k === 'wos_return_url');
+      || k.startsWith('wos_return_url')   // tab-scoped login breadcrumbs
+      || k.startsWith('wos_login_pending'));
     if (keysToRemove.length > 0) {
       await chrome.storage.session.remove(keysToRemove);
       console.log(`[Startup] Cleared ${keysToRemove.length} stale session keys`);
@@ -1441,6 +1507,8 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   }
 
   clearPendingTab(tabId);
+  clearSearchPageTimer(tabId);
+  chrome.storage.session.remove([wosReturnUrlKey(tabId), wosLoginPendingKey(tabId)]).catch(() => { });
   pendingPlumx.delete(tabId);
   pendingWosDoiTabs.delete(tabId);
   pendingScholarDoiTabs.delete(tabId);
@@ -1491,6 +1559,54 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['scholar_content.js'] });
   } catch (err) {
     console.warn('[WoS Worker] Failed to inject scholar_content.js:', err);
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  DETAIL-TAB BOUNCE WATCHDOG  (auto-close + continue)
+// ═══════════════════════════════════════════════
+// A detail tab opened on a /full-record/ URL sometimes gets navigated away by
+// WoS (stale/anonymous session → Clarivate → smart-search home, or the legacy
+// webofknowledge gateway → NXDOMAIN). article_detail.js only runs on
+// full-record pages, so nothing reports back and the SERIAL detail pool stalls
+// on that tab forever — the operator had to close the tab by hand, after which
+// tabs.onRemoved refills the pool and scraping continues. This automates that
+// manual close: detect the navigation, close the tab (onRemoved does the
+// refill), and requeue the article ONCE so its detail data isn't silently lost.
+// Nothing here NAVIGATES — it only closes a tab that already bounced.
+const bouncedDetailTabs = new Set(); // dedup: onUpdated fires several times per bounce
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const url = changeInfo.url || (changeInfo.status === 'loading' && tab ? (tab.pendingUrl || tab.url) : null);
+  if (!url) return;
+  const isBounce =
+    /webofknowledge\.com/i.test(url) ||
+    /\/wos\/(woscc|alldb)\/(smart|basic)-search/i.test(url) ||
+    /^chrome-error:/i.test(url);
+  if (!isBounce) return;
+  if (bouncedDetailTabs.has(tabId)) return;
+
+  for (const [taskId, job] of detailJobs.entries()) {
+    if (!job.activeTabIds.has(tabId)) continue;
+    bouncedDetailTabs.add(tabId);
+    setTimeout(() => bouncedDetailTabs.delete(tabId), 30000);
+
+    const assignedUrl = job.tabToUrlMap.get(tabId);
+    console.warn(`[WoS Detail] Tab #${tabId} bounced off full-record (${url}) — auto-closing to continue.`);
+    addLog('WoS detay sekmesi arama sayfasına yönlendirildi — otomatik kapatılıp sıradakine geçiliyor', 'warning');
+
+    // Requeue the article once so its detail data gets another attempt.
+    if (!job.retriedUrls) job.retriedUrls = new Set();
+    const base = assignedUrl ? assignedUrl.split('#')[0] : null;
+    if (base && !job.retriedUrls.has(base)) {
+      job.retriedUrls.add(base);
+      job.queue.push(assignedUrl);
+    }
+
+    // Closing fires tabs.onRemoved, which deletes the tab from the job and
+    // calls fillDetailTabPool — exactly what the manual close did.
+    chrome.tabs.remove(tabId).catch(() => { });
+    return;
   }
 });
 
@@ -2191,22 +2307,34 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
   }, SCRAPE_TIMEOUT_MS);
   scrapeTimeouts.set(tabId, timeoutId);
 
-  // Pre-ready timeout: if SCRAPE_READY is not received within 60s, fail gracefully
+  armPreReadyTimeout(tabId);
+}
+
+/**
+ * Pre-ready timeout: if SCRAPE_READY is not received within
+ * PRE_READY_TIMEOUT_MS, fail the task and close the tab. Re-armable — each
+ * call supersedes the previous timer (token check), so it can be restarted
+ * after a login round-trip resets {@code readyAt}.
+ */
+function armPreReadyTimeout(tabId) {
+  const armed = pendingTabs.get(tabId);
+  if (!armed) return;
+  const token = (armed.preReadyToken || 0) + 1;
+  armed.preReadyToken = token;
   setTimeout(async () => {
     const entry = pendingTabs.get(tabId);
-    if (entry && !entry.readyAt) {
-      console.warn(`[WoS Worker] Tab #${tabId} never sent SCRAPE_READY within ${PRE_READY_TIMEOUT_MS / 1000}s. Failing task.`);
-      addLog(`${source} tab never became ready — marking as NOT_FOUND`, 'warning');
-      try {
-        const h = await brokerHeaders();
-        await fetch(`${API_BASE}/api/tasks/${entry.taskId}/fail`, {
-          method: 'POST', headers: h,
-          body: JSON.stringify({ error: 'Content script never loaded (pre-ready timeout)' }),
-        });
-      } catch (_) { }
-      clearPendingTab(tabId);
-      try { await chrome.tabs.remove(tabId); } catch (_) { }
-    }
+    if (!entry || entry.preReadyToken !== token || entry.readyAt) return;
+    console.warn(`[WoS Worker] Tab #${tabId} never sent SCRAPE_READY within ${PRE_READY_TIMEOUT_MS / 1000}s. Failing task.`);
+    addLog(`${entry.source} tab never became ready — marking as NOT_FOUND`, 'warning');
+    try {
+      const h = await brokerHeaders();
+      await fetch(`${API_BASE}/api/tasks/${entry.taskId}/fail`, {
+        method: 'POST', headers: h,
+        body: JSON.stringify({ error: 'Content script never loaded (pre-ready timeout)' }),
+      });
+    } catch (_) { }
+    clearPendingTab(tabId);
+    try { await chrome.tabs.remove(tabId); } catch (_) { }
   }, PRE_READY_TIMEOUT_MS);
 }
 
@@ -2259,13 +2387,15 @@ function markSourceComplete(source, failed = false) {
   updateSyncProgress(source, failed ? 'FAILED' : 'COMPLETED');
 }
 
-async function handleTaskTimeout(tabId) {
+async function handleTaskTimeout(tabId, reason = 'Timeout') {
   const entry = pendingTabs.get(tabId);
   if (!entry) return;
   const { taskId } = entry;
 
-  console.error(`[WoS Worker] Task ID: ${taskId} zaman aşımı.`);
-  addLog(`Task timed out after ${SCRAPE_TIMEOUT_MS/60000} min of inactivity`, 'error');
+  console.error(`[WoS Worker] Task ID: ${taskId} sonlandırıldı: ${reason}`);
+  addLog(reason === 'Timeout'
+    ? `Task timed out after ${SCRAPE_TIMEOUT_MS/60000} min of inactivity`
+    : `Task ${taskId} failed: ${reason}`, 'error');
   updateState({ status: 'TIMEOUT' });
   scrapeTimeouts.delete(tabId);
   clearPendingTab(tabId);
@@ -2285,12 +2415,62 @@ async function handleTaskTimeout(tabId) {
     const h = await brokerHeaders();
     await fetch(`${API_BASE}/api/tasks/${taskId}/fail`, {
       method: 'POST', headers: h,
-      body: JSON.stringify({ error: 'Timeout' }),
+      body: JSON.stringify({ error: reason }),
     });
   } catch (e) { }
 
   try { await chrome.tabs.remove(tabId); } catch (_) { }
 }
+
+// ═══════════════════════════════════════════════
+//  PROFILE-TAB SEARCH-PAGE WATCHDOG
+// ═══════════════════════════════════════════════
+// A WoS author-profile task tab must be on /wos/author/record/…. If WoS (or
+// the Clarivate login chain) drops it on the search/home page, content.js
+// never runs there and the task used to hang until the 60-minute scrape
+// timeout — blocking the whole serial queue. Give the post-login return
+// navigation a short grace period, then fail fast and close the tab so the
+// orchestrator moves on. Navigation-free: we only close a tab that already
+// went astray (never reload/redirect into the Clarivate session).
+const SEARCH_PAGE_GRACE_MS = 20_000;
+const searchPageTimers = new Map(); // tabId → timeoutId
+
+function clearSearchPageTimer(tabId) {
+  const t = searchPageTimers.get(tabId);
+  if (t != null) {
+    clearTimeout(t);
+    searchPageTimers.delete(tabId);
+  }
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const url = changeInfo.url || (changeInfo.status === 'complete' ? tab?.url : null);
+  if (!url) return;
+  const entry = pendingTabs.get(tabId);
+  if (!entry || entry.source !== 'WOS' || entry.type === 'DETAIL') return;
+
+  if (!isWosSearchOrHomeUrl(url)) {
+    // Back on a real page (or mid-login on clarivate.com) — stand down.
+    clearSearchPageTimer(tabId);
+    return;
+  }
+  if (searchPageTimers.has(tabId)) return;
+
+  const taskId = entry.taskId;
+  console.warn(`[WoS Worker] Profile tab #${tabId} (task ${taskId}) is on a search/home page: ${url}`);
+  const timer = setTimeout(async () => {
+    searchPageTimers.delete(tabId);
+    const current = pendingTabs.get(tabId);
+    if (!current || current.taskId !== taskId) return;
+    let nowUrl = null;
+    try { nowUrl = (await chrome.tabs.get(tabId))?.url; } catch (_) { return; }
+    if (!isWosSearchOrHomeUrl(nowUrl)) return;
+    addLog('WoS profil sekmesi arama sayfasında kaldı — görev hızlıca sonlandırılıyor, sıradakine geçiliyor', 'warning');
+    await handleTaskTimeout(tabId,
+      'WoS arama sayfasına yönlendirildi (giriş sonrası görev sayfasına dönülemedi)');
+  }, SEARCH_PAGE_GRACE_MS);
+  searchPageTimers.set(tabId, timer);
+});
 
 // ═══════════════════════════════════════════════
 //  EXTENSION ICON CLICK -> OPEN FULL PAGE UI
@@ -2509,8 +2689,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // ── WoS return-URL persistence (storage.session not always usable from MAIN world) ──
   if (msg.type === 'WOS_SET_RETURN_URL') {
     // Awaitable so the caller (forceNavigateToLogin) can rely on the
-    // write completing before triggering navigation.
-    chrome.storage.session.set({ wos_return_url: msg.url || '' })
+    // write completing before triggering navigation. Tab-scoped, and only
+    // real WoS data pages are accepted: the message arrives via a page-world
+    // bridge, and a search/home URL here is exactly the "stuck on the search
+    // page" bug.
+    const tabId = sender.tab?.id;
+    if (tabId == null || tabId === wosSession.pendingProbeTabId || !isAcceptableWosReturnUrl(msg.url)) {
+      sendResponse({ ok: false, error: 'return URL rejected' });
+      return true;
+    }
+    chrome.storage.session.set({ [wosReturnUrlKey(tabId)]: msg.url })
       .then(() => sendResponse({ ok: true }))
       .catch(e => {
         console.warn('[WoS Session] Failed to set return URL:', e?.message || e);
@@ -2526,7 +2714,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // session_handler runs in MAIN world and can't touch chrome.storage
   // directly — all storage I/O happens here.
   if (msg.type === 'WOS_SET_LOGIN_PENDING') {
-    chrome.storage.session.set({ wos_login_pending: Date.now() })
+    const tabId = sender.tab?.id;
+    if (tabId == null) {
+      sendResponse({ ok: false, error: 'no sender tab' });
+      return true;
+    }
+    chrome.storage.session.set({ [wosLoginPendingKey(tabId)]: Date.now() })
       .then(() => sendResponse({ ok: true }))
       .catch(e => {
         console.warn('[WoS Session] Failed to set login-pending:', e?.message || e);
@@ -2544,14 +2737,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const tabId = sender.tab?.id;
         const tabUrl = sender.tab?.url;
-        const stored = await chrome.storage.session.get(['wos_login_pending']);
-        const ts = stored.wos_login_pending;
+        if (tabId == null) {
+          sendResponse({ fired: false, reason: 'no sender tab' });
+          return;
+        }
+        const pendingKey = wosLoginPendingKey(tabId);
+        const stored = await chrome.storage.session.get([pendingKey]);
+        const ts = stored[pendingKey];
         if (!ts) {
           sendResponse({ fired: false, reason: 'no flag' });
           return;
         }
         if (Date.now() - ts > 5 * 60 * 1000) {
-          await chrome.storage.session.remove(['wos_login_pending']);
+          await chrome.storage.session.remove([pendingKey, wosReturnUrlKey(tabId)]);
           sendResponse({ fired: false, reason: 'stale' });
           return;
         }
@@ -2559,6 +2757,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // helper so navigation / dedup / hash-restamp is identical
         // to the WOS_LOGIN_SUCCESS message path.
         postSessionEvent('WOS', 'LOGIN_SUCCESS', 'post-login breadcrumb consumed');
+        // Landing back on webofscience.com after a submitted login = the
+        // session is live. If the pre-flight probe drove this login, release
+        // the WoS phase gate now instead of waiting for its DOM poll.
+        if (tabId === wosSession.pendingProbeTabId && wosSession.pendingResolve) {
+          finishWosProbe(true);
+        } else {
+          wosSession.status = 'authenticated';
+          wosSession.lastVerifiedAt = Date.now();
+        }
         await handleWosLoginSuccess(tabId, tabUrl);
         sendResponse({ fired: true, tabId });
       } catch (e) {
@@ -3175,7 +3382,12 @@ async function finalizeAndComplete(taskId) {
     if (detail?.authors) {
       authors = detail.authors;
     }
-    const authorsList = authors.split(/[;,]/).map(a => a.trim()).filter(a => a);
+    // Split on ';' ONLY. Detail/DOI scrapers join authors with '; ' where each
+    // entry is "Lastname, Firstname" (article_detail.js / wos_doi_content.js).
+    // Splitting on ',' too would shatter every "Lastname, Firstname" pair into
+    // two bogus authors (the historical author-name-split bug). The comma is an
+    // intra-name separator here, never an author separator.
+    const authorsList = authors.split(';').map(a => a.trim()).filter(a => a);
 
     return {
       ...article,
