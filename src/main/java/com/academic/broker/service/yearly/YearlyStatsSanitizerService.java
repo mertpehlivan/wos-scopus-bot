@@ -1,6 +1,7 @@
 package com.academic.broker.service.yearly;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -44,6 +45,8 @@ public class YearlyStatsSanitizerService {
     private final Mode mode;
     private final Clock clock;
 
+    // Two constructors (this + the test one) → Spring needs to be told which to use.
+    @Autowired
     public YearlyStatsSanitizerService(@Value("${broker.yearly-sanitize-mode:shadow}") String mode) {
         this(parseMode(mode), Clock.systemUTC());
     }
