@@ -85,8 +85,48 @@ function getText(selector, root = document) {
     return root.querySelector(selector)?.textContent?.trim() || '';
 }
 
+/**
+ * Synthetic click that can NEVER navigate the tab. The JCR link (and some
+ * expand buttons) are real <a href="..."> anchors — a plain dispatched click
+ * lets the default action follow the href, which yanks the tab off the
+ * full-record page (→ smart-search landing / legacy webofknowledge gateway)
+ * before the Q value is ever read. preventDefault() from our temp listener
+ * cancels that default action while the app's own click handlers (which open
+ * the sidenav / expand the section) still run normally.
+ */
+function safeClick(el) {
+    const guard = (e) => { e.preventDefault(); };
+    el.addEventListener('click', guard);
+    try {
+        el.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true }));
+    } finally {
+        el.removeEventListener('click', guard);
+    }
+}
+
+// ── Wait for the Pendo resource-center badge ──────────────────────────────────
+// The purple Pendo badge (img id="pendo-image-badge-…", class
+// _pendo-badge-image) is injected by WoS's analytics layer AFTER the Angular
+// app has fully rendered the record — it is the most reliable "page is
+// completely loaded" signal on the full-record page. Wait for it, THEN scrape
+// (Q value via JCR sidenav etc.). The id suffix is dynamic, so match by
+// prefix/class. Bounded: if the badge never appears (blocked, slow network),
+// proceed anyway so one page can't hang the serial detail pool.
+const PENDO_BADGE_SELECTOR =
+    'img[id^="pendo-image-badge"], img._pendo-badge-image, ._pendo-resource-center-badge-image';
+const PENDO_WAIT_TIMEOUT_MS = 30000;
+
+function pendoBadgeVisible() {
+    const el = document.querySelector(PENDO_BADGE_SELECTOR);
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+}
+
 async function waitForDetailLoad() {
-    let spinnerFound = false;
+    const deadline = Date.now() + PENDO_WAIT_TIMEOUT_MS;
+
+    // 1. Wait out any visible loading spinner (bounded by the same deadline).
     for (let i = 0; i < 30; i++) {
         const spinner = document.querySelector('.spinner-lightbox, .cdx-spinner, mat-spinner');
         if (!spinner) break;
@@ -94,10 +134,24 @@ async function waitForDetailLoad() {
         const s = window.getComputedStyle(spinner);
         if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') break;
 
-        spinnerFound = true;
         await _humanDelay(400, 700);
+        if (Date.now() >= deadline) break;
     }
-    await _humanDelay(spinnerFound ? 800 : 200, spinnerFound ? 1500 : 500);
+
+    // 2. Wait for the Pendo badge — the last element WoS renders.
+    let badgeSeen = false;
+    while (Date.now() < deadline) {
+        if (pendoBadgeVisible()) { badgeSeen = true; break; }
+        await _humanDelay(300, 600);
+    }
+    if (badgeSeen) {
+        console.log('[WoS Detail] Pendo rozeti görüldü — sayfa tam yüklü, scrape başlıyor.');
+    } else {
+        console.warn(`[WoS Detail] Pendo rozeti ${PENDO_WAIT_TIMEOUT_MS / 1000}s içinde görünmedi — yine de devam ediliyor.`);
+    }
+
+    // 3. Short settle so late-mounting fields (JCR link) attach after the badge.
+    await _humanDelay(600, 1200);
 }
 
 // ── Click "See more data fields" to reveal hidden section ─────────────────────
@@ -109,7 +163,7 @@ async function openHiddenSection() {
     if (style.display === 'none') return false;
 
     await _humanDelay(200, 500);
-    btn.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true }));
+    safeClick(btn);
     await _humanDelay(600, 1200);
     return true;
 }
@@ -132,7 +186,7 @@ async function expandAbstract() {
         const btn = document.querySelector(sel);
         if (btn && window.getComputedStyle(btn).display !== 'none') {
             await _humanDelay(200, 500);
-            btn.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true }));
+            safeClick(btn);
             await _humanDelay(500, 1000);
             return true;
         }
@@ -148,7 +202,7 @@ async function expandAbstract() {
                 panel.getAttribute('aria-expanded') === 'true';
             if (!isExpanded) {
                 await _humanDelay(200, 500);
-                header.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true }));
+                safeClick(header);
                 await _humanDelay(600, 1200);
             }
             return true;
@@ -157,34 +211,39 @@ async function expandAbstract() {
     return false;
 }
 
-// ── Open JCR Sidenav ──────────────────────────────────────────────────────────
+// ── JCR/JCI data access ───────────────────────────────────────────────────────
+// KEY FACT (confirmed on a live full-record DOM dump): current WoS PRE-RENDERS
+// the whole JCR/JCI sidenav content into the DOM at page load — hidden with
+// visibility:hidden, but fully populated (Sidenav-N-JCR-quartile_0 = "Q1",
+// category name, edition, JCI values). textContent of hidden elements is
+// perfectly readable, so NO interaction is needed at all. Clicking the
+// "View Journal Impact" link is BANNED anyway: its handler does a JS-side
+// router navigation that yanks the tab to smart-search (preventDefault can't
+// stop it — tested live).
+//
+// The sidenav is duplicated several times per page (Sidenav-0 in the source
+// row, Sidenav-1/3 in the journal-info card). Find whichever instance has
+// data instead of hard-coding Sidenav-0.
+function findSidenavPrefix() {
+    for (const p of ['Sidenav-0', 'Sidenav-1', 'Sidenav-2', 'Sidenav-3']) {
+        if (document.querySelector(
+            `[data-ta^="${p}-JCR-quartile"], [data-ta="${p}-JCR-category-name_0"], [data-ta^="${p}-JCI-value"]`
+        )) return p;
+    }
+    return null;
+}
+
 async function openJcrSidenav() {
-    const btn = document.querySelector('[data-ta="jcr-link"]');
-    if (!btn) return false;
-
-    await _humanDelay(300, 800);
-
-    const originalHref = btn.getAttribute('href');
-    if (originalHref && originalHref.startsWith('javascript:')) {
-        btn.removeAttribute('href');
-    }
-
-    const clickEvent = new MouseEvent('click', { view: window, bubbles: true, cancelable: true });
-    btn.dispatchEvent(clickEvent);
-
-    if (originalHref) {
-        btn.setAttribute('href', originalHref);
-    }
-
-    for (let i = 0; i < 20; i++) {
-        await _humanDelay(150, 350);
-        const sidenav = document.querySelector('mat-sidenav.jcr-sidenav');
-        if (sidenav && window.getComputedStyle(sidenav).visibility !== 'hidden') {
-            await _humanDelay(400, 900);
+    // Poll briefly for the pre-rendered sidenav data (it mounts with the rest
+    // of the Angular page; usually already there by the time we run).
+    for (let i = 0; i < 10; i++) {
+        if (findSidenavPrefix()) {
+            console.log('[WoS Detail] JCR/JCI verisi DOM\'da hazır (' + findSidenavPrefix() + ') — tıklamasız okunuyor.');
             return true;
         }
+        await _humanDelay(300, 500);
     }
-
+    console.log('[WoS Detail] JCR/JCI verisi DOM\'da bulunamadı — Q değeri atlanıyor (tıklama yasak).');
     return false;
 }
 
@@ -371,29 +430,58 @@ function extractWoSId() {
     return null;
 }
 
-// ── Extract Times Cited (GÜNCEL) ──────────────────────────────────────────────
-function extractTimesCited() {
-    // Güncel WoS Times Cited selector (gönderilen HTML'den)
-    const timesCitedSelectors = [
-        '#FullRRPTa-wos-citation-network-times-cited-count-link-1',
-        '[id^="FullRRPTa-wos-citation-network-times-cited-count-link"]',
-        '[data-ta^="FullRRPTa-wos-citation-network-times-cited"]',
-        '[data-ta="FullRRPTa-citationsLabelPluralNoLink-0"]',
-        '[data-ta="FullRRPTa-citationCountLinkValue"]',
-        '.times-cited-count',
-        '.citation-count-number',
-    ];
+// ── Extract Times Cited (WoS Core Collection) ─────────────────────────────────
+// Confirmed on a live DOM dump: the Citation Network section carries several
+// times-cited links whose id/data-ta ENDS IN THE COUNT VALUE, e.g.
+//   id="FullRRPTa-wos-citation-network-times-cited-count-link-20"  (WoS Core, href /woscc/citing-summary/) → "20"
+//   id="FullRRPTa-wos-citation-network-times-cited-count-link-ALLDB" (All DBs, /alldb/citing-summary/) → "29"
+//   ...-link-PQDT / -RC etc. (per-database, smaller numbers)
+// The old code relied on DOM order of a prefix match, which is fragile and
+// silently returned 0 when the section had not rendered. We now deterministically
+// pick the WoS Core count (the number the operator panel shows as "WoS"),
+// preferring the link whose href targets /woscc/citing-summary/, then the WOSCC
+// id, then any of these links, then All-DB.
+function _parseCitLink(el) {
+    if (!el) return NaN;
+    const txt = (el.textContent || '').replace(/[^\d]/g, '');
+    return txt ? parseInt(txt, 10) : NaN;
+}
 
-    for (const sel of timesCitedSelectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-            const txt = el.textContent.trim().replace(/,/g, '');
-            const count = parseInt(txt, 10);
-            if (!isNaN(count) && count >= 0) return count;
+function extractTimesCited() {
+    const links = Array.from(document.querySelectorAll(
+        '[id^="FullRRPTa-wos-citation-network-times-cited-count-link"], ' +
+        '[data-ta^="FullRRPTa-wos-citation-network-times-cited-count-link"]'
+    ));
+
+    // 1. WoS Core Collection — href points at /woscc/citing-summary/.
+    for (const el of links) {
+        const href = el.getAttribute('href') || el.querySelector('a')?.getAttribute('href') || '';
+        if (/\/woscc\/citing-summary\//i.test(href)) {
+            const n = _parseCitLink(el);
+            if (!isNaN(n)) return n;
         }
     }
+    // 2. Explicit WOSCC id (hidden duplicate link).
+    const wosccById = document.querySelector('[id$="times-cited-count-link-WOSCC"], [data-ta$="times-cited-count-link-WOSCC"]');
+    const nWoscc = _parseCitLink(wosccById);
+    if (!isNaN(nWoscc)) return nWoscc;
+    // 3. First visible citation-network link that isn't an All-DB/per-DB roll-up.
+    for (const el of links) {
+        const key = (el.id || el.getAttribute('data-ta') || '');
+        if (/-link-(ALLDB|PQDT|RC|ARCI|BCI|CSCD|DRCI|RSCI|SCIELO|DIIDW|PCI)$/i.test(key)) continue;
+        const n = _parseCitLink(el);
+        if (!isNaN(n)) return n;
+    }
+    // 4. All-DB link as last resort (better than 0).
+    const alldb = document.querySelector('[id$="times-cited-count-link-ALLDB"], [data-ta$="times-cited-count-link-ALLDB"]');
+    const nAll = _parseCitLink(alldb);
+    if (!isNaN(nAll)) return nAll;
 
-    // Fallback: metin içinden ara
+    // 5. Legacy selectors + text fallback.
+    for (const sel of ['[data-ta="FullRRPTa-citationsLabelPluralNoLink-0"]', '.times-cited-count', '.citation-count-number']) {
+        const n = _parseCitLink(document.querySelector(sel));
+        if (!isNaN(n)) return n;
+    }
     const bodyText = document.body.innerText || '';
     const m = bodyText.match(/times?\s*cited[^:\d]*:?\s*([\d,]+)/i);
     return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0;
@@ -408,11 +496,14 @@ function extractJcrValues() {
         jcrYear: null,
     };
 
+    // Which pre-rendered sidenav instance carries the data (Sidenav-0/1/3).
+    const P = findSidenavPrefix() || 'Sidenav-0';
+
     // Quartile - güncel selector
     const quartileSelectors = [
-        '[data-ta^="Sidenav-0-JCR-quartile"]',
-        '[id^="Sidenav-0-JCR-quartile"]',
-        '#Sidenav-0-JCR-quartile_0',
+        `[data-ta^="${P}-JCR-quartile"]`,
+        `[id^="${P}-JCR-quartile"]`,
+        `#${P}-JCR-quartile_0`,
         '.jcr-quartile',
         '[class*="quartile-badge"]',
     ];
@@ -430,9 +521,9 @@ function extractJcrValues() {
 
     // Journal Impact Factor (JIF) - güncel selector
     const jifSelectors = [
-        '#Sidenav-0-JCR-value',
-        '[id^="Sidenav-0-JCR-value"]',
-        '[data-ta^="Sidenav-0-JCR-value"]',
+        `#${P}-JCR-value`,
+        `[id^="${P}-JCR-value"]`,
+        `[data-ta^="${P}-JCR-value"]`,
         '.jif-value',
         '.impact-factor-value',
         '[data-ta*="JIF-value"]',
@@ -452,9 +543,9 @@ function extractJcrValues() {
 
     // Journal Citation Indicator (JCI) - güncel selector
     const jciSelectors = [
-        '#Sidenav-0-JCI-value',
-        '[id^="Sidenav-0-JCI-value"]',
-        '[data-ta^="Sidenav-0-JCI-value"]',
+        `#${P}-JCI-value`,
+        `[id^="${P}-JCI-value"]`,
+        `[data-ta^="${P}-JCI-value"]`,
         '.jci-value',
         '[data-ta*="JCI-value"]',
     ];
@@ -473,8 +564,8 @@ function extractJcrValues() {
 
     // JCR Year
     const yearSelectors = [
-        '#Sidenav-0-JCR-year',
-        '[data-ta^="Sidenav-0-JCR-year"]',
+        `#${P}-JCR-year`,
+        `[data-ta^="${P}-JCR-year"]`,
         '.jcr-year',
     ];
 
@@ -623,15 +714,16 @@ function scrapeArticleDetail() {
         if (t) researchAreas.push(t);
     });
 
-    // JCR Categories (from sidenav Sidenav-0-*)
+    // JCR Categories (from whichever pre-rendered sidenav instance has data)
+    const SP = findSidenavPrefix() || 'Sidenav-0';
     const jcrCategories = [];
     let i = 0;
     while (true) {
-        const nameEl = document.querySelector(`[data-ta="Sidenav-0-JCR-category-name_${i}"]`);
+        const nameEl = document.querySelector(`[data-ta="${SP}-JCR-category-name_${i}"]`);
         if (!nameEl) break;
         const name = nameEl.textContent.trim();
-        const quartile = getText(`[data-ta="Sidenav-0-JCR-quartile_${i}"]`);
-        const edition = getText(`[data-ta="Sidenav-0-JCR-edition_${i}"]`)
+        const quartile = getText(`[data-ta="${SP}-JCR-quartile_${i}"]`);
+        const edition = getText(`[data-ta="${SP}-JCR-edition_${i}"]`)
             .replace(/^in\s+/i, '').trim();
         if (name) jcrCategories.push({ name, quartile, edition });
         i++;
@@ -641,11 +733,11 @@ function scrapeArticleDetail() {
     const jciCategories = [];
     let j = 0;
     while (true) {
-        const nameEl = document.querySelector(`[data-ta="Sidenav-0-JCI-category-name_${j}"]`);
+        const nameEl = document.querySelector(`[data-ta="${SP}-JCI-category-name_${j}"]`);
         if (!nameEl) break;
         const name = nameEl.textContent.trim();
-        const quartile = getText(`[data-ta="Sidenav-0-JCI-quartile_${j}"]`);
-        const rank = getText(`[data-ta="Sidenav-0-JCI-rank_${j}"]`);
+        const quartile = getText(`[data-ta="${SP}-JCI-quartile_${j}"]`);
+        const rank = getText(`[data-ta="${SP}-JCI-rank_${j}"]`);
         if (name) jciCategories.push({ name, quartile, rank });
         j++;
     }

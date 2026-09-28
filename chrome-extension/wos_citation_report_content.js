@@ -792,6 +792,55 @@ function isStaleCitationReportRedirect() {
         || path === '/wos/';
 }
 
+/** True once the SPA has landed on the real Citation Report view. */
+function isOnCitationReportPage() {
+    return (window.location.pathname || '').includes('/citation-report');
+}
+
+/**
+ * The "View citation report" link on the WoS author record points at an
+ * INTERMEDIATE URL: `/wos/woscc/general-summary?queryJson=...&dest=citation-report`.
+ * WoS runs the author search there and then CLIENT-SIDE navigates (Angular
+ * pushState, same document) to the real `/wos/woscc/citation-report/...`
+ * view. Our content script is injected on the intermediate page's load —
+ * and that general-summary page carries its own `app-record` /
+ * `.search-results-item` rows that happen to match PUBLICATION_ROWS, but
+ * has NO `#snChart` and no per-paper citation columns. So scraping it
+ * directly yields empty "0 of 0 publications" payloads, and when the
+ * search/session is slow the 3-minute tab watchdog kills the task first.
+ *
+ * <p>Gate the scrape on the URL PATH (not on element presence — the decoy
+ * rows would fool an element gate): poll until the SPA lands on
+ * `/citation-report`, giving up only if WoS instead bounced us to a
+ * login / search-home page (handled by isStaleCitationReportRedirect) or
+ * the wait times out. Same-document pushState keeps this injected script
+ * alive across the navigation, so polling window.location works.
+ *
+ * @returns {Promise<'ready'|'stale'|'timeout'>}
+ */
+function waitForCitationReportPage(timeout = 45000) {
+    return new Promise((resolve) => {
+        if (isOnCitationReportPage()) { resolve('ready'); return; }
+        const started = Date.now();
+        const timer = setInterval(() => {
+            if (isOnCitationReportPage()) {
+                clearInterval(timer);
+                console.log('[WoS Citation Report] Landed on /citation-report after',
+                        Date.now() - started, 'ms');
+                resolve('ready');
+            } else if (isStaleCitationReportRedirect()) {
+                clearInterval(timer);
+                console.warn('[WoS Citation Report] Bounced to a non-report page while waiting:',
+                        window.location.pathname);
+                resolve('stale');
+            } else if (Date.now() - started > timeout) {
+                clearInterval(timer);
+                resolve('timeout');
+            }
+        }, 750);
+    });
+}
+
 function reportStaleRedirect() {
     try {
         const taskId = (window.location.hash || '').match(/citation-report-task-id=([^&]+)/);
@@ -819,13 +868,36 @@ if (isStaleCitationReportRedirect()) {
     // Run after page stabilizes
     const startDelay = CONFIG.TIMEOUTS.INITIAL_DELAY + Math.random() * 1000;
 
-    setTimeout(() => {
+    setTimeout(async () => {
         // Recheck — Angular sometimes navigates client-side between
         // load and our timer firing.
         if (isStaleCitationReportRedirect()) {
             console.warn('[WoS Citation Report] Stale redirect detected after delay');
             reportStaleRedirect();
             return;
+        }
+        // The saved link lands us on the general-summary intermediate page
+        // (dest=citation-report). Wait for WoS to finish its search and
+        // client-side navigate to the real /citation-report view before
+        // scraping — otherwise we read the search page's decoy rows and
+        // send an empty payload (or time out). See waitForCitationReportPage.
+        if (!isOnCitationReportPage()) {
+            console.log('[WoS Citation Report] Not on /citation-report yet (' +
+                    window.location.pathname + '); waiting for SPA navigation…');
+            const state = await waitForCitationReportPage(45000);
+            if (state === 'stale') {
+                reportStaleRedirect();
+                return;
+            }
+            if (state === 'timeout') {
+                // Never reached the report view — report as stale so the
+                // background worker recovers (re-open author profile for a
+                // fresh link) instead of us scraping the wrong page.
+                console.warn('[WoS Citation Report] Never reached /citation-report (still ' +
+                        window.location.pathname + '); reporting stale.');
+                reportStaleRedirect();
+                return;
+            }
         }
         console.log('[WoS Citation Report] Starting after initial delay...');
         syncCitationReport().catch(err => {

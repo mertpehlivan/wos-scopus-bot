@@ -130,6 +130,20 @@ public class CitationReportTaskController {
                                           @RequestBody Map<String, Object> body) {
         CitationReportTask task = repository.findByIdForUpdate(taskId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
+        if (task.getStatus() == TaskStatus.PENDING) {
+            // The normal inline path opens the citation-report tab straight
+            // from the WoS author scrape (finalizeAndComplete →
+            // openCitationReportTab) WITHOUT ever calling /poll — and /poll is
+            // the only thing that flips PENDING → PROCESSING. So the task is
+            // still PENDING when the worker posts its result here, and the old
+            // strict guard rejected the completion, leaving the task stuck
+            // PENDING forever (operator sees "Sıraya alındı" indefinitely).
+            // The stuck-task watchdog can also reset a PROCESSING task back to
+            // PENDING mid-scrape. Reclaim it either way. Mirrors
+            // ArticleTaskService.completeTask.
+            log.warn("[CitationReport] Task {} still PENDING at complete — reclaiming to PROCESSING.", taskId);
+            task.setStatus(TaskStatus.PROCESSING);
+        }
         if (task.getStatus() != TaskStatus.PROCESSING) {
             throw new TaskNotProcessableException(taskId, task.getStatus(), "complete");
         }
@@ -159,6 +173,15 @@ public class CitationReportTaskController {
                                       @RequestBody(required = false) Map<String, Object> body) {
         CitationReportTask task = repository.findByIdForUpdate(taskId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
+        if (task.getStatus() == TaskStatus.PENDING) {
+            // Same reclaim as complete(): the inline path (injection failure /
+            // 3-min tab timeout) reports failure on a task that was never
+            // polled to PROCESSING. Without reclaiming, the /fail was rejected
+            // and the task stayed PENDING — the operator never even saw the
+            // FAILED chip + error to retry from.
+            log.warn("[CitationReport] Task {} still PENDING at fail — reclaiming to PROCESSING.", taskId);
+            task.setStatus(TaskStatus.PROCESSING);
+        }
         if (task.getStatus() != TaskStatus.PROCESSING) {
             throw new TaskNotProcessableException(taskId, task.getStatus(), "fail");
         }
