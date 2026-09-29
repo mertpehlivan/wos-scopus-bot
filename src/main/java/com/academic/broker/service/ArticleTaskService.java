@@ -358,8 +358,9 @@ public class ArticleTaskService {
      * Worker progress heartbeat. Refreshes updatedAt (which the stuck watchdog
      * measures) and records the phase/progress the operator panel shows.
      *
-     * @return {@code {ok, status, cancel}} — {@code cancel} is reserved for
-     *         operator-initiated cancellation (always false for now)
+     * @return {@code {ok, status, cancel}} — {@code cancel=true} when the task
+     *         is no longer the worker's to finish (already COMPLETED/FAILED);
+     *         a deleted task (operator re-scrape) answers 404 instead
      */
     @Transactional
     public java.util.Map<String, Object> heartbeat(Long taskId, String phase, Integer current, Integer total) {
@@ -372,7 +373,9 @@ public class ArticleTaskService {
             task.setStatus(TaskStatus.PROCESSING);
         }
         if (task.getStatus() != TaskStatus.PROCESSING) {
-            return java.util.Map.of("ok", false, "status", task.getStatus().name(), "cancel", false);
+            // COMPLETED/FAILED under the worker's feet (operator re-scrape,
+            // watchdog completion…) — tell it to stop instead of scraping on.
+            return java.util.Map.of("ok", false, "status", task.getStatus().name(), "cancel", true);
         }
         task.setLastHeartbeatAt(Instant.now());
         if (phase != null && !phase.isBlank()) {
@@ -436,6 +439,29 @@ public class ArticleTaskService {
         if (requeued > 0 || completed > 0) {
             log.info("Stuck watchdog: {} task(s) re-queued, {} completed from stored payload", requeued, completed);
         }
+    }
+
+    /** DOI-enrich tabs time out after 5 min in the worker; 15 min silent = abandoned. */
+    private static final long DOI_ENRICH_STUCK_MINUTES = 15;
+
+    /**
+     * DOI-enrich tasks had no reclaim path: a worker restart mid-lookup left
+     * them PROCESSING forever (never re-polled). Put them back in the queue.
+     */
+    @Scheduled(fixedDelay = 300_000, initialDelay = 180_000)
+    @Transactional
+    public void resetStuckDoiEnrichTasks() {
+        Instant cutoff = Instant.now().minusSeconds(DOI_ENRICH_STUCK_MINUTES * 60L);
+        int reset = 0;
+        for (com.academic.broker.domain.DoiEnrichTask t : doiEnrichRepository.findByStatus(TaskStatus.PROCESSING)) {
+            if (t.getUpdatedAt() != null && t.getUpdatedAt().isBefore(cutoff)) {
+                t.setStatus(TaskStatus.PENDING);
+                t.touch();
+                doiEnrichRepository.save(t);
+                reset++;
+            }
+        }
+        if (reset > 0) log.info("Reset {} stuck DOI-enrich PROCESSING task(s) to PENDING", reset);
     }
 
     private static String truncateError(String error) {

@@ -972,6 +972,8 @@ async function pollScrapeSource(source, beforeOpen = null) {
           status: 'INITIALIZING',
           taskId,
           targetId: externalId,
+          currentSource: effectiveSource,
+          detailStartedAt: null,
           progress: { current: 0, total: 0, label: `Initializing ${effectiveSource} task...` },
           stats: { pagesScanned: 0, articlesFound: 0, detailsExtracted: 0 }
         });
@@ -2572,6 +2574,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 
   // ── RESET EVERYTHING ──
+  if (msg.type === 'SAFE_RESET') {
+    safeReset()
+      .then(() => sendResponse({ ok: true }))
+      .catch(e => sendResponse({ ok: false, error: e?.message || String(e) }));
+    return true;
+  }
+
   if (msg.type === 'RESET_ALL') {
     (async () => {
       addLog('Resetting all state...', 'warning');
@@ -3236,6 +3245,7 @@ async function handleDetailsNeeded(authorTabId, msg) {
 
   updateState({
     status: 'SCRAPING_DETAILS',
+    detailStartedAt: Date.now(),
     progress: { current: 0, total: articlesToDetail.length, label: 'Details Extraction' }
   });
   resetScrapeTimeout(authorTabId);
@@ -3418,6 +3428,17 @@ async function handleArticleDetailComplete(detailTabId, msg) {
 // ═══════════════════════════════════════════════
 
 async function finalizeAndComplete(taskId) {
+  // Broker status turns COMPLETED mid-way through; shield the task from the
+  // ping/heartbeat cancel path until the bookkeeping below is done.
+  finalizingTaskIds.add(taskId);
+  try {
+    await finalizeAndCompleteInner(taskId);
+  } finally {
+    finalizingTaskIds.delete(taskId);
+  }
+}
+
+async function finalizeAndCompleteInner(taskId) {
   const job = detailJobs.get(taskId);
   if (!job) return;
 
@@ -4327,10 +4348,11 @@ function sendTaskHeartbeat(taskId, phase, current, total, force = false) {
   (async () => {
     try {
       const h = await brokerHeaders();
-      await fetch(`${API_BASE}/api/tasks/${taskId}/heartbeat`, {
+      const res = await fetch(`${API_BASE}/api/tasks/${taskId}/heartbeat`, {
         method: 'POST', headers: h,
         body: JSON.stringify({ phase, current: current ?? null, total: total ?? null }),
       });
+      await handleHeartbeatResponse(taskId, res);
     } catch (e) {
       console.warn(`[Heartbeat] task ${taskId} failed:`, e?.message || e);
     }
@@ -4440,7 +4462,7 @@ async function sendWorkerPing() {
   const alerts = await updateVisibilityAlert(view);
   const activeTasks = [];
   for (const [, e] of pendingTabs.entries()) {
-    if (e.type === 'DETAIL') continue;
+    if (e.type === 'DETAIL' || finalizingTaskIds.has(e.taskId)) continue;
     const job = detailJobs.get(e.taskId);
     activeTasks.push({
       taskId: e.taskId, source: e.source, taskType: e.taskType || null,
@@ -4465,7 +4487,8 @@ async function sendWorkerPing() {
   };
   try {
     const h = await brokerHeaders();
-    await fetch(`${API_BASE}/api/worker/ping`, { method: 'POST', headers: h, body: JSON.stringify(payload) });
+    const res = await fetch(`${API_BASE}/api/worker/ping`, { method: 'POST', headers: h, body: JSON.stringify(payload) });
+    await handlePingResponse(res);
   } catch (e) {
     console.warn('[Ping] failed:', e?.message || e);
   }
@@ -4498,4 +4521,149 @@ async function preflightWosSessionSoft() {
     wosProbeFailures = 0;
     addLog(`WoS oturumu ${WOS_PROBE_MAX_FAILURES} kez doğrulanamadı — ${WOS_PROBE_BACKOFF_MS / 60000} dk ön-kontrol yapılmayacak; görev sekmesi girişi kendisi deneyecek`, 'warning');
   }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  R3 — CANCELLATION & SAFE RESET
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Tasks inside finalizeAndComplete — their broker status flips to COMPLETED
+ *  before the tab bookkeeping is cleared; never treat that as a cancel. */
+const finalizingTaskIds = new Set();
+
+/**
+ * The broker no longer wants this task (operator re-scrape / approve /
+ * reject / expiry deleted it, or it is already COMPLETED/FAILED). Stop
+ * scraping for nothing: close its detail and profile tabs WITHOUT reporting
+ * /fail (the broker already knows), and free the slot for the next task.
+ */
+function cancelTaskLocally(taskId, reason) {
+  if (taskId == null || finalizingTaskIds.has(taskId)) return;
+  let profileTabId = null;
+  for (const [tabId, e] of pendingTabs.entries()) {
+    if (e.taskId === taskId && e.type !== 'DETAIL') { profileTabId = tabId; break; }
+  }
+  const job = detailJobs.get(taskId);
+  if (profileTabId == null && !job) return;
+
+  addLog(`Görev #${taskId} artık broker'da aktif değil (${reason}) — sekmeleri kapatılıyor`, 'warning');
+  if (job) {
+    // Delete the job first so onRemoved's pool refill finds nothing to open.
+    detailJobs.delete(taskId);
+    for (const dt of job.activeTabIds) {
+      clearDetailTabTimeout(dt);
+      chrome.tabs.remove(dt).catch(() => { });
+    }
+  }
+  lastHeartbeat.delete(taskId);
+  if (profileTabId != null) {
+    clearPendingTab(profileTabId); // entry gone → onRemoved won't /fail it
+    chrome.tabs.remove(profileTabId).catch(() => { });
+  }
+  updateState({
+    status: 'IDLE', taskId: null, targetId: null, currentSource: null, detailStartedAt: null,
+    progress: { current: 0, total: 0, label: 'Waiting...' },
+  });
+  scheduleOrchestrator(3000);
+}
+
+/** Heartbeat / ping answers: 404 = task deleted, cancel:true = finished elsewhere. */
+async function handleHeartbeatResponse(taskId, res) {
+  if (!res) return;
+  if (res.status === 404) {
+    cancelTaskLocally(taskId, 'görev silindi');
+    return;
+  }
+  if (!res.ok) return;
+  const body = await res.json().catch(() => null);
+  if (body && body.cancel) cancelTaskLocally(taskId, `durum ${body.status || '?'}`);
+}
+
+async function handlePingResponse(res) {
+  if (!res || !res.ok) return;
+  const body = await res.json().catch(() => null);
+  const ids = Array.isArray(body?.cancel) ? body.cancel : [];
+  for (const id of ids) cancelTaskLocally(Number(id), 'görev iptal/yenilendi');
+}
+
+/**
+ * "Güvenli sıfırla" — the supported replacement for closing the worker
+ * window by hand. Every in-flight task is reported to the broker WITH a
+ * reason (so it is re-queued / visible, never silently orphaned), all bot
+ * tabs are closed, session/probe state is cleared and the loop restarts.
+ */
+async function safeReset() {
+  const reason = 'Operatör eklentiden güvenli sıfırlama yaptı';
+  addLog('Güvenli sıfırlama başlatıldı…', 'warning');
+
+  // 1) Profile tasks: /fail with reason + close their tabs (and detail tabs).
+  for (const [tabId, e] of [...pendingTabs.entries()]) {
+    if (e.type === 'DETAIL') continue;
+    try { await handleTaskTimeout(tabId, reason); } catch (_) { }
+  }
+  // 2) Side tasks tracked in memory.
+  for (const [tabId, info] of [...pendingPlumx.entries()]) {
+    await failOrphanTask('PLUMX', info.taskId, reason);
+    chrome.tabs.remove(tabId).catch(() => { });
+  }
+  for (const [tabId, info] of [...pendingWosDoiTabs.entries()]) {
+    await failOrphanTask('WOS_DOI', info.taskId, reason);
+    chrome.tabs.remove(tabId).catch(() => { });
+  }
+  for (const [tabId, info] of [...pendingScholarDoiTabs.entries()]) {
+    await failOrphanTask('SCHOLAR_DOI', info.taskId, reason);
+    chrome.tabs.remove(tabId).catch(() => { });
+  }
+  for (const [tabId, info] of [...pendingCitationReportTabs.entries()]) {
+    await failOrphanTask('CR', info.citationReportTaskId, reason);
+    chrome.tabs.remove(tabId).catch(() => { });
+  }
+  // 3) Anything else still registered (probe, stray detail tabs…).
+  let reg = {};
+  try { reg = (await chrome.storage.local.get(BOT_TAB_REGISTRY_KEY))[BOT_TAB_REGISTRY_KEY] || {}; } catch (_) { }
+  for (const [tabIdStr, info] of Object.entries(reg)) {
+    if (info && info.kind !== 'DETAIL' && info.kind !== 'PROBE' && info.kind !== 'TASK') {
+      await failOrphanTask(info.kind, info.taskId, reason);
+    }
+    chrome.tabs.remove(Number(tabIdStr)).catch(() => { });
+  }
+  await updateBotTabRegistry(r => { for (const k of Object.keys(r)) delete r[k]; });
+
+  // 4) In-memory state.
+  for (const t of detailTabTimers.values()) clearTimeout(t);
+  detailTabTimers.clear();
+  for (const t of searchPageTimers.values()) clearTimeout(t);
+  searchPageTimers.clear();
+  pendingTabs.clear();
+  detailJobs.clear();
+  pendingPlumx.clear();
+  pendingWosDoiTabs.clear();
+  pendingScholarDoiTabs.clear();
+  pendingCitationReportTabs.clear();
+  lastHeartbeat.clear();
+  activeProfileTask = null;
+  activeWosJobs.profileTab = null;
+  activeWosJobs.profileTaskId = null;
+  activeWosJobs.detailTabs = new Set();
+  activeWosJobs.citationReportTab = null;
+  if (wosSession.pendingTimeoutId != null) clearTimeout(wosSession.pendingTimeoutId);
+  if (wosSession.pendingResolve) { const r = wosSession.pendingResolve; wosSession.pendingResolve = null; r(false); }
+  wosSession.pendingProbeTabId = null;
+  wosSession.pendingTimeoutId = null;
+  wosSession.status = 'unknown';
+  wosSession.lastVerifiedAt = 0;
+  wosProbeFailures = 0;
+  wosProbeBackoffUntil = 0;
+  workerHiddenSince = null;
+  try { await chrome.action.setBadgeText({ text: '' }); } catch (_) { }
+
+  updateState({
+    status: 'IDLE', taskId: null, targetId: null, currentSource: null, detailStartedAt: null,
+    progress: { current: 0, total: 0, label: 'Waiting...' }, workerAlerts: [],
+  });
+  addLog('Güvenli sıfırlama tamamlandı — yarım kalan görevler broker\'a bildirildi, kuyruk yeniden başlıyor', 'success');
+  ensureHeartbeatAlarm();
+  scheduleOrchestrator(3000);
+  sendWorkerPing().catch(() => { });
 }

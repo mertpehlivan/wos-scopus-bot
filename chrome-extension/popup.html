@@ -27,6 +27,10 @@
       </div>
     </header>
 
+    <!-- ═══ ONE-LINE STATUS + ALERTS ══════════════════════════════ -->
+    <div class="status-line" id="status-line">Bekleniyor — aktif görev yok</div>
+    <div class="alert-list" id="alert-list"></div>
+
     <!-- ═══ LIVE ACTIVITY STRIP ══════════════════════════════════ -->
     <div class="activity-strip" id="activity-strip">
       <div class="activity-empty">Henüz aktif görev yok</div>
@@ -42,6 +46,15 @@
 
     <!-- ═══ TAB: OVERVIEW ══════════════════════════════════════════════ -->
     <div class="tab-panel active" id="tab-overview">
+      <!-- Safe reset — replaces closing the worker window by hand -->
+      <div class="safe-reset-box">
+        <button id="btn-safe-reset" class="tool-btn safe-reset-btn">🛟 Güvenli sıfırla</button>
+        <div class="safe-reset-hint">
+          Takılı sekmeleri kapatır, yarım kalan görevleri sebebiyle sunucuya bildirir ve kuyruğu yeniden başlatır.
+          Worker penceresini elle kapatmak yerine bunu kullanın.
+        </div>
+      </div>
+
       <!-- Sync Progress -->
       <div class="sync-progress-box">
         <div class="sync-title">Senkronizasyon Durumu</div>

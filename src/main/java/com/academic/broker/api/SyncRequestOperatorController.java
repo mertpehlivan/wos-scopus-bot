@@ -280,6 +280,9 @@ public class SyncRequestOperatorController {
         t.setStatus(TaskStatus.PENDING);
         t.setErrorMessage(null);
         t.setRetryCount(t.getRetryCount() + 1);
+        // Fresh set of watchdog attempts — without this a task that already
+        // burned its 3 re-queues went straight back to FAILED on first stall.
+        t.setWatchdogResets(0);
         t.touch();
         citationReportRepository.save(t);
         service.audit(id, operatorId, "OPERATOR", "RETRY_CITATION_REPORT",

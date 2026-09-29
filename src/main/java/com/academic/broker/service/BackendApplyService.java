@@ -94,8 +94,11 @@ public class BackendApplyService {
         // The backend (ApplySyncService.mergeEdits + allowed()) is the single
         // authority that applies editedData over stagedData gated by
         // approvedFields. Keep these three keys in sync with that reader.
-        body.put("stagedData", outgoingStaged(req));
-        body.put("editedData", req.getEditedData());
+        Map<String, Object> stagedOut = outgoingStaged(req);
+        Map<String, Object> editedOut = req.getEditedData() == null ? null : new HashMap<>(req.getEditedData());
+        applyOperatorYearlyOverride(stagedOut, editedOut);
+        body.put("stagedData", stagedOut);
+        body.put("editedData", editedOut);
         body.put("approvedFields", req.getApprovedFields());
         body.put("reviewedByUserId", req.getReviewedByUserId() == null
                 ? null : req.getReviewedByUserId().toString());
@@ -183,6 +186,41 @@ public class BackendApplyService {
             return staged;
         }
         return copy;
+    }
+
+    /**
+     * The operator's yearly-series override lives at
+     * {@code editedData.OPENALEX.metrics.yearlyStats}. The tenant's
+     * {@code ApplySyncService.mergeEdits} merges only ONE level inside a source
+     * block, so forwarding it as-is would REPLACE the whole staged
+     * {@code OPENALEX.metrics} map with {@code {yearlyStats}} and silently drop
+     * hIndex / citations / documents from the apply. Instead, move the override
+     * into the (already copied) staged block here and strip it from the edited
+     * copy. Both maps are copies — the persisted request is not modified.
+     */
+    @SuppressWarnings("unchecked")
+    static void applyOperatorYearlyOverride(Map<String, Object> staged, Map<String, Object> edited) {
+        if (staged == null || edited == null) return;
+        if (!(edited.get("OPENALEX") instanceof Map<?, ?> eoa)) return;
+        if (!(((Map<String, Object>) eoa).get("metrics") instanceof Map<?, ?> em)) return;
+        Object override = ((Map<String, Object>) em).get("yearlyStats");
+        if (!(override instanceof List<?> list)) return;
+
+        // staged.OPENALEX.metrics.yearlyStats = override (new maps all the way down)
+        Map<String, Object> soa = staged.get("OPENALEX") instanceof Map<?, ?> m
+                ? new HashMap<>((Map<String, Object>) m) : new HashMap<>();
+        Map<String, Object> smetrics = soa.get("metrics") instanceof Map<?, ?> mm
+                ? new HashMap<>((Map<String, Object>) mm) : new HashMap<>();
+        smetrics.put("yearlyStats", new java.util.ArrayList<>(list));
+        soa.put("metrics", smetrics);
+        staged.put("OPENALEX", soa);
+
+        // edited copy without the moved key (drop now-empty containers)
+        Map<String, Object> eoaCopy = new HashMap<>((Map<String, Object>) eoa);
+        Map<String, Object> emCopy = new HashMap<>((Map<String, Object>) em);
+        emCopy.remove("yearlyStats");
+        if (emCopy.isEmpty()) eoaCopy.remove("metrics"); else eoaCopy.put("metrics", emCopy);
+        if (eoaCopy.isEmpty()) edited.remove("OPENALEX"); else edited.put("OPENALEX", eoaCopy);
     }
 
     private static String trimTrailingSlash(String s) {

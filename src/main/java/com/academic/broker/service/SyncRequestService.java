@@ -59,6 +59,7 @@ public class SyncRequestService {
     private final SyncAuditLogRepository auditRepository;
     private final ArticleTaskRepository articleTaskRepository;
     private final PlumxTaskRepository plumxTaskRepository;
+    private final com.academic.broker.repository.CitationReportTaskRepository citationReportTaskRepository;
     private final TenantRegistry tenantRegistry;
 
     @Value("${broker.sla-review-hours:24}")
@@ -784,6 +785,17 @@ public class SyncRequestService {
 
         // Wipe leftover article + plumx tasks for this request.
         cleanupWorkerTasks(syncRequestId, "RESCRAPE");
+        // …and its Citation Report task(s), whatever their status. A COMPLETED
+        // one used to survive the reset; the fresh WoS scrape's announce only
+        // re-arms FAILED tasks, so the new per-year WoS citations were never
+        // fetched (panel: CR=COMPLETED but yearly stats empty).
+        try {
+            int cr = citationReportTaskRepository.deleteBySyncRequestIdAndStatusIn(
+                    syncRequestId, List.of(TaskStatus.values()));
+            if (cr > 0) log.info("[SyncRequest] {} RESCRAPE — removed {} citation-report task(s)", syncRequestId, cr);
+        } catch (Exception e) {
+            log.warn("[SyncRequest] {} citation-report cleanup on rescrape failed: {}", syncRequestId, e.getMessage());
+        }
 
         audit(syncRequestId, operatorUserId, "OPERATOR", "RESCRAPE",
                 Map.of("note", "stagedData / editedData / progress wiped, status → PENDING_SCRAPE"));

@@ -93,6 +93,25 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // ── Force poll ───────────────────────────────────────────────
+  // ── Safe reset (R3) ─────────────────────────────────────────
+  const safeResetBtn = document.getElementById('btn-safe-reset');
+  safeResetBtn.addEventListener('click', () => {
+    const ok = confirm(
+      'Güvenli sıfırlama:\n\n'
+      + '• Açık bot sekmeleri kapatılır\n'
+      + '• Yarım kalan görevler "operatör sıfırladı" sebebiyle sunucuya bildirilir (sessizce kaybolmaz)\n'
+      + '• Kuyruk birkaç saniye içinde yeniden başlar\n\n'
+      + 'Devam edilsin mi?');
+    if (!ok) return;
+    safeResetBtn.disabled = true;
+    safeResetBtn.textContent = '⏳ Sıfırlanıyor…';
+    chrome.runtime.sendMessage({ type: 'SAFE_RESET' }, (resp) => {
+      safeResetBtn.disabled = false;
+      safeResetBtn.textContent = '🛟 Güvenli sıfırla';
+      if (resp && resp.ok === false) alert('Sıfırlama hatası: ' + (resp.error || 'bilinmiyor'));
+    });
+  });
+
   document.getElementById('btn-force-poll').addEventListener('click', () => {
     chrome.runtime.sendMessage({ type: 'FORCE_POLL' });
   });
@@ -291,8 +310,62 @@ document.addEventListener('DOMContentLoaded', () => {
       renderSyncProgress(state.syncProgress);
     }
 
+    renderStatusLine(state);
+    renderAlerts(state.workerAlerts || []);
+
     renderActivityStrip();
     renderTaskTable();
+  }
+
+  // ── One-line status (R3) ─────────────────────────────────────
+  const statusLine = document.getElementById('status-line');
+  const alertList = document.getElementById('alert-list');
+  const SOURCE_NAMES = { WOS: 'WoS', SCOPUS: 'Scopus', SCHOLAR: 'Scholar', OPENALEX: 'OpenAlex' };
+  const PHASE_NAMES = {
+    INITIALIZING: 'sayfa açılıyor', PAGINATING: 'profil taranıyor', SCRAPING_DETAILS: 'detaylar',
+    COMPLETING: 'kaydediliyor', TIMEOUT: 'zaman aşımı', ERROR: 'hata',
+  };
+
+  function fmtMin(ms) {
+    const m = Math.round(ms / 60000);
+    return m < 1 ? '<1 dk' : `${m} dk`;
+  }
+
+  function renderStatusLine(state) {
+    const s = state.status || 'IDLE';
+    if (s === 'IDLE' || !state.taskId) {
+      statusLine.textContent = 'Bekleniyor — aktif görev yok';
+      statusLine.className = 'status-line';
+      return;
+    }
+    const parts = [SOURCE_NAMES[state.currentSource] || state.currentSource || 'Görev'];
+    parts.push(PHASE_NAMES[s] || s.toLowerCase());
+    const p = state.progress || {};
+    if (s === 'SCRAPING_DETAILS' && p.total > 0) {
+      parts[1] = `detay ${p.current}/${p.total}`;
+      if (state.detailStartedAt && p.current > 0 && p.current < p.total) {
+        const perItem = (Date.now() - state.detailStartedAt) / p.current;
+        parts.push(`~${fmtMin(perItem * (p.total - p.current))} kaldı`);
+      }
+    }
+    parts.push(`#${state.taskId}`);
+    statusLine.textContent = parts.join(' · ');
+    statusLine.className = 'status-line active';
+  }
+
+  const ALERT_TEXT = {
+    WORKER_WINDOW_HIDDEN: '⚠ Worker penceresi gizli/küçültülmüş — Chrome sayfaları yavaşlatıyor. Pencereyi görünür bırakın.',
+    WOS_SESSION_UNVERIFIED: '⚠ WoS oturumu doğrulanamadı — ön-kontrol 10 dk duraklatıldı. Bu Chrome\'da WoS\'a giriş yapılı olduğunu kontrol edin.',
+  };
+
+  function renderAlerts(codes) {
+    alertList.innerHTML = '';
+    for (const c of codes) {
+      const div = document.createElement('div');
+      div.className = 'alert-item';
+      div.textContent = ALERT_TEXT[c] || c;
+      alertList.appendChild(div);
+    }
   }
 
   // ── pushEnrichmentResult ─────────────────────────────────────

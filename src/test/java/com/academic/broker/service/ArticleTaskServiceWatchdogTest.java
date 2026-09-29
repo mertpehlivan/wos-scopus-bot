@@ -132,7 +132,8 @@ class ArticleTaskServiceWatchdogTest {
         when(repo.findByIdForUpdate(6L)).thenReturn(Optional.of(t));
 
         assertThat(service.heartbeat(6L, "DETAILS", 1, 2))
-                .containsEntry("ok", false).containsEntry("status", "COMPLETED");
+                .containsEntry("ok", false).containsEntry("status", "COMPLETED")
+                .containsEntry("cancel", true);
     }
 
     @Test

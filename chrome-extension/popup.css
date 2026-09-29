@@ -517,3 +517,32 @@ input:checked + .slider:before {
   from { opacity:0; transform:translateY(5px); }
   to { opacity:1; transform:translateY(0); }
 }
+
+/* ── R3: one-line status, alerts, safe reset ───────────────────────── */
+.status-line {
+  padding: 6px 14px;
+  font-size: 11px;
+  color: var(--muted2);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status-line.active { color: #a5b4fc; }
+.alert-list:empty { display: none; }
+.alert-list { padding: 6px 14px; border-bottom: 1px solid var(--border); }
+.alert-item {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: #fcd34d;
+  background: rgba(245, 158, 11, .08);
+  border: 1px solid rgba(245, 158, 11, .3);
+  border-radius: 6px;
+  padding: 5px 8px;
+  margin: 3px 0;
+}
+.safe-reset-box { margin-bottom: 10px; }
+.safe-reset-btn { width: 100%; border-color: rgba(16, 185, 129, .35); color: #6ee7b7; background: rgba(16, 185, 129, .08); }
+.safe-reset-btn:hover { border-color: #10b981; color: #a7f3d0; background: rgba(16, 185, 129, .15); }
+.safe-reset-btn:disabled { opacity: .5; cursor: wait; }
+.safe-reset-hint { font-size: 9.5px; color: var(--muted); margin-top: 4px; line-height: 1.4; }

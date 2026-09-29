@@ -45,10 +45,33 @@ public class WorkerController {
     private final ArticleTaskRepository articleRepository;
     private final CitationReportTaskRepository citationReportRepository;
 
+    /**
+     * Worker liveness ping. The response lists {@code cancel}: task ids the
+     * worker reports as active that the broker no longer wants — deleted by an
+     * operator re-scrape / approve / reject / expiry, or already COMPLETED /
+     * FAILED. The worker closes those tabs instead of scraping on for nothing
+     * (its results would be rejected anyway).
+     */
     @PostMapping("/api/worker/ping")
+    @Transactional(readOnly = true)
     public ResponseEntity<Map<String, Object>> ping(@RequestBody(required = false) Map<String, Object> body) {
         health.recordPing(body);
-        return ResponseEntity.ok(Map.of("ok", true, "serverTime", Instant.now().toString()));
+        List<Long> reported = new ArrayList<>();
+        if (body != null && body.get("activeTasks") instanceof List<?> list) {
+            for (Object o : list) {
+                if (o instanceof Map<?, ?> m && m.get("taskId") instanceof Number n) reported.add(n.longValue());
+            }
+        }
+        List<Long> cancel = new ArrayList<>();
+        if (!reported.isEmpty()) {
+            Map<Long, TaskStatus> known = new LinkedHashMap<>();
+            for (ArticleTask t : articleRepository.findAllById(reported)) known.put(t.getId(), t.getStatus());
+            for (Long id : reported) {
+                TaskStatus s = known.get(id);
+                if (s == null || s == TaskStatus.COMPLETED || s == TaskStatus.FAILED) cancel.add(id);
+            }
+        }
+        return ResponseEntity.ok(Map.of("ok", true, "serverTime", Instant.now().toString(), "cancel", cancel));
     }
 
     @GetMapping("/api/operator/worker/health")

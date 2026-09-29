@@ -30,6 +30,7 @@ public class SyncRequestExpirySweeper {
     private final SyncRequestService service;
     private final ArticleTaskRepository articleTaskRepository;
     private final PlumxTaskRepository plumxTaskRepository;
+    private final WorkerHealthService workerHealth;
 
     @Scheduled(fixedDelay = 300_000L, initialDelay = 60_000L)
     @Transactional
@@ -44,12 +45,13 @@ public class SyncRequestExpirySweeper {
         Instant now = Instant.now();
         List<TaskStatus> activeTaskStatuses = List.of(TaskStatus.PENDING, TaskStatus.PROCESSING);
         for (SyncRequest r : overdue) {
+            String originalStatus = r.getStatus().name(); // read BEFORE overwriting
             r.setStatus(SyncRequestStatus.EXPIRED);
             r.setRejectionReason("24 saatlik inceleme süresi doldu");
             r.setReviewedAt(now);
             r.touch();
             service.audit(r.getId(), null, "SYSTEM", "EXPIRE",
-                    Map.of("originalStatus", r.getStatus().name()));
+                    Map.of("originalStatus", originalStatus));
             // Wipe any worker tasks still chasing this request — same
             // cleanup the approve/reject paths run inline. Otherwise an
             // expired request can keep the worker busy on its leftovers
@@ -108,6 +110,15 @@ public class SyncRequestExpirySweeper {
                             || t.getStatus() == TaskStatus.COMPLETED
                             || t.getStatus() == TaskStatus.FAILED);
             if (engaged) continue;
+            // Measured from requestedAt, which a re-scrape does not move: an
+            // old request that was just re-queued must get its own window.
+            boolean freshTasks = tasks.stream().anyMatch(t ->
+                    t.getCreatedAt() != null && t.getCreatedAt().isAfter(cutoff));
+            if (freshTasks) continue;
+            // "Worker never engaged" only means offline when the worker is
+            // actually silent; if it is alive the request is just queued
+            // behind others (the queue is serial) — leave it to the 24h SLA.
+            if (Boolean.TRUE.equals(workerHealth.snapshot().get("online"))) continue;
 
             // No engagement after the window (worker offline, or no task ever
             // queued). Fail it so it's surfaced, then wipe leftover tasks.
