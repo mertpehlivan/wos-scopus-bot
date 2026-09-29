@@ -30,6 +30,40 @@
         'WOS_SESSION_OK',
     ]);
 
+    // ── WoS login credentials (R6) ──────────────────────────────────────
+    // Kept in chrome.storage.local (entered in the popup), never in source.
+    // Answered here, in the ISOLATED world, without a background round trip,
+    // and only while the page actually shows a password field — so scripts
+    // on ordinary WoS data pages can't fish them out through this relay.
+    // The reply is visible to the page, but so is a filled login form.
+    const CREDENTIALS_KEY = 'wosCredentials';
+    const MAX_CREDENTIAL_REPLIES = 5;
+    let credentialReplies = 0;
+
+    function hasPasswordField() {
+        return !!document.querySelector('input[type="password"], input[name="password"], input[formcontrolname="password"]');
+    }
+
+    async function answerCredentials(id) {
+        if (!hasPasswordField() || credentialReplies >= MAX_CREDENTIAL_REPLIES) {
+            reply(id, { ok: false, error: 'not a login page' });
+            return;
+        }
+        credentialReplies++;
+        let creds = null;
+        try {
+            creds = (await chrome.storage.local.get(CREDENTIALS_KEY))[CREDENTIALS_KEY] || null;
+        } catch (err) {
+            console.warn('[WoS Bridge] credential read failed:', err?.message || err);
+        }
+        if (creds && creds.email && creds.password) {
+            reply(id, { ok: true, email: creds.email, password: creds.password });
+            return;
+        }
+        try { chrome.runtime.sendMessage({ type: 'WOS_CREDENTIALS_MISSING' }).catch(() => { }); } catch (_) { }
+        reply(id, { ok: false, missing: true });
+    }
+
     function reply(id, response) {
         try {
             window.postMessage({ __wosBridge: 'res', id, response }, window.location.origin);
@@ -41,6 +75,7 @@
         const data = event.data;
         if (!data || data.__wosBridge !== 'req' || typeof data.id !== 'string') return;
         const msg = data.msg;
+        if (msg && msg.type === 'WOS_GET_CREDENTIALS') { answerCredentials(data.id); return; }
         if (!msg || typeof msg.type !== 'string' || !ALLOWED_TYPES.has(msg.type)) return;
 
         try {

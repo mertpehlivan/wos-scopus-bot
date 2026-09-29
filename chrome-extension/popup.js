@@ -87,6 +87,40 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
+  // ── WoS login credentials (R6: no longer in the source) ──────
+  // The saved password is never read back into the form; an empty password
+  // field on save keeps the stored one (so only the e-mail can be changed).
+  const wosEmailInput = document.getElementById('wos-email-input');
+  const wosPasswordInput = document.getElementById('wos-password-input');
+  const wosCredsStatus = document.getElementById('wos-creds-status');
+  function showWosCredsState(creds) {
+    const ok = !!(creds && creds.email && creds.password);
+    wosPasswordInput.placeholder = ok ? '•••••••• (kayıtlı — değiştirmek için yazın)' : 'Şifre';
+    wosCredsStatus.textContent = ok ? '✓ Kayıtlı' : '⚠ Tanımlı değil — WoS otomatik giriş yapamaz';
+    wosCredsStatus.style.color = ok ? '' : '#f59e0b';
+  }
+  chrome.storage.local.get(['wosCredentials'], r => {
+    if (r.wosCredentials?.email) wosEmailInput.value = r.wosCredentials.email;
+    showWosCredsState(r.wosCredentials);
+  });
+  document.getElementById('wos-creds-save').addEventListener('click', () => {
+    const email = wosEmailInput.value.trim();
+    const password = wosPasswordInput.value;
+    chrome.storage.local.get(['wosCredentials'], r => {
+      const next = { email, password: password || r.wosCredentials?.password || '' };
+      if (!next.email || !next.password) {
+        wosCredsStatus.textContent = 'E-posta ve şifre gerekli';
+        wosCredsStatus.style.color = '#f59e0b';
+        return;
+      }
+      chrome.storage.local.set({ wosCredentials: next }, () => {
+        wosPasswordInput.value = '';
+        showWosCredsState(next);
+        wosCredsStatus.textContent = '✓ Kaydedildi';
+      });
+    });
+  });
+
   // ── Diagnostics ──────────────────────────────────────────────
   document.getElementById('btn-diagnostics').addEventListener('click', () => {
     chrome.tabs.create({ url: chrome.runtime.getURL('diagnostics.html') });
@@ -356,6 +390,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const ALERT_TEXT = {
     WORKER_WINDOW_HIDDEN: '⚠ Worker penceresi gizli/küçültülmüş — Chrome sayfaları yavaşlatıyor. Pencereyi görünür bırakın.',
     WOS_SESSION_UNVERIFIED: '⚠ WoS oturumu doğrulanamadı — ön-kontrol 10 dk duraklatıldı. Bu Chrome\'da WoS\'a giriş yapılı olduğunu kontrol edin.',
+    WOS_CREDENTIALS_MISSING: '⚠ WoS giriş bilgileri tanımlı değil — Ayarlar sekmesinden e-posta ve şifreyi girin; oturum düşerse otomatik giriş yapılamaz.',
   };
 
   function renderAlerts(codes) {

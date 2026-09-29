@@ -673,7 +673,7 @@ async function handleWosLoginSuccess(tabId, tabUrl) {
   }
 }
 
-function resetScrapeTimeout(tabId) {
+function resetScrapeTimeout(tabId, delayMs = SCRAPE_TIMEOUT_MS) {
   // Always cleanup old timeout first, even if exception occurs
   if (scrapeTimeouts.has(tabId)) {
     try {
@@ -692,8 +692,9 @@ function resetScrapeTimeout(tabId) {
         if (current && current.taskId === entry.taskId) {
           handleTaskTimeout(tabId);
         }
-      }, SCRAPE_TIMEOUT_MS);
+      }, delayMs);
       scrapeTimeouts.set(tabId, newTimeout);
+      noteScrapeDeadline(tabId, delayMs);
     } catch (e) {
       console.error(`[Cleanup] Failed to set new timeout for tab ${tabId}:`, e);
       scrapeTimeouts.delete(tabId); // Fail-safe
@@ -1487,10 +1488,18 @@ async function runScholarPhaseInline() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== pollAlarmName && alarm.name !== HEARTBEAT_ALARM) return;
+  // An alarm often is what wakes a stopped SW: never run a tick on the empty
+  // state while the R6 restore is still reading the snapshot.
+  if (!swStateRestored) return swStateReady.then(() => onOrchestratorAlarm(alarm));
+  return onOrchestratorAlarm(alarm);
+});
+
+function onOrchestratorAlarm(alarm) {
   // Once a minute: liveness + window-visibility report for the operator
   // panel. Independent of the orchestrator guard below.
   if (alarm.name === HEARTBEAT_ALARM) {
     sendWorkerPing().catch(e => console.warn('[Ping]', e?.message || e));
+    schedulePersistSwState();
   }
   // Coalesce concurrent triggers (master one-shot + periodic heartbeat) so
   // we never run two orchestrator ticks at once.
@@ -1505,13 +1514,16 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       scheduleOrchestrator(15000);
     })
     .finally(() => { orchestratorInFlight = false; });
-});
+}
 
 // ═══════════════════════════════════════════════
 //  TAB REMOVAL LISTENER — prevents stale state when user closes tabs
 // ═══════════════════════════════════════════════
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  // After a service-worker restart, wait until the persisted state is back —
+  // otherwise a tab closed in that window would be missed (R6).
+  if (!swStateRestored) await swStateReady;
   console.log(`[WoS Worker] Tab #${tabId} closed by user/browser, cleaning up state...`);
 
   // Report task failure to broker before clearing local state
@@ -1551,6 +1563,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
       fillDetailTabPool(taskId);
     }
   }
+  schedulePersistSwState();
 });
 
 // ═══════════════════════════════════════════════
@@ -1670,25 +1683,31 @@ async function pollOpenAlex() {
     const data = await res.json();
     if (!data?.taskId || !data?.externalId) return false;
 
-    activeOpenAlexTask = data;
-    // Crash-safe breadcrumb: if Chrome kills the SW mid-processing, the
-    // in-memory slot is lost but this lets the next cold start reconcile a
-    // stale in-flight task (fail it on the broker) instead of leaving it
-    // stuck PROCESSING. See cleanupOnStartup.
-    try { await chrome.storage.session.set({ openalex_inflight: { taskId: data.taskId, startedAt: Date.now() } }); } catch (_) { /* ignore */ }
-    try {
-      // Run synchronously — caller awaits, ordering downstream is preserved.
-      await processOpenAlexTask(data);
-    } catch (e) {
-      console.warn('[OpenAlex] Task processing failed:', e?.message || e);
-    } finally {
-      activeOpenAlexTask = null;
-      try { await chrome.storage.session.remove('openalex_inflight'); } catch (_) { /* ignore */ }
-    }
+    // Run synchronously — caller awaits, ordering downstream is preserved.
+    await runOpenAlexTask(data, 0);
     return true;
   } catch (e) {
     console.warn('[OpenAlex] Poll failed:', e?.message || e);
     return false;
+  }
+}
+
+/**
+ * Crash-safe breadcrumb: if Chrome kills the SW mid-processing, the
+ * in-memory slot is lost. The breadcrumb carries the whole task, so a
+ * service-worker restart resumes it (R6, bounded by `resumes`); after a
+ * browser start/extension reload cleanupOnStartup fails it instead.
+ */
+async function runOpenAlexTask(data, resumes) {
+  activeOpenAlexTask = data;
+  try { await chrome.storage.session.set({ openalex_inflight: { taskId: data.taskId, startedAt: Date.now(), task: data, resumes } }); } catch (_) { /* ignore */ }
+  try {
+    await processOpenAlexTask(data);
+  } catch (e) {
+    console.warn('[OpenAlex] Task processing failed:', e?.message || e);
+  } finally {
+    activeOpenAlexTask = null;
+    try { await chrome.storage.session.remove('openalex_inflight'); } catch (_) { /* ignore */ }
   }
 }
 
@@ -2356,6 +2375,7 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
     }
   }, SCRAPE_TIMEOUT_MS);
   scrapeTimeouts.set(tabId, timeoutId);
+  noteScrapeDeadline(tabId, SCRAPE_TIMEOUT_MS);
 
   armPreReadyTimeout(tabId);
 }
@@ -2366,11 +2386,12 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
  * call supersedes the previous timer (token check), so it can be restarted
  * after a login round-trip resets {@code readyAt}.
  */
-function armPreReadyTimeout(tabId) {
+function armPreReadyTimeout(tabId, delayMs = PRE_READY_TIMEOUT_MS) {
   const armed = pendingTabs.get(tabId);
   if (!armed) return;
   const token = (armed.preReadyToken || 0) + 1;
   armed.preReadyToken = token;
+  preReadyDeadlines.set(tabId, Date.now() + delayMs);
   setTimeout(async () => {
     const entry = pendingTabs.get(tabId);
     if (!entry || entry.preReadyToken !== token || entry.readyAt) return;
@@ -2385,7 +2406,7 @@ function armPreReadyTimeout(tabId) {
     } catch (_) { }
     clearPendingTab(tabId);
     try { await chrome.tabs.remove(tabId); } catch (_) { }
-  }, PRE_READY_TIMEOUT_MS);
+  }, delayMs);
 }
 
 function clearPendingTab(tabId) {
@@ -2430,7 +2451,10 @@ function clearPendingTab(tabId) {
     clearTimeout(scrapeTimeouts.get(tabId));
     scrapeTimeouts.delete(tabId);
   }
+  scrapeDeadlines.delete(tabId);
+  preReadyDeadlines.delete(tabId);
   chrome.storage.session.remove(String(tabId));
+  schedulePersistSwState();
 }
 
 function markSourceComplete(source, failed = false) {
@@ -2562,7 +2586,15 @@ chrome.action.onClicked.addListener((tab) => {
 //  MESSAGE ROUTER
 // ═══════════════════════════════════════════════
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+onRuntimeMessage((msg, sender, sendResponse) => {
+  if (msg.type === 'WOS_CREDENTIALS_MISSING') {
+    // The session handler found a login form but no saved credentials. The
+    // minute ping raises WOS_CREDENTIALS_MISSING from storage; log it here.
+    addLog('WoS giriş formu açıldı ama eklentide WoS giriş bilgisi yok — Ayarlar sekmesinden girin', 'error');
+    sendResponse({ ok: true });
+    return true;
+  }
+
   if (msg.type === 'GET_DASHBOARD_STATE') {
     sendResponse(appState);
     return true;
@@ -2892,6 +2924,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
         }, SCRAPE_TIMEOUT_MS);
         scrapeTimeouts.set(tabId, newTimeout);
+        noteScrapeDeadline(tabId, SCRAPE_TIMEOUT_MS);
         if (entry.type !== 'DETAIL' && !detailJobs.has(entry.taskId)) {
           sendTaskHeartbeat(entry.taskId, 'PROFILE',
               msg.stats?.articlesFound ?? msg.stats?.pagesScanned ?? null, null);
@@ -4318,11 +4351,13 @@ function updateBotTabRegistry(mutate) {
 function registerBotTab(tabId, kind, taskId) {
   if (tabId == null) return;
   updateBotTabRegistry(reg => { reg[tabId] = { kind, taskId: taskId ?? null, at: Date.now() }; });
+  schedulePersistSwState();
 }
 
 function unregisterBotTab(tabId) {
   if (tabId == null) return;
   updateBotTabRegistry(reg => { delete reg[tabId]; });
+  schedulePersistSwState();
 }
 
 const ORPHAN_REASON = 'Eklenti yeniden başlatıldı/güncellendi — sekme yetim kaldı, kapatıldı';
@@ -4359,12 +4394,13 @@ async function failOrphanTask(kind, taskId, reason) {
  * Runs on every service-worker start. In-memory state is empty at that
  * point, so any registered bot tab is an orphan: fail its task and close it.
  */
-async function reconcileOrphanBotTabs(reason) {
+async function reconcileOrphanBotTabs(reason, keep = new Set()) {
   let reg = {};
   try {
     reg = (await chrome.storage.local.get(BOT_TAB_REGISTRY_KEY))[BOT_TAB_REGISTRY_KEY] || {};
   } catch (_) { return; }
-  const entries = Object.entries(reg);
+  // Tabs whose work was restored from the persisted state (R6) are not orphans.
+  const entries = Object.entries(reg).filter(([id]) => !keep.has(Number(id)));
   if (entries.length === 0) return;
   console.warn(`[Registry] ${reason}: ${entries.length} orphan bot tab(s) from a previous worker instance`);
   for (const [tabIdStr, info] of entries) {
@@ -4392,8 +4428,8 @@ function failOrphanFromUrl(url) {
   return Promise.resolve();
 }
 
-reconcileOrphanBotTabs('service-worker start')
-  .catch(e => console.warn('[Registry] reconcile failed:', e?.message || e));
+// The start-up reconcile runs from the R6 block at the end of this file,
+// after the persisted state has been restored (see swStateReady).
 
 // ── Task progress heartbeat ──────────────────────────────────────────────
 // Lets the broker tell "long but progressing" from "dead": every heartbeat
@@ -4409,6 +4445,7 @@ function sendTaskHeartbeat(taskId, phase, current, total, force = false) {
   const now = Date.now();
   if (!force && prev && prev.phase === phase && now - prev.at < HEARTBEAT_MIN_INTERVAL_MS) return;
   lastHeartbeat.set(taskId, { at: now, phase });
+  schedulePersistSwState();
   (async () => {
     try {
       const h = await brokerHeaders();
@@ -4516,6 +4553,7 @@ async function updateVisibilityAlert(view) {
     workerHiddenSince = null;
   }
   if (Date.now() < wosProbeBackoffUntil) alerts.push('WOS_SESSION_UNVERIFIED');
+  if (GROUP_CONFIG.wos && !(await hasWosCredentials())) alerts.push('WOS_CREDENTIALS_MISSING');
   updateState({ workerAlerts: alerts, workerWindow: view });
   return alerts;
 }
@@ -4701,6 +4739,8 @@ async function safeReset() {
   searchPageTimers.clear();
   pendingTabs.clear();
   detailJobs.clear();
+  scrapeDeadlines.clear();
+  preReadyDeadlines.clear();
   pendingPlumx.clear();
   pendingWosDoiTabs.clear();
   pendingScholarDoiTabs.clear();
@@ -4764,3 +4804,261 @@ async function fetchDetailCache(taskId) {
     clearTimeout(timer);
   }
 }
+// ═══════════════════════════════════════════════════════════════════════
+//  R6 — Service-worker state persistence + WoS credentials from storage
+// ═══════════════════════════════════════════════════════════════════════
+// Chrome may stop an idle MV3 service worker at any time. Until now every
+// in-memory map (pendingTabs, detailJobs, activeWosJobs, wosSession, the
+// timers) died with it, and the start-up reconcile then treated every open
+// bot tab as an orphan: the task was failed and hours of detail work lost.
+//
+// Now a snapshot of the task state is kept in chrome.storage.session
+// (debounced, ~1 s). That area survives a service-worker restart but is
+// cleared when the extension is reloaded/updated or the browser restarts —
+// exactly the line between "resume" and "orphan":
+//   • snapshot present  → SW restart: profile tabs keep running, detail
+//     jobs continue (pages that were loading are re-queued), idle and
+//     pre-ready timeouts are re-armed with the time they had left, an
+//     interrupted OpenAlex task is re-run once or twice.
+//   • no snapshot       → reload/update/browser start: the R2 orphan path
+//     fails the tasks and closes the tabs, as before.
+// Navigation-free like the rest: nothing here reloads or redirects a page.
+
+const SW_STATE_KEY = 'swStateSnapshot';
+const SW_STATE_VERSION = 1;
+const SW_PERSIST_DEBOUNCE_MS = 1000;
+const OPENALEX_MAX_RESUMES = 2;
+const SW_RESTART_REASON = 'Eklenti servis çalışanı yeniden başladı — görev sekmesi bulunamadı';
+
+// `var`: read by hoisted functions (message gate, onRemoved) that may run
+// before this block has been evaluated.
+var swStateRestored = false;
+var swStateReady;
+let swPersistTimer = null;
+let swPersistWarned = false;
+let openAlexResume = null; // breadcrumb of an OpenAlex task interrupted by the restart
+const scrapeDeadlines = new Map();   // tabId → epoch ms when the idle timeout fires
+const preReadyDeadlines = new Map(); // tabId → epoch ms when the pre-ready timeout fires
+
+function noteScrapeDeadline(tabId, delayMs) {
+  scrapeDeadlines.set(tabId, Date.now() + delayMs);
+  schedulePersistSwState();
+}
+
+/** Wraps the runtime message router: messages that wake a restarting SW wait for the restore. */
+function onRuntimeMessage(handler) {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (swStateRestored) {
+      const keepOpen = handler(msg, sender, sendResponse);
+      schedulePersistSwState();
+      return keepOpen;
+    }
+    swStateReady.then(() => {
+      handler(msg, sender, sendResponse);
+      schedulePersistSwState();
+    });
+    return true; // answer asynchronously
+  });
+}
+
+function schedulePersistSwState() {
+  // Never overwrite the previous instance's snapshot before it was read.
+  if (!swStateRestored || swPersistTimer) return;
+  swPersistTimer = setTimeout(() => {
+    swPersistTimer = null;
+    persistSwState();
+  }, SW_PERSIST_DEBOUNCE_MS);
+}
+
+function buildSwSnapshot() {
+  const pending = [];
+  for (const [tabId, e] of pendingTabs.entries()) {
+    if (e.type === 'DETAIL') continue; // detail pages are re-opened, not resumed
+    const { preReadyToken, ...rest } = e;
+    pending.push([tabId, rest]);
+  }
+  const jobs = [];
+  for (const [taskId, j] of detailJobs.entries()) {
+    jobs.push([taskId, {
+      authorData: j.authorData,
+      articles: j.articles,
+      queue: j.queue,
+      totalToDetail: j.totalToDetail,
+      detailMap: j.detailMap,
+      authorTabId: j.authorTabId,
+      cachedCount: j.cachedCount,
+      partial: j.partial || null,
+      inFlightUrls: [...j.tabToUrlMap.values()],
+      retriedUrls: j.retriedUrls ? [...j.retriedUrls] : [],
+    }]);
+  }
+  return {
+    v: SW_STATE_VERSION,
+    extVersion: EXT_VERSION,
+    savedAt: Date.now(),
+    activeProfileTask,
+    pending,
+    jobs,
+    scrapeDeadlines: [...scrapeDeadlines],
+    preReadyDeadlines: [...preReadyDeadlines],
+    wosSession: {
+      status: wosSession.status === 'authenticated' ? 'authenticated' : 'unknown',
+      lastVerifiedAt: wosSession.lastVerifiedAt || 0,
+    },
+    wosProbe: { failures: wosProbeFailures, backoffUntil: wosProbeBackoffUntil },
+    syncProgress: { ...syncProgress },
+    ui: {
+      status: appState.status, taskId: appState.taskId, targetId: appState.targetId,
+      progress: appState.progress, currentSource: appState.currentSource ?? null,
+      detailStartedAt: appState.detailStartedAt ?? null,
+    },
+  };
+}
+
+async function persistSwState() {
+  try {
+    await chrome.storage.session.set({ [SW_STATE_KEY]: buildSwSnapshot() });
+  } catch (e) {
+    if (!swPersistWarned) {
+      swPersistWarned = true;
+      console.warn('[R6] State snapshot could not be saved:', e?.message || e);
+    }
+  }
+}
+
+/**
+ * Rebuilds the in-memory state from the previous instance's snapshot.
+ * @returns {{keep:Set<number>, restart:boolean, resumed:number, lostTaskId:number|null}}
+ */
+async function restoreSwState() {
+  const keep = new Set();
+  let snap = null;
+  try { snap = (await chrome.storage.session.get(SW_STATE_KEY))[SW_STATE_KEY] || null; } catch (_) { }
+  if (!snap || snap.v !== SW_STATE_VERSION || snap.extVersion !== EXT_VERSION) {
+    return { keep, restart: false, resumed: 0, lostTaskId: null };
+  }
+
+  let openTabIds = new Set();
+  try { openTabIds = new Set((await chrome.tabs.query({})).map(t => t.id)); } catch (_) { }
+
+  // WoS session cache: saves a probe tab after the restart.
+  if (snap.wosSession?.status === 'authenticated'
+      && Date.now() - (snap.wosSession.lastVerifiedAt || 0) < WOS_SESSION_TTL_MS) {
+    wosSession.status = 'authenticated';
+    wosSession.lastVerifiedAt = snap.wosSession.lastVerifiedAt;
+  }
+  wosProbeFailures = snap.wosProbe?.failures || 0;
+  wosProbeBackoffUntil = snap.wosProbe?.backoffUntil || 0;
+
+  // Profile/author tabs that are still open keep running — their content
+  // scripts never noticed the restart.
+  for (const [tabId, e] of snap.pending || []) {
+    if (!openTabIds.has(tabId)) continue;
+    pendingTabs.set(tabId, e);
+    keep.add(tabId);
+    if (e.source === 'WOS') {
+      activeWosJobs.profileTab = tabId;
+      activeWosJobs.profileTaskId = e.taskId;
+    }
+  }
+
+  // Detail jobs continue from where they were; the page that was loading
+  // (its tab is closed by the orphan sweep) goes back to the front of the queue.
+  for (const [taskId, j] of snap.jobs || []) {
+    if (!pendingTabs.has(j.authorTabId)) continue; // author tab gone → orphan path fails the task
+    detailJobs.set(taskId, {
+      authorData: j.authorData,
+      articles: j.articles,
+      queue: [...(j.inFlightUrls || []), ...(j.queue || [])],
+      totalToDetail: j.totalToDetail,
+      detailMap: j.detailMap || {},
+      authorTabId: j.authorTabId,
+      cachedCount: j.cachedCount || 0,
+      ...(j.partial ? { partial: j.partial } : {}),
+      activeTabIds: new Set(),
+      tabToUrlMap: new Map(),
+      retriedUrls: new Set(j.retriedUrls || []),
+    });
+  }
+
+  // The global profile slot only survives with its tab. A task claimed but
+  // not yet opened when the SW stopped is reported so it doesn't sit
+  // PROCESSING until the broker watchdog.
+  let lostTaskId = null;
+  const slot = snap.activeProfileTask;
+  if (slot) {
+    if ([...pendingTabs.values()].some(e => e.taskId === slot.taskId)) activeProfileTask = slot;
+    else lostTaskId = slot.taskId;
+  }
+
+  // Timeouts: re-armed with the time they had left (never below 5 s so a
+  // result already in flight can still land).
+  const scrapeDl = new Map(snap.scrapeDeadlines || []);
+  const preReadyDl = new Map(snap.preReadyDeadlines || []);
+  const left = (deadline, fallback) => Math.max(5000, (deadline ?? Date.now() + fallback) - Date.now());
+  for (const [tabId, e] of pendingTabs.entries()) {
+    resetScrapeTimeout(tabId, left(scrapeDl.get(tabId), SCRAPE_TIMEOUT_MS));
+    if (!e.readyAt) armPreReadyTimeout(tabId, left(preReadyDl.get(tabId), PRE_READY_TIMEOUT_MS));
+  }
+
+  // Reserve the OpenAlex slot before the orchestrator can run again; the
+  // interrupted task is re-run after the restore (resumeOpenAlexAfterRestart).
+  try {
+    const inflight = (await chrome.storage.session.get('openalex_inflight')).openalex_inflight || null;
+    if (inflight?.task) {
+      openAlexResume = inflight;
+      activeOpenAlexTask = inflight.task;
+    }
+  } catch (_) { }
+
+  if (pendingTabs.size > 0) {
+    Object.assign(syncProgress, snap.syncProgress || {});
+    if (snap.ui) updateState(snap.ui);
+  }
+  return { keep, restart: true, resumed: pendingTabs.size, lostTaskId };
+}
+
+/** Re-runs an OpenAlex task the stopped worker was in the middle of (fetch-only, idempotent). */
+async function resumeOpenAlexAfterRestart() {
+  const inflight = openAlexResume;
+  openAlexResume = null;
+  if (!inflight?.task) return;
+  const resumes = (inflight.resumes || 0) + 1;
+  if (resumes > OPENALEX_MAX_RESUMES) {
+    activeOpenAlexTask = null;
+    try { await chrome.storage.session.remove('openalex_inflight'); } catch (_) { }
+    await openAlexFailTask(inflight.taskId, 'worker restarted repeatedly mid-OpenAlex');
+    return;
+  }
+  addLog(`OpenAlex görevi #${inflight.taskId} servis çalışanı yeniden başladığı için tekrar çalıştırılıyor`, 'warning');
+  await runOpenAlexTask(inflight.task, resumes);
+}
+
+async function hasWosCredentials() {
+  try {
+    const c = (await chrome.storage.local.get('wosCredentials')).wosCredentials;
+    return !!(c && c.email && c.password);
+  } catch (_) {
+    return true; // storage unreadable → don't raise a false alarm
+  }
+}
+
+swStateReady = restoreSwState()
+  .catch(e => {
+    console.warn('[R6] State restore failed:', e?.message || e);
+    return { keep: new Set(), restart: false, resumed: 0, lostTaskId: null };
+  })
+  .then(async (r) => {
+    swStateRestored = true;
+    await reconcileOrphanBotTabs('service-worker start', r.keep)
+      .catch(e => console.warn('[Registry] reconcile failed:', e?.message || e));
+    if (r.lostTaskId != null) await failOrphanTask('TASK', r.lostTaskId, SW_RESTART_REASON);
+    await persistSwState();
+    if (!r.restart) return;
+    if (r.resumed > 0) {
+      console.warn(`[R6] Service worker restarted — resumed ${r.resumed} task tab(s), ${detailJobs.size} detail job(s)`);
+      addLog(`Servis çalışanı yeniden başladı — ${r.resumed} görev kaldığı yerden devam ediyor`, 'warning');
+    }
+    for (const taskId of detailJobs.keys()) fillDetailTabPool(taskId);
+    resumeOpenAlexAfterRestart().catch(e => console.warn('[R6] OpenAlex resume failed:', e?.message || e));
+  });

@@ -34,9 +34,11 @@
         console.log('[WoS Session] Probe mode active for this tab');
     }
 
+    // Credentials are NOT in the source any more (R6): the operator enters
+    // them once in the extension popup (chrome.storage.local), and the
+    // ISOLATED-world bridge hands them over only while a login form is on
+    // the page. See getLoginCredentials().
     const CONFIG = {
-        email: 'info@rawdatalibrary.net',
-        password: 'sakarya54qA*',
         checkIntervalMs: 2000,
         maxCheckAttempts: 90, // ~3 minutes of polling
     };
@@ -109,6 +111,29 @@
     /** Best-effort report to background → broker → backend. */
     function reportSession(event, detail) {
         bridgeSend({ type: 'SESSION_EVENT', source: 'WOS', event, detail });
+    }
+
+    /**
+     * WoS login credentials from the extension's storage (entered in the
+     * popup), fetched through the bridge. Returns null when none are saved;
+     * that is reported once per page so the operator sees "WoS giriş
+     * bilgileri eksik" instead of an endless login loop.
+     */
+    let _credsMissingReported = false;
+    let _creds = null; // cached for this page: login retries don't ask again
+    async function getLoginCredentials() {
+        if (_creds) return _creds;
+        const res = await bridgeSend({ type: 'WOS_GET_CREDENTIALS' });
+        if (res && res.ok && res.email && res.password) {
+            _creds = { email: res.email, password: res.password };
+            return _creds;
+        }
+        if (!_credsMissingReported) {
+            _credsMissingReported = true;
+            console.warn('[WoS Session] No WoS credentials saved in the extension — cannot log in');
+            reportSession('LOGIN_FAILED', 'WoS giriş bilgileri eklentide tanımlı değil');
+        }
+        return null;
     }
 
     /**
@@ -650,18 +675,21 @@
         // still log the attempt for debugging.
         console.log('\n[WoS Session] 🔐 LOGIN PROCESS STARTING from URL:', window.location.href, '\n');
 
+        const creds = await getLoginCredentials();
+        if (!creds) return false;
+
         // STEP 1: EMAIL
         emailInput.click();
         emailInput.focus();
         await _humanDelay(400, 700);
-        setAngularInputValue(emailInput, CONFIG.email, 'EMAIL');
+        setAngularInputValue(emailInput, creds.email, 'EMAIL');
         await _humanDelay(3000, 5000);
 
         // STEP 2: PASSWORD
         passwordInput.click();
         passwordInput.focus();
         await _humanDelay(400, 700);
-        setAngularInputValue(passwordInput, CONFIG.password, 'PASSWORD');
+        setAngularInputValue(passwordInput, creds.password, 'PASSWORD');
         await _humanDelay(3000, 5000);
 
         // STEP 3: SUBMIT
