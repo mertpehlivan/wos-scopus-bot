@@ -105,31 +105,7 @@ public class BackendApplyService {
         body.put("reviewedAt", req.getReviewedAt() == null ? null : req.getReviewedAt().toString());
         body.put("reviewerNotes", req.getReviewerNotes());
 
-        String json;
-        try {
-            json = objectMapper.writeValueAsString(body);
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException("Apply payload serialization failed", e);
-        }
-
-        // Multi-tenant: route the callback to the backend that opened THIS
-        // request, with the token it supplied. Falls back to the global
-        // broker.backend-url / backend-api-key for legacy requests that carry
-        // no per-tenant routing info (single-tenant / not-yet-migrated).
-        String targetBase = (req.getBackendBaseUrl() != null && !req.getBackendBaseUrl().isBlank())
-                ? req.getBackendBaseUrl() : backendUrl;
-        String targetToken = (req.getBackendCallbackToken() != null && !req.getBackendCallbackToken().isBlank())
-                ? req.getBackendCallbackToken() : backendApiKey;
-        String url = trimTrailingSlash(targetBase) + "/api/v1/internal/apply-sync";
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .header("Content-Type", "application/json")
-                .header("X-Internal-Key", targetToken)
-                .timeout(Duration.ofSeconds(30))
-                .POST(HttpRequest.BodyPublishers.ofString(json))
-                .build();
-
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = postToTenant(req, body);
         int code = response.statusCode();
         if (code >= 200 && code < 300) {
             service.markApplied(req.getId());
@@ -151,6 +127,35 @@ public class BackendApplyService {
             log.warn("[Apply] {} apply failed (retryable): {}", req.getId(), error);
         }
         return false;
+    }
+
+    /**
+     * POSTs an apply-sync payload to the tenant backend that opened {@code req}.
+     * Multi-tenant: routes to the request's own backend with the token it
+     * supplied; falls back to the global broker.backend-url / backend-api-key
+     * for legacy requests without per-tenant routing info. Shared by the
+     * approval path and the R5 yearly-series correction patch.
+     */
+    public HttpResponse<String> postToTenant(SyncRequest req, Map<String, Object> body) throws Exception {
+        String json;
+        try {
+            json = objectMapper.writeValueAsString(body);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Apply payload serialization failed", e);
+        }
+        String targetBase = (req.getBackendBaseUrl() != null && !req.getBackendBaseUrl().isBlank())
+                ? req.getBackendBaseUrl() : backendUrl;
+        String targetToken = (req.getBackendCallbackToken() != null && !req.getBackendCallbackToken().isBlank())
+                ? req.getBackendCallbackToken() : backendApiKey;
+        String url = trimTrailingSlash(targetBase) + "/api/v1/internal/apply-sync";
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("X-Internal-Key", targetToken)
+                .timeout(Duration.ofSeconds(30))
+                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .build();
+        return HTTP.send(request, HttpResponse.BodyHandlers.ofString());
     }
 
     /**

@@ -10,5 +10,7 @@ import java.util.UUID;
 
 public interface SyncAuditLogRepository extends JpaRepository<SyncAuditLog, Long> {
     List<SyncAuditLog> findBySyncRequestIdOrderByCreatedAtAsc(UUID syncRequestId);
+
+    boolean existsBySyncRequestIdAndAction(UUID syncRequestId, String action);
     Page<SyncAuditLog> findByActorUserIdOrderByCreatedAtDesc(UUID actorUserId, Pageable pageable);
 }

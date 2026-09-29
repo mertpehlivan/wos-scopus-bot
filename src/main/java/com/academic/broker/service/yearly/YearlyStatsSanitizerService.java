@@ -56,12 +56,62 @@ public class YearlyStatsSanitizerService {
     @Autowired
     public YearlyStatsSanitizerService(@Value("${broker.yearly-sanitize-mode:shadow}") String mode) {
         this(parseMode(mode), Clock.systemUTC());
+        log.info("[YearlyStats] sanitizer mode = {}", this.mode);
     }
 
     YearlyStatsSanitizerService(Mode mode, Clock clock) {
         this.mode = mode;
         this.clock = clock;
-        log.info("[YearlyStats] sanitizer mode = {}", mode);
+    }
+
+    /**
+     * R5: what an already-APPLIED request's OpenAlex yearly series would look
+     * like cleaned — regardless of the configured mode. Empty when there is
+     * nothing to fix. {@code original} is the series the tenant received
+     * (the request's stored series before any cleaning).
+     */
+    @SuppressWarnings("unchecked")
+    public java.util.Optional<Map<String, Object>> previewFix(Map<String, Object> staged,
+                                                               Map<String, Object> approvedFields) {
+        if (staged == null || !(staged.get("OPENALEX") instanceof Map<?, ?> oa)
+                || !(((Map<String, Object>) oa).get("metrics") instanceof Map<?, ?> mm)) {
+            return java.util.Optional.empty();
+        }
+        Map<String, Object> metrics = (Map<String, Object>) mm;
+        Object originalObj = metrics.containsKey(AUTHOR_KEY) ? metrics.get(AUTHOR_KEY)
+                : metrics.containsKey(RAW_KEY) && !BASIS_WORKS_MARK.equals(metrics.get(BASIS_KEY)) ? metrics.get(RAW_KEY)
+                : metrics.get(SERIES_KEY);
+        List<?> original = originalObj instanceof List<?> l ? l : List.of();
+
+        Map<String, Object> copy = new HashMap<>(staged);
+        YearlyStatsSanitizer.Result r = new YearlyStatsSanitizerService(Mode.ON, clock)
+                .apply(copy, excludedWorkIds(copy, approvedFields));
+        if (r == null) return java.util.Optional.empty();
+        Map<String, Object> fixedMetrics = (Map<String, Object>) ((Map<String, Object>) copy.get("OPENALEX")).get("metrics");
+        List<?> fixed = fixedMetrics.get(SERIES_KEY) instanceof List<?> f ? f : List.of();
+        if (fixed.isEmpty() || sameSeries(fixed, original)) return java.util.Optional.empty();
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("fixed", fixed);
+        out.put("original", original);
+        out.put("report", fixedMetrics.get(REPORT_KEY));
+        return java.util.Optional.of(out);
+    }
+
+    /** Same year → citations mapping (publication counts ignored). */
+    static boolean sameSeries(List<?> a, List<?> b) {
+        return citationsByYear(a).equals(citationsByYear(b));
+    }
+
+    private static Map<Integer, Integer> citationsByYear(List<?> rows) {
+        Map<Integer, Integer> m = new java.util.TreeMap<>();
+        for (Object o : rows) {
+            if (!(o instanceof Map<?, ?> r)) continue;
+            Integer y = YearlyStatsSanitizer.toInt(r.get("year"));
+            Integer c = YearlyStatsSanitizer.toInt(r.get("citations"));
+            if (y != null) m.put(y, c == null ? 0 : c);
+        }
+        return m;
     }
 
     public Mode getMode() {
