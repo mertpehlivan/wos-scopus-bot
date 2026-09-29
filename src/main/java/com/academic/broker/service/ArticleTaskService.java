@@ -56,6 +56,16 @@ public class ArticleTaskService {
     @Value("${broker.processing-timeout-minutes:5}")
     private int processingTimeoutMinutes;
 
+    /**
+     * Stuck threshold for tasks whose worker sends progress heartbeats. Every
+     * heartbeat touches updatedAt, so this measures "no progress for N min"
+     * rather than total runtime — long profiles are safe, dead tabs are
+     * reclaimed quickly. Tasks that never heartbeat (older extensions) keep
+     * the legacy processing-timeout-minutes rule.
+     */
+    @Value("${broker.heartbeat-stale-minutes:20}")
+    private int heartbeatStaleMinutes;
+
     private static final List<TaskStatus> ACTIVE_STATUSES = List.of(
             TaskStatus.PENDING,
             TaskStatus.PROCESSING);
@@ -189,6 +199,7 @@ public class ArticleTaskService {
         task.setStatus(TaskStatus.PROCESSING);
         task.setStartedAt(Instant.now());
         task.setFinishedAt(null);
+        task.resetProgress();
         task.touch();
         repository.save(task);
         log.info("Task {} polled by extension (source={}, externalId={})", task.getId(), task.getTargetSource(), task.getExternalId());
@@ -344,28 +355,86 @@ public class ArticleTaskService {
     }
 
     /**
-     * Zaman aşımı: PROCESSING'de 5 dakikadan uzun kalan task'ları tekrar PENDING
-     * yapar.
+     * Worker progress heartbeat. Refreshes updatedAt (which the stuck watchdog
+     * measures) and records the phase/progress the operator panel shows.
+     *
+     * @return {@code {ok, status, cancel}} — {@code cancel} is reserved for
+     *         operator-initiated cancellation (always false for now)
      */
-    @Scheduled(fixedDelay = 60_000, initialDelay = 60_000) // every 1 min, timeout threshold from config
+    @Transactional
+    public java.util.Map<String, Object> heartbeat(Long taskId, String phase, Integer current, Integer total) {
+        ArticleTask task = repository.findByIdForUpdate(taskId)
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
+        if (task.getStatus() == TaskStatus.PENDING) {
+            // Watchdog re-queued it while the worker was still busy — the
+            // heartbeat proves it is alive, so take it back (as complete does).
+            log.warn("Task {} was reset to PENDING but the worker is still active. Reclaiming.", taskId);
+            task.setStatus(TaskStatus.PROCESSING);
+        }
+        if (task.getStatus() != TaskStatus.PROCESSING) {
+            return java.util.Map.of("ok", false, "status", task.getStatus().name(), "cancel", false);
+        }
+        task.setLastHeartbeatAt(Instant.now());
+        if (phase != null && !phase.isBlank()) {
+            task.setProgressPhase(phase.length() > 40 ? phase.substring(0, 40) : phase);
+        }
+        if (current != null) task.setProgressCurrent(current);
+        if (total != null) task.setProgressTotal(total);
+        task.touch();
+        repository.save(task);
+        return java.util.Map.of("ok", true, "status", task.getStatus().name(), "cancel", false);
+    }
+
+    /**
+     * Stuck watchdog. A PROCESSING task is stale when its worker went silent:
+     * <ul>
+     *   <li>heartbeat-capable task (lastHeartbeatAt set): no update for
+     *       {@code heartbeat-stale-minutes}</li>
+     *   <li>legacy task (never heartbeated): no update for
+     *       {@code processing-timeout-minutes}</li>
+     * </ul>
+     * Stale tasks with a payload are completed AND ingested into their sync
+     * request (previously they were only marked COMPLETED, leaving the request
+     * in PENDING_SCRAPE until expiry); the rest go back to PENDING.
+     */
+    @Scheduled(fixedDelay = 60_000, initialDelay = 60_000)
     @Transactional
     public void resetStuckProcessingTasks() {
-        Instant cutoff = Instant.now().minusSeconds(processingTimeoutMinutes * 60L);
-        List<ArticleTask> stuck = repository.findStuckProcessing(cutoff);
-        if (!stuck.isEmpty()) {
-            for (ArticleTask task : stuck) {
-                if (task.getRawData() != null) {
-                    task.setStatus(TaskStatus.COMPLETED);
-                    task.setFinishedAt(Instant.now());
-                } else {
-                    task.setStatus(TaskStatus.PENDING);
-                    task.setErrorMessage("Watchdog: " + processingTimeoutMinutes
-                            + " dk PROCESSING kaldı, yeniden kuyruğa alındı");
-                }
+        Instant now = Instant.now();
+        Instant legacyCutoff = now.minusSeconds(processingTimeoutMinutes * 60L);
+        Instant heartbeatCutoff = now.minusSeconds(heartbeatStaleMinutes * 60L);
+        Instant fetchCutoff = heartbeatCutoff.isAfter(legacyCutoff) ? heartbeatCutoff : legacyCutoff;
+
+        int requeued = 0, completed = 0;
+        for (ArticleTask task : repository.findStuckProcessing(fetchCutoff)) {
+            boolean heartbeatCapable = task.getLastHeartbeatAt() != null;
+            Instant cutoff = heartbeatCapable ? heartbeatCutoff : legacyCutoff;
+            if (task.getUpdatedAt() == null || !task.getUpdatedAt().isBefore(cutoff)) continue;
+
+            if (task.getRawData() != null) {
+                task.setStatus(TaskStatus.COMPLETED);
+                task.setFinishedAt(now);
                 task.touch();
                 repository.save(task);
+                completed++;
+                if (task.getSyncRequestId() != null) {
+                    SyncRequestWorkerBridge bridge = syncBridge.getIfAvailable();
+                    if (bridge != null) bridge.ingestTaskCompletion(task);
+                }
+            } else {
+                long silentMin = java.time.Duration.between(task.getUpdatedAt(), now).toMinutes();
+                task.setStatus(TaskStatus.PENDING);
+                task.setErrorMessage("Watchdog: " + silentMin + " dk ilerleme yok"
+                        + (heartbeatCapable ? " (son aşama: " + task.getProgressPhase() + ")" : "")
+                        + ", yeniden kuyruğa alındı");
+                task.resetProgress();
+                task.touch();
+                repository.save(task);
+                requeued++;
             }
-            log.info("Reset {} stuck PROCESSING task(s) to PENDING", stuck.size());
+        }
+        if (requeued > 0 || completed > 0) {
+            log.info("Stuck watchdog: {} task(s) re-queued, {} completed from stored payload", requeued, completed);
         }
     }
 

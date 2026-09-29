@@ -106,6 +106,11 @@ public interface ArticleTaskRepository extends JpaRepository<ArticleTask, Long> 
     @Query("DELETE FROM ArticleTask t WHERE t.status = com.academic.broker.domain.TaskStatus.PENDING")
     int deletePendingArticles();
 
+    /** Worker health view: tasks currently in a given status (derived query). */
+    List<ArticleTask> findByStatusOrderByIdAsc(TaskStatus status);
+
+    long countByTargetSourceAndStatus(TargetSource targetSource, TaskStatus status);
+
     /** All article-tasks linked to a given sync request. */
     List<ArticleTask> findBySyncRequestId(java.util.UUID syncRequestId);
 

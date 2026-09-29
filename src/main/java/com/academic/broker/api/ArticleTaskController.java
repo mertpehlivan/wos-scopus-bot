@@ -30,6 +30,7 @@ import java.util.Map;
 public class ArticleTaskController {
 
     private final ArticleTaskService taskService;
+    private final com.academic.broker.service.WorkerHealthService workerHealth;
 
     /**
      * Ana sistem: Yeni WoS/Scopus ID'lerini kuyruğa ekler.
@@ -55,6 +56,7 @@ public class ArticleTaskController {
      */
     @GetMapping(value = "/poll", produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<PollTaskResponse> pollTask(@RequestParam("source") TargetSource source) {
+        workerHealth.recordPoll(source.name());
         PollTaskResponse response = taskService.pollTask(source);
         if (response == null) {
             return ResponseEntity.noContent().build();
@@ -84,6 +86,28 @@ public class ArticleTaskController {
             @Valid @RequestBody AuthorMetricsRequest request) {
         taskService.saveAuthorMetrics(taskId, request);
         return ResponseEntity.ok().build();
+    }
+
+    /**
+     * Eklenti: ilerleme sinyali. Body: {@code {phase, current, total}} (hepsi opsiyonel).
+     * Görev PROCESSING değilse {@code ok=false} ile mevcut durumu döner.
+     */
+    @PostMapping(value = "/{taskId}/heartbeat")
+    public ResponseEntity<Map<String, Object>> heartbeat(
+            @PathVariable Long taskId,
+            @RequestBody(required = false) Map<String, Object> body) {
+        String phase = body == null || body.get("phase") == null ? null : String.valueOf(body.get("phase"));
+        Integer current = body == null ? null : asInt(body.get("current"));
+        Integer total = body == null ? null : asInt(body.get("total"));
+        return ResponseEntity.ok(taskService.heartbeat(taskId, phase, current, total));
+    }
+
+    private static Integer asInt(Object v) {
+        if (v instanceof Number n) return n.intValue();
+        if (v instanceof String s) {
+            try { return Integer.parseInt(s.trim()); } catch (NumberFormatException ignored) { return null; }
+        }
+        return null;
     }
 
     /**

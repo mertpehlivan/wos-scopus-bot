@@ -104,6 +104,33 @@ public class ArticleTask {
     @Column(name = "finished_at")
     private Instant finishedAt;
 
+    /**
+     * Last progress heartbeat from the worker (POST /api/tasks/{id}/heartbeat).
+     * Non-null means the worker speaks the heartbeat protocol, so the stuck
+     * watchdog can use the short heartbeat-silence threshold instead of the
+     * legacy 120-minute one.
+     */
+    @Column(name = "last_heartbeat_at")
+    private Instant lastHeartbeatAt;
+
+    /** Worker-reported phase: PROFILE | DETAILS | CITATION_REPORT … */
+    @Column(name = "progress_phase", length = 40)
+    private String progressPhase;
+
+    @Column(name = "progress_current")
+    private Integer progressCurrent;
+
+    @Column(name = "progress_total")
+    private Integer progressTotal;
+
+    /** Clears the per-run progress fields (new claim or re-queue). */
+    public void resetProgress() {
+        this.lastHeartbeatAt = null;
+        this.progressPhase = null;
+        this.progressCurrent = null;
+        this.progressTotal = null;
+    }
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;

@@ -106,7 +106,11 @@ let scholarDoiPoolSize = 1; // Strict: 1 at a time
 // SCRAPE_TIMEOUT_MS     — Maximum time allowed after SCRAPE_READY. Extended on PROGRESS_UPDATE.
 //                         Must be < broker timeout so extension fails tasks before broker resets them.
 const PRE_READY_TIMEOUT_MS = 180_000;   // 3 minutes  (broker: 120 min)
-const SCRAPE_TIMEOUT_MS    = 3_600_000; // 60 minutes — raised from 10 min to allow large profiles
+// IDLE timeout, not a total-runtime cap: it is re-armed on every sign of
+// progress (PROGRESS_UPDATE, author metrics, each finished/abandoned detail
+// page). The old fixed 60 min was never refreshed during the detail phase, so
+// big profiles timed out mid-way; a dead tab now fails after 15 min instead.
+const SCRAPE_TIMEOUT_MS    = 900_000;   // 15 minutes without progress
 
 // Active scrape timeout trackers (tabId → timeoutId)
 const scrapeTimeouts = new Map();
@@ -798,6 +802,10 @@ async function cleanupOnStartup(reason) {
           || u.includes('wos-doi-task-id=')
           || u.includes('scholar-doi-task-id=')
           || u.includes('citation-report-task-id=')) {
+        // Tell the broker too — closing silently left the task PROCESSING
+        // until the broker watchdog (≤120 min). De-duplicated with the
+        // bot-tab registry reconcile.
+        await failOrphanFromUrl(u);
         try { await chrome.tabs.remove(t.id); closed++; } catch (_) { /* ignore */ }
       }
     }
@@ -929,7 +937,11 @@ async function isScholarPhaseActive() {
   return false;
 }
 
-async function pollScrapeSource(source) {
+/**
+ * @param beforeOpen optional async hook run after a task is claimed and
+ *        before its tab opens (WoS session pre-flight). Failures are ignored.
+ */
+async function pollScrapeSource(source, beforeOpen = null) {
   if (activeProfileTask !== null) {
     return false;
   }
@@ -965,6 +977,9 @@ async function pollScrapeSource(source) {
         });
         addLog(`New ${effectiveSource} Task (ID: ${taskId})`, 'success');
 
+        if (beforeOpen) {
+          try { await beforeOpen(); } catch (e) { console.warn(`[Orchestrator] ${source} pre-open hook failed:`, e?.message || e); }
+        }
         await humanDelay(800, 2500);
         await openTaskTab(taskId, externalId, effectiveSource, redirectUrl || null, taskType || 'FULL_SCRAPE');
         return true;
@@ -1113,7 +1128,7 @@ const WOS_SESSION_PROBE_URL =
 // session lifetime (~hours) but short enough that a logout while the
 // worker is idle gets re-detected before the next batch.
 const WOS_SESSION_TTL_MS = 25 * 60 * 1000;
-const WOS_SESSION_PROBE_TIMEOUT_MS = 90_000;
+const WOS_SESSION_PROBE_TIMEOUT_MS = 60_000;
 let wosSession = {
   status: 'unknown',     // 'unknown' | 'checking' | 'authenticated' | 'expired'
   lastVerifiedAt: 0,
@@ -1175,6 +1190,17 @@ async function probeWosLoggedInState(tabId) {
             || txt.includes('web of science free view');
         const loginForm = !!document.querySelector(
             'input[name="email"], input[formcontrolname="email"], input#mat-input-1');
+        // Visible account control = definitely signed in. The new WoS header
+        // flashes a "Sign In" control during bootstrap even for logged-in
+        // users (same guard as wos_session_handler.hasLoggedInHeader).
+        const userEl = document.querySelector('[data-ta="wos-header-user_name"]');
+        let loggedInHeader = false;
+        if (userEl) {
+            const ur = userEl.getBoundingClientRect();
+            const ucs = window.getComputedStyle(userEl);
+            loggedInHeader = ur.width > 0 && ur.height > 0
+                && ucs.display !== 'none' && ucs.visibility !== 'hidden';
+        }
         // "Sign In" control: walk visible buttons/links.
         let hasSignIn = false;
         const candidates = document.querySelectorAll('button, a, [role="button"], mat-menu-item');
@@ -1193,6 +1219,7 @@ async function probeWosLoggedInState(tabId) {
         return {
           hasFreeView,
           loginForm,
+          loggedInHeader,
           hasSignIn,
           bodyLen: txt.length,
           host: location.host,
@@ -1207,6 +1234,9 @@ async function probeWosLoggedInState(tabId) {
     // / session_handler login flow handle it.
     if (r.host && r.host.includes('clarivate.com')) {
       return { logged: false, reason: 'on auth domain', detail: r };
+    }
+    if (r.loggedInHeader && !r.hasFreeView && !r.loginForm) {
+      return { logged: true, reason: 'account header visible', detail: r };
     }
     if (r.bodyLen < 50) {
       return { logged: false, reason: 'body not rendered', detail: r };
@@ -1248,11 +1278,17 @@ async function ensureWosSession() {
 
   let winId = null;
   try { winId = await getOrCreateWorkerWindow(); } catch (_) { /* fall back to default window */ }
-  const opts = { url: WOS_SESSION_PROBE_URL, active: false };
+  // active:true — a background tab in the worker window is render-throttled,
+  // which made the probe read a half-bootstrapped page ("body not rendered" /
+  // a flashing Sign In) and fail. It now only runs right after a WoS task was
+  // claimed, when no other WoS tab is open, so taking the active slot briefly
+  // doesn't disturb a scrape.
+  const opts = { url: WOS_SESSION_PROBE_URL, active: true };
   if (winId != null) opts.windowId = winId;
   let tab;
   try {
     tab = await chrome.tabs.create(opts);
+    registerBotTab(tab.id, 'PROBE', null);
     wosSession.pendingProbeTabId = tab.id;
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
     addLog('[WoS Session] Pre-flight session probe started', 'info');
@@ -1343,37 +1379,17 @@ function finishWosProbe(ok) {
          ok ? 'success' : 'warning');
 }
 
-// Cooldown after a failed pre-flight probe before retrying. Without
-// this the orchestrator would re-open a probe tab on every tick (the
-// cache miss as soon as the previous probe is marked `expired`),
-// burning resources and blocking the other source phases. 60s is long
-// enough to let a transient failure resolve (network blip, slow
-// Angular load) without making the user wait minutes for a real
-// re-probe after a logout.
-const WOS_SESSION_RETRY_BACKOFF_MS = 60_000;
-
-/** WoS phase as a stateless predicate. */
+/**
+ * WoS phase as a stateless predicate. Claims a task first; the session
+ * pre-flight runs only for a claimed task and never blocks it (see
+ * preflightWosSessionSoft). Previously the probe ran before polling on every
+ * tick and a failed probe gated the phase — an endless basic-search loop that
+ * left WoS tasks PENDING.
+ */
 async function runWosPhaseInline() {
   if (!GROUP_CONFIG.wos) return 'drained';
   if (await isWosPhaseActive()) return 'busy';
-  // Backoff: if we just failed a probe, skip WoS this tick so other
-  // phases (Scopus / Scholar / PlumX / OpenAlex) keep moving. The
-  // probe itself will be retried after the cooldown expires.
-  if (wosSession.status === 'expired'
-      && (Date.now() - wosSession.lastVerifiedAt) < WOS_SESSION_RETRY_BACKOFF_MS) {
-    return 'drained';
-  }
-  // Pre-flight: make sure we have a logged-in WoS session BEFORE
-  // opening a task tab. Otherwise the task tab lands on the free-view
-  // banner and the redirect dance eats half the scrape window.
-  const sessionOk = await ensureWosSession();
-  if (!sessionOk) {
-    // Probe failed — return 'drained' so the orchestrator continues
-    // to the other phases. The backoff above prevents another probe
-    // from firing for the next 60s.
-    return 'drained';
-  }
-  const picked = await pollScrapeSource('WOS');
+  const picked = await pollScrapeSource('WOS', preflightWosSessionSoft);
   return picked ? 'picked' : 'drained';
 }
 
@@ -1469,6 +1485,11 @@ async function runScholarPhaseInline() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== pollAlarmName && alarm.name !== HEARTBEAT_ALARM) return;
+  // Once a minute: liveness + window-visibility report for the operator
+  // panel. Independent of the orchestrator guard below.
+  if (alarm.name === HEARTBEAT_ALARM) {
+    sendWorkerPing().catch(e => console.warn('[Ping]', e?.message || e));
+  }
   // Coalesce concurrent triggers (master one-shot + periodic heartbeat) so
   // we never run two orchestrator ticks at once.
   if (orchestratorInFlight) return;
@@ -1508,6 +1529,8 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 
   clearPendingTab(tabId);
   clearSearchPageTimer(tabId);
+  clearDetailTabTimeout(tabId);
+  unregisterBotTab(tabId);
   chrome.storage.session.remove([wosReturnUrlKey(tabId), wosLoginPendingKey(tabId)]).catch(() => { });
   pendingPlumx.delete(tabId);
   pendingWosDoiTabs.delete(tabId);
@@ -1594,6 +1617,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const assignedUrl = job.tabToUrlMap.get(tabId);
     console.warn(`[WoS Detail] Tab #${tabId} bounced off full-record (${url}) — auto-closing to continue.`);
     addLog('WoS detay sekmesi arama sayfasına yönlendirildi — otomatik kapatılıp sıradakine geçiliyor', 'warning');
+
+    // Closing a bounced tab and moving on counts as progress for the
+    // author tab's idle timeout.
+    clearDetailTabTimeout(tabId);
+    if (job.authorTabId != null) resetScrapeTimeout(job.authorTabId);
 
     // Requeue the article once so its detail data gets another attempt.
     if (!job.retriedUrls) job.retriedUrls = new Set();
@@ -2120,6 +2148,7 @@ async function openPlumxTab(taskId, doi) {
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
+    registerBotTab(tab.id, 'PLUMX', taskId);
     pendingPlumx.set(tab.id, { taskId, doi });
     console.log(`[PlumX Worker] Opened PlumX tab #${tab.id} for DOI: ${doi}`);
     broadcastTaskStarted(taskId, 'PLUMX', doi);
@@ -2286,6 +2315,7 @@ async function openTaskTab(taskId, externalId, source, redirectUrl, taskType) {
   }
 
   const tabId = tab.id;
+  registerBotTab(tabId, 'TASK', taskId);
   await chrome.storage.session.set({ [tabId]: { taskId, externalId, source, taskType: taskType || 'FULL_SCRAPE' } });
 
   // Track WOS group jobs
@@ -2515,9 +2545,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .finally(() => { orchestratorInFlight = false; });
     }
     ensureHeartbeatAlarm();
-    pollWosDoi();
-    pollScholarDoi();
-    pollPlumx();
+    // Only one tab can be active per window: a DOI/PlumX tab opened now would
+    // push a running profile/detail tab into the background (render-throttled)
+    // mid-scrape. Let the orchestrator reach those phases on its own instead.
+    if (isWorkerBusy()) {
+      addLog('Force Poll: profil/detay taraması sürüyor — DOI/PlumX sekmeleri şimdi açılmadı', 'info');
+    } else {
+      pollWosDoi();
+      pollScholarDoi();
+      pollPlumx();
+    }
     sendResponse({ ok: true });
     return true;
   }
@@ -2631,6 +2668,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Using resetScrapeTimeout ensures the new timeout is stored in
         // scrapeTimeouts and can be cancelled on PROGRESS_UPDATE or clearPendingTab.
         resetScrapeTimeout(tabId);
+        sendTaskHeartbeat(entry.taskId, 'PROFILE', null, null, true);
       }
     }
     sendResponse({ ok: true });
@@ -2807,6 +2845,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
         }, SCRAPE_TIMEOUT_MS);
         scrapeTimeouts.set(tabId, newTimeout);
+        if (entry.type !== 'DETAIL' && !detailJobs.has(entry.taskId)) {
+          sendTaskHeartbeat(entry.taskId, 'PROFILE',
+              msg.stats?.articlesFound ?? msg.stats?.pagesScanned ?? null, null);
+        }
       }
     }
     if (msg.stats) {
@@ -2988,6 +3030,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 async function handleAuthorMetrics(msg, senderTabId) {
   const { taskId, authorMetrics, url, source, taskType } = msg;
+  // Author metrics arriving is progress — re-arm the idle timeout.
+  if (senderTabId != null && pendingTabs.has(senderTabId)) resetScrapeTimeout(senderTabId);
 
   // Track metrics in diagnostics
   const diagTask = diagGetTask(taskId);
@@ -3194,6 +3238,8 @@ async function handleDetailsNeeded(authorTabId, msg) {
     status: 'SCRAPING_DETAILS',
     progress: { current: 0, total: articlesToDetail.length, label: 'Details Extraction' }
   });
+  resetScrapeTimeout(authorTabId);
+  sendTaskHeartbeat(taskId, 'DETAILS', 0, articlesToDetail.length, true);
   addLog(`Starting detail extraction for ${articlesToDetail.length} articles (pool: ${detailPoolSize})`, 'info');
 
   fillDetailTabPool(taskId);
@@ -3263,6 +3309,8 @@ async function openDetailTab(taskId, job, url) {
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
+    registerBotTab(tab.id, 'DETAIL', taskId);
+    armDetailTabTimeout(tab.id, taskId);
     job.activeTabIds.add(tab.id);
     job.tabToUrlMap.set(tab.id, url);
     // Track WOS detail tabs
@@ -3352,6 +3400,11 @@ async function handleArticleDetailComplete(detailTabId, msg) {
     detailBackoffUntil = Date.now() + 30000; // 30s backoff
     addLog(`Rate limited! Detail pool shrunk to ${detailPoolSize}, backing off 30s`, 'warning');
   }
+
+  // Progress: re-arm the author tab's IDLE timeout and tell the broker.
+  clearDetailTabTimeout(detailTabId);
+  if (job.authorTabId != null) resetScrapeTimeout(job.authorTabId);
+  sendTaskHeartbeat(taskId, 'DETAILS', Object.keys(job.detailMap).length, job.totalToDetail);
 
   try { await chrome.tabs.remove(detailTabId); } catch (_) { }
   job.activeTabIds.delete(detailTabId);
@@ -3722,6 +3775,7 @@ async function openWosDoiTab(taskId, doi) {
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
+    registerBotTab(tab.id, 'WOS_DOI', taskId);
     pendingWosDoiTabs.set(tab.id, { taskId, doi });
     console.log(`[WoS DOI Worker] Opened tab #${tab.id} for DOI: ${doi}`);
     broadcastTaskStarted(taskId, 'WOS', doi);
@@ -3835,6 +3889,7 @@ async function openScholarDoiTab(taskId, doi) {
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
+    registerBotTab(tab.id, 'SCHOLAR_DOI', taskId);
     pendingScholarDoiTabs.set(tab.id, { taskId, doi });
     console.log(`[Scholar DOI Worker] Opened tab #${tab.id} for DOI: ${doi}`);
     broadcastTaskStarted(taskId, 'SCHOLAR', doi);
@@ -4014,6 +4069,7 @@ async function handleCitationReportLinkFound(taskId, citationReportUrl, authorWo
     if (winId != null) opts.windowId = winId;
     const tab = await chrome.tabs.create(opts);
     if (winId != null) { await dismissWorkerPlaceholder(); await sweepBlankTabsInWorker(tab.id); }
+    registerBotTab(tab.id, 'CR', citationReportTaskId ?? null);
     pendingCitationReportTabs.set(tab.id, { taskId, authorWosId, citationReportTaskId, openedAt: Date.now() });
     activeWosJobs.citationReportTab = tab.id;
     addLog(`[WOS Group] Citation report tab opened #${tab.id} for task ${taskId}`, 'info');
@@ -4134,5 +4190,312 @@ async function reportCitationReportFailure(citationReportTaskId, errorMessage) {
         });
   } catch (e) {
     console.warn('[Citation Report] Failed to report failure to broker:', e?.message || e);
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  R2 — WORKER TELEMETRY & RESILIENCE
+// ═══════════════════════════════════════════════════════════════════════
+// Everything here is navigation-free: it reports, times out and closes
+// tabs, but never reloads or redirects a WoS page.
+
+const EXT_VERSION = chrome.runtime.getManifest().version;
+
+// ── Bot-tab registry (orphan detection) ──────────────────────────────────
+// In-memory maps (pendingTabs, detailJobs, …) die with the service worker —
+// and with every extension reload/update. Tabs opened before that became
+// orphans: the reload-time sweep closed them WITHOUT telling the broker, so
+// the task sat PROCESSING until the broker watchdog (seen live: task 2080).
+// The registry lives in chrome.storage.local (survives SW restarts AND
+// extension reloads; tab ids stay valid within the browser session).
+const BOT_TAB_REGISTRY_KEY = 'botTabRegistry';
+let botTabRegistryWrite = Promise.resolve();
+
+function updateBotTabRegistry(mutate) {
+  botTabRegistryWrite = botTabRegistryWrite.then(async () => {
+    try {
+      const stored = await chrome.storage.local.get(BOT_TAB_REGISTRY_KEY);
+      const reg = stored[BOT_TAB_REGISTRY_KEY] || {};
+      mutate(reg);
+      await chrome.storage.local.set({ [BOT_TAB_REGISTRY_KEY]: reg });
+    } catch (e) {
+      console.warn('[Registry] update failed:', e?.message || e);
+    }
+  });
+  return botTabRegistryWrite;
+}
+
+/**
+ * @param kind TASK | DETAIL | PROBE | WOS_DOI | SCHOLAR_DOI | PLUMX | CR
+ * @param taskId broker id to fail if the tab is orphaned (CR: citation-report task id)
+ */
+function registerBotTab(tabId, kind, taskId) {
+  if (tabId == null) return;
+  updateBotTabRegistry(reg => { reg[tabId] = { kind, taskId: taskId ?? null, at: Date.now() }; });
+}
+
+function unregisterBotTab(tabId) {
+  if (tabId == null) return;
+  updateBotTabRegistry(reg => { delete reg[tabId]; });
+}
+
+const ORPHAN_REASON = 'Eklenti yeniden başlatıldı/güncellendi — sekme yetim kaldı, kapatıldı';
+const orphanFailedThisBoot = new Set();
+
+/** Tells the broker a task's tab is gone. De-duplicated per SW boot. */
+async function failOrphanTask(kind, taskId, reason) {
+  if (taskId == null) return;
+  const key = `${kind}:${taskId}`;
+  if (orphanFailedThisBoot.has(key)) return;
+  orphanFailedThisBoot.add(key);
+  try {
+    const h = await brokerHeaders();
+    if (kind === 'TASK') {
+      await fetch(`${API_BASE}/api/tasks/${taskId}/fail`, {
+        method: 'POST', headers: h, body: JSON.stringify({ error: reason }),
+      });
+    } else if (kind === 'PLUMX') {
+      await fetch(`${API_BASE}/api/plumx-tasks/${taskId}/fail`, { method: 'POST', headers: h });
+    } else if (kind === 'WOS_DOI') {
+      await reportDoiTaskFail('WOS', taskId, reason);
+    } else if (kind === 'SCHOLAR_DOI') {
+      await reportDoiTaskFail('SCHOLAR', taskId, reason);
+    } else if (kind === 'CR') {
+      await reportCitationReportFailure(taskId, reason);
+    }
+    console.warn(`[Registry] Reported orphan ${kind} task ${taskId} as failed`);
+  } catch (e) {
+    console.warn(`[Registry] Could not report orphan ${kind} ${taskId}:`, e?.message || e);
+  }
+}
+
+/**
+ * Runs on every service-worker start. In-memory state is empty at that
+ * point, so any registered bot tab is an orphan: fail its task and close it.
+ */
+async function reconcileOrphanBotTabs(reason) {
+  let reg = {};
+  try {
+    reg = (await chrome.storage.local.get(BOT_TAB_REGISTRY_KEY))[BOT_TAB_REGISTRY_KEY] || {};
+  } catch (_) { return; }
+  const entries = Object.entries(reg);
+  if (entries.length === 0) return;
+  console.warn(`[Registry] ${reason}: ${entries.length} orphan bot tab(s) from a previous worker instance`);
+  for (const [tabIdStr, info] of entries) {
+    const tabId = Number(tabIdStr);
+    if (info && info.kind !== 'DETAIL' && info.kind !== 'PROBE') {
+      await failOrphanTask(info.kind, info.taskId, ORPHAN_REASON);
+    }
+    try { await chrome.tabs.remove(tabId); } catch (_) { /* already gone */ }
+  }
+  await updateBotTabRegistry(r => { for (const [id] of entries) delete r[id]; });
+  addLog(`${entries.length} yetim bot sekmesi kapatıldı, görevleri broker'a bildirildi`, 'warning');
+}
+
+/** Same reporting for tabs found by URL hash (opened by pre-registry versions). */
+function failOrphanFromUrl(url) {
+  const pick = (re) => { const m = url.match(re); return m ? Number(m[1]) : null; };
+  const task = pick(/(?:^|[#&])(?:wos|scopus|scholar)-task-id=(\d+)/);
+  if (task != null) return failOrphanTask('TASK', task, ORPHAN_REASON);
+  const plumx = pick(/plumx-task-id=(\d+)/);
+  if (plumx != null) return failOrphanTask('PLUMX', plumx, ORPHAN_REASON);
+  const wosDoi = pick(/wos-doi-task-id=(\d+)/);
+  if (wosDoi != null) return failOrphanTask('WOS_DOI', wosDoi, ORPHAN_REASON);
+  const scholarDoi = pick(/scholar-doi-task-id=(\d+)/);
+  if (scholarDoi != null) return failOrphanTask('SCHOLAR_DOI', scholarDoi, ORPHAN_REASON);
+  return Promise.resolve();
+}
+
+reconcileOrphanBotTabs('service-worker start')
+  .catch(e => console.warn('[Registry] reconcile failed:', e?.message || e));
+
+// ── Task progress heartbeat ──────────────────────────────────────────────
+// Lets the broker tell "long but progressing" from "dead": every heartbeat
+// refreshes the task's updatedAt, and the broker re-queues heartbeat-capable
+// tasks after 20 min of silence instead of 120. Sent only on REAL progress
+// (never from a timer), so a stuck tab still goes quiet.
+const HEARTBEAT_MIN_INTERVAL_MS = 45_000;
+const lastHeartbeat = new Map(); // taskId → { at, phase }
+
+function sendTaskHeartbeat(taskId, phase, current, total, force = false) {
+  if (taskId == null) return;
+  const prev = lastHeartbeat.get(taskId);
+  const now = Date.now();
+  if (!force && prev && prev.phase === phase && now - prev.at < HEARTBEAT_MIN_INTERVAL_MS) return;
+  lastHeartbeat.set(taskId, { at: now, phase });
+  (async () => {
+    try {
+      const h = await brokerHeaders();
+      await fetch(`${API_BASE}/api/tasks/${taskId}/heartbeat`, {
+        method: 'POST', headers: h,
+        body: JSON.stringify({ phase, current: current ?? null, total: total ?? null }),
+      });
+    } catch (e) {
+      console.warn(`[Heartbeat] task ${taskId} failed:`, e?.message || e);
+    }
+  })();
+}
+
+// ── Per-detail-tab timeout ───────────────────────────────────────────────
+// One broken full-record page used to hold the SERIAL detail pool until the
+// whole task timed out. Close it after DETAIL_TAB_TIMEOUT_MS and move on
+// (no reload — the article is just recorded as "detail not fetched").
+const DETAIL_TAB_TIMEOUT_MS = 150_000;
+const detailTabTimers = new Map(); // tabId → timeoutId
+
+function armDetailTabTimeout(tabId, taskId) {
+  clearDetailTabTimeout(tabId);
+  detailTabTimers.set(tabId, setTimeout(() => {
+    detailTabTimers.delete(tabId);
+    const job = detailJobs.get(taskId);
+    if (!job || !job.activeTabIds.has(tabId)) return;
+    const url = job.tabToUrlMap.get(tabId) || '';
+    console.warn(`[WoS Detail] Tab #${tabId} exceeded ${DETAIL_TAB_TIMEOUT_MS / 1000}s — closing, moving on: ${url}`);
+    addLog('WoS detay sayfası zamanında yüklenmedi — atlanıp sıradakine geçiliyor', 'warning');
+    const diagTask = diagGetTask(taskId);
+    if (diagTask && url) {
+      const base = url.split('#')[0];
+      const a = diagTask.articles.find(x => x.articleUrl === base || url.startsWith(x.articleUrl));
+      if (a) { a.detailStatus = 'FAILED'; a.detailData = { error: 'detail tab timeout' }; }
+    }
+    if (job.authorTabId != null) resetScrapeTimeout(job.authorTabId);
+    chrome.tabs.remove(tabId).catch(() => { }); // onRemoved refills the pool
+  }, DETAIL_TAB_TIMEOUT_MS));
+}
+
+function clearDetailTabTimeout(tabId) {
+  const t = detailTabTimers.get(tabId);
+  if (t != null) {
+    clearTimeout(t);
+    detailTabTimers.delete(tabId);
+  }
+}
+
+// ── Worker window visibility ─────────────────────────────────────────────
+// Chrome throttles hidden (minimized / fully covered) windows hard — timers
+// drop to once a minute after 5 min and SPAs stop rendering. The extension
+// can't prevent that, but it can detect it and tell the operator.
+let workerHiddenSince = null;
+let lastDrawAttentionAt = 0;
+const HIDDEN_ALERT_AFTER_MS = 60_000;
+const DRAW_ATTENTION_EVERY_MS = 10 * 60_000;
+
+function isWorkerBusy() {
+  return activeProfileTask != null || detailJobs.size > 0 || pendingCitationReportTabs.size > 0;
+}
+
+async function inspectWorkerWindow() {
+  if (workerWindowId == null) return { windowState: 'none', visible: null };
+  let win;
+  try {
+    win = await chrome.windows.get(workerWindowId, { populate: true });
+  } catch (_) {
+    return { windowState: 'closed', visible: null };
+  }
+  let visible = win.state !== 'minimized';
+  const active = (win.tabs || []).find(t => t.active);
+  if (visible && active && /^https:\/\//.test(active.url || '')) {
+    try {
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId: active.id },
+        func: () => document.visibilityState,
+      });
+      if (r && r.result) visible = r.result === 'visible';
+    } catch (_) { /* page not scriptable right now */ }
+  }
+  return { windowState: win.state, visible };
+}
+
+async function updateVisibilityAlert(view) {
+  const hidden = view.visible === false && isWorkerBusy();
+  const alerts = [];
+  if (hidden) {
+    if (workerHiddenSince == null) workerHiddenSince = Date.now();
+    if (Date.now() - workerHiddenSince >= HIDDEN_ALERT_AFTER_MS) {
+      alerts.push('WORKER_WINDOW_HIDDEN');
+      try { await chrome.action.setBadgeText({ text: '!' }); } catch (_) { }
+      try { await chrome.action.setBadgeBackgroundColor({ color: '#d97706' }); } catch (_) { }
+      if (Date.now() - lastDrawAttentionAt >= DRAW_ATTENTION_EVERY_MS && workerWindowId != null) {
+        lastDrawAttentionAt = Date.now();
+        // Flashes the taskbar entry; does NOT steal focus.
+        chrome.windows.update(workerWindowId, { drawAttention: true }).catch(() => { });
+        addLog('Worker penceresi gizli/küçültülmüş — Chrome sayfaları yavaşlatıyor. Pencereyi görünür bırakın.', 'warning');
+      }
+    }
+  } else {
+    if (workerHiddenSince != null) {
+      try { await chrome.action.setBadgeText({ text: '' }); } catch (_) { }
+    }
+    workerHiddenSince = null;
+  }
+  if (Date.now() < wosProbeBackoffUntil) alerts.push('WOS_SESSION_UNVERIFIED');
+  updateState({ workerAlerts: alerts, workerWindow: view });
+  return alerts;
+}
+
+// ── Worker ping (liveness for the operator panel) ────────────────────────
+async function sendWorkerPing() {
+  const view = await inspectWorkerWindow();
+  const alerts = await updateVisibilityAlert(view);
+  const activeTasks = [];
+  for (const [, e] of pendingTabs.entries()) {
+    if (e.type === 'DETAIL') continue;
+    const job = detailJobs.get(e.taskId);
+    activeTasks.push({
+      taskId: e.taskId, source: e.source, taskType: e.taskType || null,
+      phase: job ? 'DETAILS' : (e.readyAt ? 'PROFILE' : 'LOADING'),
+      current: job ? Object.keys(job.detailMap).length : null,
+      total: job ? job.totalToDetail : null,
+    });
+  }
+  const payload = {
+    extensionVersion: EXT_VERSION,
+    windowState: view.windowState,
+    windowVisible: view.visible,
+    busy: isWorkerBusy(),
+    activeTasks,
+    wosSession: {
+      status: wosSession.status,
+      lastVerifiedAt: wosSession.lastVerifiedAt || null,
+      probeFailures: wosProbeFailures,
+      probeBackoffUntil: wosProbeBackoffUntil || null,
+    },
+    alerts,
+  };
+  try {
+    const h = await brokerHeaders();
+    await fetch(`${API_BASE}/api/worker/ping`, { method: 'POST', headers: h, body: JSON.stringify(payload) });
+  } catch (e) {
+    console.warn('[Ping] failed:', e?.message || e);
+  }
+}
+
+// ── WoS session pre-flight (soft) ────────────────────────────────────────
+// The old gate probed BEFORE polling — on every tick, even with no WoS work —
+// and on failure blocked the WoS phase for 60 s and probed again, forever
+// (the "search page keeps opening" loop). Now: claim a WoS task first, then
+// verify the session at most once per task; never block the task on it (the
+// task tab's session handler can log in by itself), and back off after
+// repeated failures.
+let wosProbeFailures = 0;
+let wosProbeBackoffUntil = 0;
+const WOS_PROBE_MAX_FAILURES = 3;
+const WOS_PROBE_BACKOFF_MS = 10 * 60_000;
+
+async function preflightWosSessionSoft() {
+  const now = Date.now();
+  if (wosSession.status === 'authenticated' && now - wosSession.lastVerifiedAt < WOS_SESSION_TTL_MS) return;
+  if (now < wosProbeBackoffUntil) return;
+  const ok = await ensureWosSession();
+  if (ok) {
+    wosProbeFailures = 0;
+    return;
+  }
+  wosProbeFailures++;
+  if (wosProbeFailures >= WOS_PROBE_MAX_FAILURES) {
+    wosProbeBackoffUntil = Date.now() + WOS_PROBE_BACKOFF_MS;
+    wosProbeFailures = 0;
+    addLog(`WoS oturumu ${WOS_PROBE_MAX_FAILURES} kez doğrulanamadı — ${WOS_PROBE_BACKOFF_MS / 60000} dk ön-kontrol yapılmayacak; görev sekmesi girişi kendisi deneyecek`, 'warning');
   }
 }
