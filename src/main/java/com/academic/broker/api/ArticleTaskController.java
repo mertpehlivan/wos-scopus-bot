@@ -102,6 +102,12 @@ public class ArticleTaskController {
         return ResponseEntity.ok(taskService.heartbeat(taskId, phase, current, total));
     }
 
+    /** Eklenti: bu yazarın son çalışmalarında alınmış WoS detayları (yeniden kullanım için). */
+    @GetMapping(value = "/{taskId}/detail-cache", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<Map<String, Object>> detailCache(@PathVariable Long taskId) {
+        return ResponseEntity.ok(taskService.detailCache(taskId));
+    }
+
     private static Integer asInt(Object v) {
         if (v instanceof Number n) return n.intValue();
         if (v instanceof String s) {

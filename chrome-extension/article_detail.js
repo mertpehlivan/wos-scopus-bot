@@ -115,6 +115,8 @@ function safeClick(el) {
 const PENDO_BADGE_SELECTOR =
     'img[id^="pendo-image-badge"], img._pendo-badge-image, ._pendo-resource-center-badge-image';
 const PENDO_WAIT_TIMEOUT_MS = 30000;
+/** Title rendered but no JCR/JCI sidenav this long → record has no JCR data. */
+const CONTENT_ONLY_GRACE_MS = 15000;
 
 function pendoBadgeVisible() {
     const el = document.querySelector(PENDO_BADGE_SELECTOR);
@@ -138,16 +140,30 @@ async function waitForDetailLoad() {
         if (Date.now() >= deadline) break;
     }
 
-    // 2. Wait for the Pendo badge — the last element WoS renders.
-    let badgeSeen = false;
+    // 2. Wait for the Pendo badge — the last element WoS renders — OR for the
+    //    data we actually scrape to be in the DOM already:
+    //      • record title + the JCR/JCI sidenav (pre-rendered, hidden) → the Q
+    //        value is readable now; no need to wait for analytics (often ~20 s
+    //        of the old 30 s cap when Pendo is slow/blocked).
+    //      • record title but no sidenav for CONTENT_ONLY_GRACE_MS → a record
+    //        without JCR data (conference paper, ESCI…); stop waiting.
+    //    Pure DOM polling — nothing is clicked or navigated.
+    let reason = 'timeout';
+    let titleSeenAt = null;
     while (Date.now() < deadline) {
-        if (pendoBadgeVisible()) { badgeSeen = true; break; }
+        if (pendoBadgeVisible()) { reason = 'pendo'; break; }
+        const title = document.querySelector('[id^="FullRTa-fullRecordtitle"], #snMainArticle');
+        if (title) {
+            if (findSidenavPrefix()) { reason = 'jcr-ready'; break; }
+            if (titleSeenAt == null) titleSeenAt = Date.now();
+            if (Date.now() - titleSeenAt >= CONTENT_ONLY_GRACE_MS) { reason = 'title-only'; break; }
+        }
         await _humanDelay(300, 600);
     }
-    if (badgeSeen) {
-        console.log('[WoS Detail] Pendo rozeti görüldü — sayfa tam yüklü, scrape başlıyor.');
+    if (reason === 'timeout') {
+        console.warn(`[WoS Detail] Sayfa ${PENDO_WAIT_TIMEOUT_MS / 1000}s içinde hazır sinyali vermedi — yine de devam ediliyor.`);
     } else {
-        console.warn(`[WoS Detail] Pendo rozeti ${PENDO_WAIT_TIMEOUT_MS / 1000}s içinde görünmedi — yine de devam ediliyor.`);
+        console.log(`[WoS Detail] Sayfa hazır (${reason}) — scrape başlıyor.`);
     }
 
     // 3. Short settle so late-mounting fields (JCR link) attach after the badge.

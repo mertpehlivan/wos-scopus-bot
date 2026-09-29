@@ -147,6 +147,13 @@ public class WorkerController {
         m.put("total", t.getProgressTotal());
         m.put("hasAuthorMetrics", t.getAuthorMetricsData() != null);
         m.put("errorMessage", t.getErrorMessage());
+        // R4: partial completion (idle timeout mid-detail) + details reused from cache.
+        if (t.getRawData() != null) {
+            Object partial = t.getRawData().get("partialDetails");
+            if (partial != null) m.put("partialDetails", partial);
+            Object cached = t.getRawData().get("cachedDetails");
+            if (cached != null) m.put("cachedDetails", cached);
+        }
         return m;
     }
 

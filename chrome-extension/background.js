@@ -1760,6 +1760,7 @@ async function processOpenAlexTask(task) {
   //
   // METRICS_ONLY skips this entirely — author dashboard refresh only.
   let publications = [];
+  const worksCitingYears = {};
   if (!metricsOnly) {
     try {
       const aid = extractOpenAlexId(author?.id);
@@ -1786,6 +1787,18 @@ async function processOpenAlexTask(task) {
         for (const w of arr) {
           const p = toOpenAlexPublication(w);
           if (p) publications.push(p);
+          // Per-work citations by CITING year (what Scholar/WoS report). The
+          // broker builds the RDLDB yearly series from these, skipping works
+          // it judges misattributed. Kept OUT of the publication objects —
+          // those land in the tenant's FormEntry data.
+          if (p?.openAlexId && Array.isArray(w.counts_by_year)) {
+            worksCitingYears[p.openAlexId] = {
+              year: Number(w.publication_year) || null,
+              counts: w.counts_by_year
+                .map(c => [Number(c?.year) || 0, Number(c?.cited_by_count) || 0])
+                .filter(([y, n]) => y > 0 && n > 0),
+            };
+          }
         }
         // OpenAlex returns next_cursor=null when the list is exhausted.
         cursor = wd?.meta?.next_cursor || null;
@@ -1798,6 +1811,11 @@ async function processOpenAlexTask(task) {
   } else {
     addLog(`OpenAlex METRICS_ONLY — skipping works fetch`, 'info');
   }
+
+  // Additive metrics key (ignored by tenants; consumed by the broker's
+  // yearly sanitizer). Absent on METRICS_ONLY → broker falls back to the
+  // author-level series.
+  if (Object.keys(worksCitingYears).length > 0) authorMetrics.worksCitingYears = worksCitingYears;
 
   // 4) Push to broker — author-metrics first, then complete
   try {
@@ -2423,6 +2441,26 @@ async function handleTaskTimeout(tabId, reason = 'Timeout') {
   const entry = pendingTabs.get(tabId);
   if (!entry) return;
   const { taskId } = entry;
+
+  // Idle timeout in the middle of the detail phase: don't throw away what was
+  // collected. Complete with a partial marker instead — the list-page data
+  // (all articles, citations, metrics) is complete; only some details are
+  // missing, and a later FULL re-scrape reuses these details from the broker
+  // cache and fetches just the rest.
+  const partialJob = detailJobs.get(taskId);
+  if (reason === 'Timeout' && partialJob && Object.keys(partialJob.detailMap).length > 0 && !partialJob.partial) {
+    const done = Object.keys(partialJob.detailMap).length;
+    partialJob.partial = { done, total: partialJob.totalToDetail, reason: 'idle-timeout' };
+    for (const dt of partialJob.activeTabIds) {
+      clearDetailTabTimeout(dt);
+      chrome.tabs.remove(dt).catch(() => { });
+    }
+    partialJob.activeTabIds.clear();
+    partialJob.queue = [];
+    addLog(`Görev #${taskId}: ilerleme durdu — ${done}/${partialJob.totalToDetail} detay ile kısmi olarak tamamlanıyor`, 'warning');
+    await finalizeAndComplete(taskId);
+    return;
+  }
 
   console.error(`[WoS Worker] Task ID: ${taskId} sonlandırıldı: ${reason}`);
   addLog(reason === 'Timeout'
@@ -3235,21 +3273,45 @@ async function handleDetailsNeeded(authorTabId, msg) {
     return;
   }
 
+  // Reuse full-record details a recent run already fetched (broker detail
+  // cache, e.g. the partial result of a timed-out run or last week's sync):
+  // only new/missing articles get a detail tab. Volatile fields (citation
+  // count) are never taken from the cache — the list page's value is used.
+  const cachedDetails = (source === 'WOS' && (authorTabEntry.taskType || 'FULL_SCRAPE') === 'FULL_SCRAPE')
+    ? await fetchDetailCache(taskId) : {};
+  const initialDetailMap = {};
+  const queue = [];
+  for (const a of articlesToDetail) {
+    const base = a.articleUrl.split('#')[0];
+    if (cachedDetails[base]) initialDetailMap[base] = cachedDetails[base];
+    else queue.push(a.articleUrl);
+  }
+  const cachedCount = Object.keys(initialDetailMap).length;
+  if (cachedCount > 0) {
+    addLog(`${cachedCount}/${articlesToDetail.length} makale detayı önbellekten alındı — ${queue.length} detay sayfası açılacak`, 'info');
+    if (diagTask) {
+      for (const art of diagTask.articles) {
+        if (art.articleUrl && initialDetailMap[art.articleUrl.split('#')[0]]) art.detailStatus = 'CACHED';
+      }
+    }
+  }
+
   detailJobs.set(taskId, {
     authorData, articles,
-    queue: articlesToDetail.map(a => a.articleUrl),
+    queue,
     totalToDetail: articlesToDetail.length,
-    detailMap: {}, authorTabId,
-    activeTabIds: new Set(), tabToUrlMap: new Map()
+    detailMap: initialDetailMap, authorTabId,
+    activeTabIds: new Set(), tabToUrlMap: new Map(),
+    cachedCount,
   });
 
   updateState({
     status: 'SCRAPING_DETAILS',
     detailStartedAt: Date.now(),
-    progress: { current: 0, total: articlesToDetail.length, label: 'Details Extraction' }
+    progress: { current: cachedCount, total: articlesToDetail.length, label: 'Details Extraction' }
   });
   resetScrapeTimeout(authorTabId);
-  sendTaskHeartbeat(taskId, 'DETAILS', 0, articlesToDetail.length, true);
+  sendTaskHeartbeat(taskId, 'DETAILS', cachedCount, articlesToDetail.length, true);
   addLog(`Starting detail extraction for ${articlesToDetail.length} articles (pool: ${detailPoolSize})`, 'info');
 
   fillDetailTabPool(taskId);
@@ -3502,6 +3564,8 @@ async function finalizeAndCompleteInner(taskId) {
   const authorTabEntry = pendingTabs.get(job.authorTabId);
   const source = authorTabEntry?.source || 'WOS';
   const rawData = { ...job.authorData, articles: enrichedArticles, source };
+  if (job.partial) rawData.partialDetails = job.partial;
+  if (job.cachedCount) rawData.cachedDetails = job.cachedCount;
   const authorTabId = job.authorTabId;
   detailJobs.delete(taskId);
 
@@ -4666,4 +4730,37 @@ async function safeReset() {
   ensureHeartbeatAlarm();
   scheduleOrchestrator(3000);
   sendWorkerPing().catch(() => { });
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  R4 — DETAIL CACHE
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Full-record details this author's recent runs already fetched, keyed by the
+ * base article URL: { [url]: detail }. Served by the broker from previous
+ * COMPLETED tasks (including partial ones). Best-effort: any failure → {} and
+ * every article is detailed as before.
+ */
+async function fetchDetailCache(taskId) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10_000);
+  try {
+    const h = await brokerHeaders();
+    const res = await fetch(`${API_BASE}/api/tasks/${taskId}/detail-cache`, { headers: h, signal: ctrl.signal });
+    if (!res.ok) return {};
+    const body = await res.json().catch(() => null);
+    const details = body && typeof body.details === 'object' && body.details ? body.details : {};
+    for (const d of Object.values(details)) {
+      // Never reuse volatile values — the current list page is authoritative.
+      if (d && typeof d === 'object') delete d.wosCitations;
+    }
+    return details;
+  } catch (e) {
+    console.warn('[Detail Cache] unavailable:', e?.message || e);
+    return {};
+  } finally {
+    clearTimeout(timer);
+  }
 }

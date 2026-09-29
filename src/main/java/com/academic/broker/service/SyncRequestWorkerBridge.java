@@ -10,6 +10,7 @@ import com.academic.broker.repository.ArticleTaskRepository;
 import com.academic.broker.repository.CitationReportTaskRepository;
 import com.academic.broker.repository.PlumxTaskRepository;
 import com.academic.broker.repository.SyncRequestRepository;
+import com.academic.broker.service.yearly.YearlyStatsSanitizerService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -144,7 +145,7 @@ public class SyncRequestWorkerBridge {
         Map<String, Object> staged = req.getStagedData();
         if (staged == null || !(staged.get("OPENALEX") instanceof Map<?, ?> before)) return false;
         Map<String, Object> copy = new HashMap<>(staged);
-        yearlySanitizer.apply(copy);
+        yearlySanitizer.apply(copy, YearlyStatsSanitizerService.excludedWorkIds(copy, req.getApprovedFields()));
         Object after = copy.get("OPENALEX");
         if (java.util.Objects.equals(before, after)) return false;
         req.setStagedData(copy);
@@ -302,7 +303,7 @@ public class SyncRequestWorkerBridge {
         // already came from OpenAlex (matched by DOI then fuzzy title).
         // Otherwise an early WoS completion races OpenAlex and ends up
         // labelling the whole list as "Web of Science".
-        rebuildPublications(staged);
+        rebuildPublications(staged, req.getApprovedFields());
 
         // Fan out PlumX over EVERY DOI in the unified publications list — not
         // just the ones OpenAlex returned. WoS detail-scrape produces DOIs
@@ -382,7 +383,7 @@ public class SyncRequestWorkerBridge {
         sourceBlob.put("provenance", "WORKER");
         staged.put(sourceKey, sourceBlob);
 
-        rebuildPublications(staged);
+        rebuildPublications(staged, req.getApprovedFields());
         req.setStagedData(staged);
         req.touch();
         syncRepository.save(req);
@@ -699,7 +700,7 @@ public class SyncRequestWorkerBridge {
         progress.put("CITATION_REPORT", task.getStatus().name());
         req.setSourceProgress(progress);
         // The WoS histogram is one of the window inputs — re-evaluate.
-        yearlySanitizer.apply(staged);
+        yearlySanitizer.apply(staged, YearlyStatsSanitizerService.excludedWorkIds(staged, req.getApprovedFields()));
         req.setStagedData(staged);
 
         boolean allDone = areAllLinkedTasksDone(reqId);
@@ -1035,7 +1036,7 @@ public class SyncRequestWorkerBridge {
      * arrival order, because we always start from the per-source raw blobs.
      */
     @SuppressWarnings("unchecked")
-    private void rebuildPublications(Map<String, Object> staged) {
+    private void rebuildPublications(Map<String, Object> staged, Map<String, Object> approvedFields) {
         // 1) Seed from OpenAlex
         java.util.LinkedHashMap<String, Map<String, Object>> byDoi = new java.util.LinkedHashMap<>();
         java.util.LinkedHashMap<String, Map<String, Object>> byTitle = new java.util.LinkedHashMap<>();
@@ -1149,7 +1150,7 @@ public class SyncRequestWorkerBridge {
         //    derived from the list we just rebuilt (+ Scholar/WoS series).
         //    Runs on every rebuild because corroboration changes as sources
         //    land; idempotent (always restarts from yearlyStatsRaw).
-        yearlySanitizer.apply(staged);
+        yearlySanitizer.apply(staged, YearlyStatsSanitizerService.excludedWorkIds(staged, approvedFields));
     }
 
     /**

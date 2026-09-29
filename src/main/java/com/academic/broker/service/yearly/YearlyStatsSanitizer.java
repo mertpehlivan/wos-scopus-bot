@@ -83,15 +83,45 @@ public final class YearlyStatsSanitizer {
      * @param guardTriggered true when the "never remove everything" guard fired
      *                       (then {@code kept} is the full input and {@code removed} is empty)
      */
+    /** How the series was built. */
+    public static final String BASIS_AUTHOR = "AUTHOR_COUNTS_SANITIZED";
+    public static final String BASIS_WORKS = "WORKS_CITING_YEAR";
+
+    /** A work left out of a works-based series. */
+    public record WorkExclusion(String id, Integer year, String title, int citations, String reason) {
+        public Map<String, Object> toMap() {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", id);
+            m.put("year", year);
+            m.put("title", title);
+            m.put("citations", citations);
+            m.put("reason", reason);
+            return m;
+        }
+    }
+
+    /**
+     * @param fullSeries works mode only: the series built from ALL works (no
+     *                   exclusions, no row rules) — what the operator may
+     *                   restore rows from; null in author mode
+     */
     public record Result(List<Map<String, Object>> kept,
                          List<Decision> removed,
                          List<Decision> flagged,
                          Window window,
-                         boolean guardTriggered) {
+                         boolean guardTriggered,
+                         String basis,
+                         List<WorkExclusion> excludedWorks,
+                         Integer citationsAll,
+                         Integer citationsIncluded,
+                         List<Map<String, Object>> fullSeries) {
         public boolean changed() { return !removed.isEmpty(); }
     }
 
     /**
+     * Author-level series (OpenAlex {@code counts_by_year}, which for some
+     * authors is grouped by PUBLICATION year) cleaned by the row rules.
+     *
      * @param rawSeries    OpenAlex rows {@code [{year, citations, publications?}]}; may be null
      * @param publications staged unified publications ({@code year}, {@code sources}); may be null
      * @param scholarSeries Scholar rows {@code [{year, citations}]}; may be null
@@ -104,11 +134,88 @@ public final class YearlyStatsSanitizer {
                                   List<?> wosSeries,
                                   int currentYear) {
         List<Map<String, Object>> rows = asRowMaps(rawSeries);
+        Window window = computeWindow(publications, scholarSeries, wosSeries, currentYear);
+        RowPass pass = applyRowRules(rows, window, currentYear);
+        if (pass.kept().isEmpty() && !rows.isEmpty()) {
+            return new Result(rows, List.of(), List.of(), window, true, BASIS_AUTHOR, List.of(), null, null, null);
+        }
+        List<Decision> flagged = window.start() == null ? isolatedRows(pass.kept()) : List.of();
+        return new Result(pass.kept(), pass.removed(), flagged, window, false, BASIS_AUTHOR, List.of(), null, null, null);
+    }
 
+    /**
+     * Series built from per-work citations by CITING year (same meaning as
+     * Scholar / WoS). Works are left out when the operator excluded them or
+     * when they look misattributed: not corroborated by any source besides
+     * OpenAlex/PlumX AND published before the career window. Row rules then
+     * run on the remaining series.
+     *
+     * @param works            {@code {openAlexId: {year, counts: [[year, citations], …]}}}
+     * @param operatorExcluded OpenAlex ids the operator took out of the approval
+     */
+    public static Result sanitizeFromWorks(Map<?, ?> works,
+                                           Collection<?> publications,
+                                           List<?> scholarSeries,
+                                           List<?> wosSeries,
+                                           Set<String> operatorExcluded,
+                                           int currentYear) {
+        Window window = computeWindow(publications, scholarSeries, wosSeries, currentYear);
+        Integer start = window.start();
+        Map<String, Map<?, ?>> pubById = indexByOpenAlexId(publications);
+
+        java.util.TreeMap<Integer, int[]> all = new java.util.TreeMap<>();
+        java.util.TreeMap<Integer, int[]> included = new java.util.TreeMap<>();
+        List<WorkExclusion> excluded = new ArrayList<>();
+        int citAll = 0, citIncluded = 0;
+
+        for (Map.Entry<?, ?> e : works.entrySet()) {
+            if (!(e.getValue() instanceof Map<?, ?> w)) continue;
+            String id = String.valueOf(e.getKey());
+            Integer pubYear = toInt(w.get("year"));
+            List<int[]> counts = countsOf(w.get("counts"));
+            Map<?, ?> pub = pubById.get(id);
+            // Lifetime total from the work itself: OpenAlex's per-work
+            // counts_by_year only covers recent years (a 1934 paper's 3
+            // citations are not in it), so summing it would undercount.
+            Integer lifetime = openAlexCitations(pub);
+            int total = 0;
+            for (int[] c : counts) total += c[1];
+            if (lifetime != null && lifetime > total) total = lifetime;
+            citAll += total;
+            accumulate(all, pubYear, counts, currentYear);
+
+            String reason = null;
+            if (operatorExcluded != null && operatorExcluded.contains(id)) {
+                reason = "OPERATOR";
+            } else if (start != null && pubYear != null && pubYear < start - TOLERANCE_YEARS
+                    && !isCorroborated(pub == null ? null : pub.get("sources"))) {
+                reason = "SUSPICIOUS_WORK";
+            }
+            if (reason != null) {
+                Object t = pub == null ? null : pub.get("title");
+                excluded.add(new WorkExclusion(id, pubYear, t == null ? null : String.valueOf(t), total, reason));
+                continue;
+            }
+            citIncluded += total;
+            accumulate(included, pubYear, counts, currentYear);
+        }
+
+        List<Map<String, Object>> fullSeries = toRows(all);
+        List<Map<String, Object>> rows = toRows(included);
+        RowPass pass = applyRowRules(rows, window, currentYear);
+        boolean guard = pass.kept().isEmpty() && !rows.isEmpty();
+        return new Result(guard ? rows : pass.kept(), guard ? List.of() : pass.removed(), List.of(), window,
+                guard, BASIS_WORKS, excluded, citAll, citIncluded, fullSeries);
+    }
+
+    // ── shared building blocks ──────────────────────────────────────────
+
+    private record RowPass(List<Map<String, Object>> kept, List<Decision> removed) {}
+
+    static Window computeWindow(Collection<?> publications, List<?> scholarSeries, List<?> wosSeries, int currentYear) {
         Integer c = corroboratedStart(publications, currentYear);
         Integer s = firstCitedYear(scholarSeries, currentYear);
         Integer w = firstCitedYear(wosSeries, currentYear);
-
         Integer start;
         String basis;
         if (c != null && s != null) {
@@ -123,8 +230,11 @@ public final class YearlyStatsSanitizer {
         } else {
             start = null; basis = "NONE";
         }
-        Window window = new Window(start, currentYear, basis, c, s, w);
+        return new Window(start, currentYear, basis, c, s, w);
+    }
 
+    private static RowPass applyRowRules(List<Map<String, Object>> rows, Window window, int currentYear) {
+        Integer start = window.start();
         List<Map<String, Object>> kept = new ArrayList<>();
         List<Decision> removed = new ArrayList<>();
         for (Map<String, Object> row : rows) {
@@ -139,20 +249,61 @@ public final class YearlyStatsSanitizer {
                         "Gelecek yıl (" + year + " > " + currentYear + ")"));
             } else if (start != null && year < start - TOLERANCE_YEARS) {
                 removed.add(new Decision(year, cit, pubs, Rule.BEFORE_CAREER,
-                        "Kariyer başlangıcından (" + start + ", " + basisLabel(basis) + ") çok önce"));
+                        "Kariyer başlangıcından (" + start + ", " + basisLabel(window.basis()) + ") çok önce"));
             } else {
                 kept.add(row);
             }
         }
+        return new RowPass(kept, removed);
+    }
 
-        // Never wipe the whole series — if everything goes, the window is
-        // evidently wrong (e.g. only a stray Scholar row). Leave it intact.
-        if (kept.isEmpty() && !rows.isEmpty()) {
-            return new Result(rows, List.of(), List.of(), window, true);
+    private static Map<String, Map<?, ?>> indexByOpenAlexId(Collection<?> publications) {
+        Map<String, Map<?, ?>> out = new java.util.HashMap<>();
+        if (publications == null) return out;
+        for (Object o : publications) {
+            if (o instanceof Map<?, ?> p && p.get("openAlexId") != null) {
+                out.put(String.valueOf(p.get("openAlexId")), p);
+            }
         }
+        return out;
+    }
 
-        List<Decision> flagged = start == null ? isolatedRows(kept) : List.of();
-        return new Result(kept, removed, flagged, window, false);
+    private static Integer openAlexCitations(Map<?, ?> pub) {
+        if (pub == null || !(pub.get("citations") instanceof Map<?, ?> c)) return null;
+        return toInt(c.get("openalex"));
+    }
+
+    private static List<int[]> countsOf(Object raw) {
+        List<int[]> out = new ArrayList<>();
+        if (!(raw instanceof List<?> list)) return out;
+        for (Object o : list) {
+            if (o instanceof List<?> pair && pair.size() >= 2) {
+                Integer y = toInt(pair.get(0));
+                Integer n = toInt(pair.get(1));
+                if (y != null && n != null && n > 0) out.add(new int[]{y, n});
+            }
+        }
+        return out;
+    }
+
+    /** citations by citing year; publications counted in the work's publication year. */
+    private static void accumulate(java.util.TreeMap<Integer, int[]> acc, Integer pubYear, List<int[]> counts, int currentYear) {
+        for (int[] c : counts) acc.computeIfAbsent(c[0], k -> new int[2])[0] += c[1];
+        if (pubYear != null && pubYear >= MIN_VALID_YEAR && pubYear <= currentYear) {
+            acc.computeIfAbsent(pubYear, k -> new int[2])[1] += 1;
+        }
+    }
+
+    private static List<Map<String, Object>> toRows(java.util.TreeMap<Integer, int[]> acc) {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (Map.Entry<Integer, int[]> e : acc.entrySet()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("year", e.getKey());
+            m.put("citations", e.getValue()[0]);
+            m.put("publications", e.getValue()[1]);
+            rows.add(m);
+        }
+        return rows;
     }
 
     // ── helpers ─────────────────────────────────────────────────────────

@@ -179,7 +179,7 @@ public class BackendApplyService {
         if (staged == null) return null;
         Map<String, Object> copy = new HashMap<>(staged);
         try {
-            yearlySanitizer.apply(copy);
+            yearlySanitizer.apply(copy, YearlyStatsSanitizerService.excludedWorkIds(copy, req.getApprovedFields()));
         } catch (RuntimeException e) {
             // Never block an approval on the sanitizer — send the original.
             log.warn("[Apply] Yearly sanitizer failed for {}: {}", req.getId(), e.getMessage());

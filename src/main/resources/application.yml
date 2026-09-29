@@ -30,6 +30,8 @@ broker:
   processing-timeout-minutes: 120
   # Stuck threshold for tasks whose worker sends progress heartbeats (ext ≥ 1.9.1).
   heartbeat-stale-minutes: ${HEARTBEAT_STALE_MINUTES:20}
+  # Reuse WoS full-record details from this author's runs within N days (0 = off).
+  detail-cache-days: ${DETAIL_CACHE_DAYS:30}
   # OpenAlex per-year citation cleanup (YearlyStatsSanitizer): off | shadow | on.
   #   shadow = compute + report only (panel shows what WOULD be removed),
   #   on     = cleaned series is what gets approved/applied to the tenant.

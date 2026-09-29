@@ -441,6 +441,69 @@ public class ArticleTaskService {
         }
     }
 
+    /** How old a previous run's full-record details may be to be reused (0 = off). */
+    @Value("${broker.detail-cache-days:30}")
+    private int detailCacheDays;
+
+    /** Enriched-article fields that come from the WoS full-record page (not the list page). */
+    private static final List<String> DETAIL_FIELDS = List.of(
+            "abstract", "funding", "addresses", "publisher", "indexTypes", "indexType", "doi",
+            "volume", "issue", "pages", "pubDate", "earlyAccess", "articleNo", "journal", "indexed",
+            "accession", "issn", "eissn", "language", "idsNumber", "documentTypes",
+            "mappedPublicationType", "wosCategories", "researchAreas", "jcrCategories",
+            "jciCategories", "jifValues", "authorKeywords", "keywordsPlus");
+
+    /**
+     * Full-record details already fetched for this author by recent COMPLETED
+     * WoS runs (incl. partial ones), keyed by base article URL — so a re-scrape
+     * only opens detail pages for new/missing articles. Newest run wins. An
+     * article counts as detailed only if it has an accession number (only the
+     * detail page provides it). Citation counts are never included — the new
+     * run's list page is authoritative for those.
+     */
+    @Transactional(readOnly = true)
+    public java.util.Map<String, Object> detailCache(Long taskId) {
+        ArticleTask current = repository.findById(taskId).orElseThrow(() -> new TaskNotFoundException(taskId));
+        java.util.Map<String, Object> details = new java.util.LinkedHashMap<>();
+        List<Long> sources = new ArrayList<>();
+        if (detailCacheDays > 0 && current.getTargetSource() == TargetSource.WOS) {
+            Instant since = Instant.now().minusSeconds(detailCacheDays * 86_400L);
+            for (ArticleTask t : repository.findTop10ByTargetSourceAndExternalIdAndStatusOrderByIdDesc(
+                    TargetSource.WOS, current.getExternalId(), TaskStatus.COMPLETED)) {
+                if (t.getId().equals(taskId) || t.getRawData() == null) continue;
+                Instant when = t.getFinishedAt() != null ? t.getFinishedAt() : t.getUpdatedAt();
+                if (when == null || when.isBefore(since)) continue;
+                if (!(t.getRawData().get("articles") instanceof List<?> articles)) continue;
+                int before = details.size();
+                for (Object o : articles) {
+                    if (!(o instanceof java.util.Map<?, ?> a)) continue;
+                    Object url = a.get("articleUrl");
+                    Object accession = a.get("accession");
+                    if (url == null || accession == null || String.valueOf(accession).isBlank()) continue;
+                    String base = String.valueOf(url).split("#", 2)[0];
+                    if (details.containsKey(base)) continue; // newer run already provided it
+                    java.util.Map<String, Object> d = new java.util.LinkedHashMap<>();
+                    for (String f : DETAIL_FIELDS) {
+                        Object v = a.get(f);
+                        if (v != null) d.put(f, v);
+                    }
+                    // Enriched articles store authors as a list; the detail
+                    // shape the worker merges expects "A; B; C".
+                    if (a.get("authors") instanceof List<?> names && !names.isEmpty()) {
+                        d.put("authors", String.join("; ", names.stream().map(String::valueOf).toList()));
+                    }
+                    details.put(base, d);
+                }
+                if (details.size() > before) sources.add(t.getId());
+            }
+        }
+        java.util.Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("details", details);
+        out.put("sourceTaskIds", sources);
+        out.put("maxAgeDays", detailCacheDays);
+        return out;
+    }
+
     /** DOI-enrich tabs time out after 5 min in the worker; 15 min silent = abandoned. */
     private static final long DOI_ENRICH_STUCK_MINUTES = 15;
 

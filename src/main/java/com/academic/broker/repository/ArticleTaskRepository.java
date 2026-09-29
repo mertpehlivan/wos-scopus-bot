@@ -111,6 +111,10 @@ public interface ArticleTaskRepository extends JpaRepository<ArticleTask, Long> 
 
     long countByTargetSourceAndStatus(TargetSource targetSource, TaskStatus status);
 
+    /** Detail cache: most recent finished runs for an author (derived query). */
+    List<ArticleTask> findTop10ByTargetSourceAndExternalIdAndStatusOrderByIdDesc(
+            TargetSource targetSource, String externalId, TaskStatus status);
+
     /** All article-tasks linked to a given sync request. */
     List<ArticleTask> findBySyncRequestId(java.util.UUID syncRequestId);
 
