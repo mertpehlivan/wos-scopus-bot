@@ -993,8 +993,18 @@ public class SyncRequestWorkerBridge {
      * {@code "metrics"} key or those field names on either side without
      * updating both. There is no test guarding this coupling.
      */
-    private static Map<String, Object> canonicalizeMetrics(Map<String, Object> raw) {
+    static Map<String, Object> canonicalizeMetrics(Map<String, Object> raw) {
         Map<String, Object> out = new HashMap<>(raw);
+        // WoS: the worker's generic summary loop picks the first sidebar item
+        // labelled "...document..." as `publications`, which is the profile's
+        // "Total documents" (claimed records incl. non-indexed / preprints),
+        // not the Core Collection count that h-index and citations are based
+        // on. Prefer the explicit Core Collection count when it was scraped.
+        if (out.get("profileSummary") instanceof Map<?, ?> ps
+                && ps.get("wosCoreCollectionPublications") instanceof Number core
+                && core.intValue() > 0) {
+            out.put("documents", core.intValue());
+        }
         // citations: prefer existing canonical key, then sumOfTimesCited
         if (!out.containsKey("citations") || out.get("citations") == null) {
             Object v = out.get("sumOfTimesCited");
