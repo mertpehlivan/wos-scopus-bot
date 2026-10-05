@@ -2779,6 +2779,17 @@ onRuntimeMessage((msg, sender, sendResponse) => {
   }
 
   // ── Pre-flight probe: session_handler reports session is OK ──
+  // The session handler runs on every WoS/Clarivate page, including tabs the
+  // operator opens by hand. It may only log in / click through on the
+  // worker's own tabs (the tab id stays the same through the login redirects).
+  if (msg.type === 'WOS_SHOULD_MANAGE') {
+    const tabId = sender.tab?.id;
+    isWorkerOwnedTab(tabId)
+      .then(manage => sendResponse({ manage }))
+      .catch(() => sendResponse({ manage: false }));
+    return true;
+  }
+
   if (msg.type === 'WOS_SESSION_OK') {
     if (wosSession.pendingResolve) {
       finishWosProbe(true);
@@ -5062,3 +5073,17 @@ swStateReady = restoreSwState()
     for (const taskId of detailJobs.keys()) fillDetailTabPool(taskId);
     resumeOpenAlexAfterRestart().catch(e => console.warn('[R6] OpenAlex resume failed:', e?.message || e));
   });
+
+/** True for tabs the worker opened (task, detail, probe, citation report, DOI, PlumX). */
+async function isWorkerOwnedTab(tabId) {
+  if (tabId == null) return false;
+  if (pendingTabs.has(tabId) || pendingCitationReportTabs.has(tabId)
+      || pendingWosDoiTabs.has(tabId) || tabId === wosSession.pendingProbeTabId) return true;
+  for (const job of detailJobs.values()) if (job.activeTabIds.has(tabId)) return true;
+  try {
+    const reg = (await chrome.storage.local.get(BOT_TAB_REGISTRY_KEY))[BOT_TAB_REGISTRY_KEY] || {};
+    return !!reg[tabId];
+  } catch (_) {
+    return false;
+  }
+}

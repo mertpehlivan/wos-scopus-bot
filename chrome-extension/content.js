@@ -476,6 +476,12 @@ function scrapeAuthorMetrics() {
         }
       });
     }
+    // The generic loop above takes the first "...document..." item, which is
+    // "Total documents" (includes non-indexed records). h-index / citations
+    // are Core Collection metrics, so report the Core Collection count.
+    if (metrics.profileSummary.wosCoreCollectionPublications > 0) {
+      metrics.publications = metrics.profileSummary.wosCoreCollectionPublications;
+    }
 
     // ── Author Position chart ─────────────────────────────────────
     // Highcharts renders each bar as a <path role="img" aria-label="First, 60.">.

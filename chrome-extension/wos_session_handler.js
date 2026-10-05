@@ -60,6 +60,21 @@
      */
     let anonSightings = 0;
     const ANON_SIGHTINGS_REQUIRED = 3;
+    /**
+     * Same persistence rule for the "Sign In" control: the WoS header renders
+     * it for a tick or two during Angular bootstrap even when logged in.
+     * Clicking the first sighting on a freshly logged-in page started a new
+     * login → Clarivate "A session already exists" → continue → the page
+     * flashes Sign In again → login … a loop (seen live after 2.0.0).
+     */
+    let signInSightings = 0;
+    const SIGN_IN_SIGHTINGS_REQUIRED = 3;
+    /**
+     * null = not asked yet, true = a worker tab (task, detail, probe, citation
+     * report, DOI) we must keep logged in, false = a tab the operator opened
+     * by hand: never click, fill or navigate there.
+     */
+    let managedTab = null;
     /** Max click retries before we give up on the dropdown and jump straight
      *  to the canonical login URL. WoS's new Angular layout sometimes opens
      *  the sign-in dropdown but closes it again before we can click the menu
@@ -773,9 +788,23 @@
         }
     }
 
+    /** Asks background whether this tab belongs to the worker (see managedTab). */
+    async function resolveManagedTab() {
+        if (managedTab !== null) return managedTab;
+        if (__PROBE_MODE) { managedTab = true; return true; }
+        const resp = await bridgeSend({ type: 'WOS_SHOULD_MANAGE' });
+        managedTab = !!(resp && resp.manage);
+        if (!managedTab) {
+            clearInterval(intervalId);
+            console.log('[WoS Session] Not a worker tab (opened by hand) — standing down, no automatic login here.');
+        }
+        return managedTab;
+    }
+
     // ── Main recovery loop ──
     async function attemptRecovery() {
         try {
+            if (!(await resolveManagedTab())) return false;
             // First thing every tick: if we just submitted the login form
             // and the redirect chain landed us on a WoS page, fire the
             // WOS_LOGIN_SUCCESS signal so background.js can navigate the
@@ -952,8 +981,14 @@
             //    MAX_SIGN_IN_CLICK_ATTEMPTS we abandon the dropdown and
             //    force-navigate to the Clarivate login URL directly — the
             //    form-handling code in this same script will pick up there.
-            const signInBtn = findSignInControl();
+            const signInBtn = loggedInHeader ? null : findSignInControl();
             if (signInBtn) {
+                signInSightings++;
+                if (signInSightings < SIGN_IN_SIGHTINGS_REQUIRED) {
+                    console.log('[WoS Session] Sign In control sighting '
+                        + signInSightings + '/' + SIGN_IN_SIGHTINGS_REQUIRED + ' — waiting for it to persist before acting');
+                    return true;
+                }
                 if (!loginDetectedReported) {
                     loginDetectedReported = true;
                     reportSession('LOGIN_DETECTED', 'Sign In control visible — session expired');
@@ -976,7 +1011,8 @@
             //    means the page is anonymous; we shouldn't loiter waiting).
             //    background.js stores the original URL and will navigate
             //    back after WOS_LOGIN_SUCCESS.
-            if (checkAttempts >= 3 && isDataPage()) {
+            signInSightings = 0;
+            if (checkAttempts >= 3 && isDataPage() && !loggedInHeader) {
                 console.log('[WoS Session] No actionable Sign In control after '
                     + checkAttempts + ' attempts — forcing login URL');
                 await forceNavigateToLogin();

@@ -28,6 +28,7 @@
         'WOS_SET_LOGIN_PENDING',
         'WOS_CHECK_POST_LOGIN',
         'WOS_SESSION_OK',
+        'WOS_SHOULD_MANAGE',
     ]);
 
     // ── WoS login credentials (R6) ──────────────────────────────────────
