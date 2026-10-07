@@ -71,6 +71,39 @@ class ArticleTaskServiceDetailCacheTest {
 
     @Test
     @SuppressWarnings("unchecked")
+    void backfillsZeroCitationsOfCachedArticles_fromNewestPositiveRun() {
+        ArticleTaskRepository repo = mock(ArticleTaskRepository.class);
+        ArticleTask current = task(10, null, null);
+        ArticleTask cachedRun = task(9, Instant.now(), List.of(       // earlier cached run: also zero
+                Map.of("accession", "WOS:1", "wosCitations", 0)));
+        ArticleTask detailedRun = task(8, Instant.now(), List.of(
+                Map.of("accession", "WOS:1", "wosCitations", 7),
+                Map.of("accession", "WOS:2", "wosCitations", 4)));
+        when(repo.findTop10ByTargetSourceAndExternalIdAndStatusOrderByIdDesc(TargetSource.WOS, "ABE-1", TaskStatus.COMPLETED))
+                .thenReturn(List.of(cachedRun, detailedRun));
+
+        Map<String, Object> raw = Map.of("cachedDetails", 2, "articles", List.of(
+                Map.of("accession", "WOS:1", "wosCitations", 0),
+                Map.of("accession", "WOS:2", "wosCitations", 5),     // fresh positive wins
+                Map.of("accession", "WOS:3", "wosCitations", 0)));   // unknown stays 0
+
+        Map<String, Object> out = service(repo, 30).backfillCachedCitations(current, raw);
+        List<Map<String, Object>> arts = (List<Map<String, Object>>) out.get("articles");
+        assertThat(arts.get(0)).containsEntry("wosCitations", 7);
+        assertThat(arts.get(1)).containsEntry("wosCitations", 5);
+        assertThat(arts.get(2)).containsEntry("wosCitations", 0);
+        assertThat(out).containsEntry("citationsBackfilled", 1);
+    }
+
+    @Test
+    void backfill_noCache_isNoOp() {
+        ArticleTaskRepository repo = mock(ArticleTaskRepository.class);
+        Map<String, Object> raw = Map.of("articles", List.of(Map.of("accession", "WOS:1", "wosCitations", 0)));
+        assertThat(service(repo, 30).backfillCachedCitations(task(10, null, null), raw)).isSameAs(raw);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
     void disabledOrNonWos_returnsEmpty() {
         ArticleTaskRepository repo = mock(ArticleTaskRepository.class);
         ArticleTask current = task(10, null, null);

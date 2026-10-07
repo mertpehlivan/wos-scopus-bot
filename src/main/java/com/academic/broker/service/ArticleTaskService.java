@@ -229,7 +229,7 @@ public class ArticleTaskService {
         if (task.getStatus() != TaskStatus.PROCESSING) {
             throw new TaskNotProcessableException(taskId, task.getStatus(), "complete");
         }
-        task.setRawData(request.getRawData());
+        task.setRawData(backfillCachedCitations(task, request.getRawData()));
         task.setStatus(TaskStatus.COMPLETED);
         task.setErrorMessage(null);
         task.setFinishedAt(Instant.now());
@@ -501,6 +501,60 @@ public class ArticleTaskService {
         out.put("details", details);
         out.put("sourceTaskIds", sources);
         out.put("maxAgeDays", detailCacheDays);
+        return out;
+    }
+
+    /**
+     * Articles whose full record came from the detail cache carry no fresh
+     * citation count: the cache strips {@code wosCitations} and the worker's
+     * list-page fallback ({@code citations}) has been reading 0 since WoS
+     * changed its result markup. So every cached article would land with 0
+     * WoS citations. For those (only when the value is 0/missing — a positive
+     * fresh value always wins) take the newest positive {@code wosCitations}
+     * that a previous COMPLETED run of the same author recorded for the same
+     * accession. Slightly stale beats a hard 0.
+     */
+    @SuppressWarnings("unchecked")
+    java.util.Map<String, Object> backfillCachedCitations(ArticleTask task, java.util.Map<String, Object> raw) {
+        if (raw == null || task.getTargetSource() != TargetSource.WOS) return raw;
+        if (!(raw.get("cachedDetails") instanceof Number n) || n.intValue() <= 0) return raw;
+        if (!(raw.get("articles") instanceof List<?> articles) || articles.isEmpty()) return raw;
+
+        java.util.Map<String, Integer> previous = new java.util.HashMap<>();
+        for (ArticleTask t : repository.findTop10ByTargetSourceAndExternalIdAndStatusOrderByIdDesc(
+                TargetSource.WOS, task.getExternalId(), TaskStatus.COMPLETED)) {
+            if (t.getId().equals(task.getId()) || t.getRawData() == null) continue;
+            if (!(t.getRawData().get("articles") instanceof List<?> old)) continue;
+            for (Object o : old) {
+                if (!(o instanceof java.util.Map<?, ?> a)) continue;
+                Object acc = a.get("accession");
+                int c = a.get("wosCitations") instanceof Number num ? num.intValue() : 0;
+                if (acc == null || String.valueOf(acc).isBlank() || c <= 0) continue;
+                previous.putIfAbsent(String.valueOf(acc), c); // newest run first
+            }
+        }
+        if (previous.isEmpty()) return raw;
+
+        List<Object> patched = new ArrayList<>(articles.size());
+        int filled = 0;
+        for (Object o : articles) {
+            if (o instanceof java.util.Map<?, ?> a
+                    && !(a.get("wosCitations") instanceof Number cur && cur.intValue() > 0)
+                    && a.get("accession") != null
+                    && previous.containsKey(String.valueOf(a.get("accession")))) {
+                java.util.Map<String, Object> copy = new java.util.LinkedHashMap<>((java.util.Map<String, Object>) a);
+                copy.put("wosCitations", previous.get(String.valueOf(a.get("accession"))));
+                patched.add(copy);
+                filled++;
+            } else {
+                patched.add(o);
+            }
+        }
+        if (filled == 0) return raw;
+        java.util.Map<String, Object> out = new java.util.LinkedHashMap<>(raw);
+        out.put("articles", patched);
+        out.put("citationsBackfilled", filled);
+        log.info("Task {}: {} cached WoS article(s) had 0 citations — backfilled from previous runs", task.getId(), filled);
         return out;
     }
 
