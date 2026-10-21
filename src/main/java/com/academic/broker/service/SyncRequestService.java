@@ -764,6 +764,51 @@ public class SyncRequestService {
             throw new TaskNotProcessableException(0L, null,
                     "rescrape (already terminal: " + req.getStatus() + ")");
         }
+        resetState(req, operatorUserId, "RESCRAPE",
+                "stagedData / editedData / progress wiped, status → PENDING_SCRAPE");
+        log.info("[SyncRequest] {} reset for full re-scrape by operator {}", syncRequestId, operatorUserId);
+        return req;
+    }
+
+    /**
+     * Re-opens an {@code EXPIRED} request for a fresh full scrape — the panel's
+     * "Yeniden Çek" on the Süresi Dolan tab. Same reset as
+     * {@link #resetForRescrape} (fresh 24h window, blobs wiped, PENDING_SCRAPE),
+     * keeping the request id so the audit trail stays in one place.
+     *
+     * <p>Refuses (IllegalStateException, caller reports it per row) when:
+     * <ul>
+     *   <li>the request is not EXPIRED — anything else has its own buttons;</li>
+     *   <li>the researcher already has an active request — re-opening would
+     *       give them two live syncs racing for the same worker tasks.</li>
+     * </ul>
+     * The tenant callback token is refreshed from the registry, so a key
+     * rotated since the original request doesn't park the later apply.
+     */
+    @Transactional
+    public SyncRequest reopenExpired(UUID syncRequestId, UUID operatorUserId) {
+        SyncRequest req = get(syncRequestId);
+        if (req.getStatus() != SyncRequestStatus.EXPIRED) {
+            throw new IllegalStateException("Talep süresi dolmuş değil (durum: " + req.getStatus() + ")");
+        }
+        repository.findActiveForUser(req.getRequesterUserId()).ifPresent(existing -> {
+            throw new IllegalStateException("Kullanıcının aktif bir talebi zaten var: " + existing.getId());
+        });
+        if (req.getBackendBaseUrl() != null) {
+            tenantRegistry.byUrl(req.getBackendBaseUrl())
+                    .ifPresent(t -> req.setBackendCallbackToken(t.callbackToken));
+        }
+        // Same pre-flight as createFromBackend: leftover tasks from closed
+        // syncs would otherwise make addTasks skip this request's sources.
+        wipeOrphanWorkerTasks();
+        resetState(req, operatorUserId, "REOPEN_EXPIRED",
+                "EXPIRED → PENDING_SCRAPE, fresh 24h window, full re-scrape");
+        log.info("[SyncRequest] {} EXPIRED re-opened for full re-scrape by operator {}", syncRequestId, operatorUserId);
+        return req;
+    }
+
+    private void resetState(SyncRequest req, UUID operatorUserId, String auditAction, String auditNote) {
+        UUID syncRequestId = req.getId();
         // Clear staging blobs + per-source progress + reviewed fields.
         Instant now = Instant.now();
         req.setStagedData(null);
@@ -797,10 +842,7 @@ public class SyncRequestService {
             log.warn("[SyncRequest] {} citation-report cleanup on rescrape failed: {}", syncRequestId, e.getMessage());
         }
 
-        audit(syncRequestId, operatorUserId, "OPERATOR", "RESCRAPE",
-                Map.of("note", "stagedData / editedData / progress wiped, status → PENDING_SCRAPE"));
-        log.info("[SyncRequest] {} reset for full re-scrape by operator {}", syncRequestId, operatorUserId);
-        return req;
+        audit(syncRequestId, operatorUserId, "OPERATOR", auditAction, Map.of("note", auditNote));
     }
 
     /**

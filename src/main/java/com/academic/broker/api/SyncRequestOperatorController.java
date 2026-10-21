@@ -189,20 +189,107 @@ public class SyncRequestOperatorController {
         // freshly-typed WoS/Scopus id survives and the re-scrape can use it.
         service.promoteEditedIdentifiers(id, operatorId);
         SyncRequest req = service.resetForRescrape(id, operatorId);
+        Map<String, List<String>> queued = queueFullScrape(req, operatorId, "RETRY_ALL");
+        return Map.of("ok", true, "retried", queued.get("retried"), "skipped", queued.get("skipped"), "reset", true);
+    }
+
+    // ── Re-open expired requests ─────────────────────────────────────
+    /**
+     * "Yeniden Çek" on an EXPIRED request: re-opens it as a fresh full scrape
+     * with a new 24h window (see {@link SyncRequestService#reopenExpired}).
+     * 409 with a Turkish reason when it can't be re-opened (not expired, the
+     * researcher already has an active request, or no source id to scrape).
+     */
+    @PostMapping("/{id}/reopen")
+    public ResponseEntity<Map<String, Object>> reopen(
+            @PathVariable UUID id,
+            @RequestAttribute(OperatorAuthFilter.OPERATOR_ID_ATTR) UUID operatorId) {
+        try {
+            return ResponseEntity.ok(reopenOne(id, operatorId));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of("ok", false, "error", e.getMessage()));
+        }
+    }
+
+    /**
+     * Bulk "Yeniden Çek" for the Süresi Dolan tab. Best-effort per row: a row
+     * that can't be re-opened is reported in {@code skipped} with its reason
+     * and never blocks the others. When several expired requests of the SAME
+     * researcher are selected only the newest is re-opened — one live sync
+     * per researcher.
+     */
+    @PostMapping("/bulk-reopen")
+    public Map<String, Object> bulkReopen(
+            @RequestBody SyncRequestDtos.BulkActionReq req,
+            @RequestAttribute(OperatorAuthFilter.OPERATOR_ID_ATTR) UUID operatorId) {
+        List<SyncRequest> rows = new java.util.ArrayList<>();
+        List<Map<String, String>> skipped = new java.util.ArrayList<>();
+        for (UUID id : req.getIds() == null ? List.<UUID>of() : req.getIds()) {
+            try {
+                rows.add(service.get(id));
+            } catch (RuntimeException e) {
+                skipped.add(Map.of("id", id.toString(), "reason", "Talep bulunamadı"));
+            }
+        }
+        rows.sort(java.util.Comparator.comparing(SyncRequest::getRequestedAt,
+                java.util.Comparator.nullsLast(java.util.Comparator.reverseOrder())));
+
+        java.util.Set<UUID> seenUsers = new java.util.HashSet<>();
+        int reopened = 0;
+        for (SyncRequest r : rows) {
+            if (!seenUsers.add(r.getRequesterUserId())) {
+                skipped.add(Map.of("id", r.getId().toString(),
+                        "reason", "Aynı kullanıcının daha yeni talebi yeniden açıldı"));
+                continue;
+            }
+            try {
+                reopenOne(r.getId(), operatorId);
+                reopened++;
+            } catch (RuntimeException e) {
+                skipped.add(Map.of("id", r.getId().toString(),
+                        "reason", e.getMessage() == null ? "Bilinmeyen hata" : e.getMessage()));
+            }
+        }
+        return Map.of("reopened", reopened, "skipped", skipped);
+    }
+
+    private Map<String, Object> reopenOne(UUID id, UUID operatorId) {
+        // Check BEFORE re-opening: a request with no scrapeable id would sit
+        // in PENDING_SCRAPE with nothing queued until it expired again.
+        SyncRequest current = service.get(id);
+        boolean anyId = false;
+        for (TargetSource ts : FULL_SCRAPE_ORDER) {
+            String ext = resolveExternalId(current.getRequesterProfileSnapshot(), ts);
+            if (ext != null && !ext.isBlank()) { anyId = true; break; }
+        }
+        if (!anyId) {
+            throw new IllegalStateException("Kullanıcının kayıtlı kaynak ID'si yok (ORCID/WoS/Scopus/Scholar)");
+        }
+        SyncRequest req = service.reopenExpired(id, operatorId);
+        Map<String, List<String>> queued = queueFullScrape(req, operatorId, "REOPEN_EXPIRED_QUEUE");
+        return Map.of("ok", true, "retried", queued.get("retried"), "skipped", queued.get("skipped"));
+    }
+
+    /**
+     * Order matches the worker's serial pipeline: OPENALEX → WOS → SCOPUS →
+     * SCHOLAR. OpenAlex MUST come first because it lays down the publication
+     * baseline (DOIs / titles / authorship) the rest enrich. Without it,
+     * WoS/Scopus would race with no twin to attach to.
+     */
+    private static final TargetSource[] FULL_SCRAPE_ORDER = {
+            TargetSource.OPENALEX, TargetSource.WOS, TargetSource.SCOPUS, TargetSource.SCHOLAR};
+
+    /** Queues a FULL_SCRAPE task per source the snapshot has an id for (step 2 of a full reset). */
+    private Map<String, List<String>> queueFullScrape(SyncRequest req, UUID operatorId, String auditAction) {
+        UUID id = req.getId();
         Map<String, Object> snap = req.getRequesterProfileSnapshot();
         Map<String, Object> progress = new java.util.HashMap<>();
 
         java.util.List<String> retried = new java.util.ArrayList<>();
         java.util.List<String> skipped = new java.util.ArrayList<>();
 
-        // ── Step 2: queue fresh tasks ────────────────────────────────
-        // Order matches the worker's serial pipeline:
-        //   OPENALEX → WOS → SCOPUS → SCHOLAR
-        // OpenAlex MUST come first because it lays down the publication
-        // baseline (DOIs / titles / authorship) the rest enrich. Without
-        // it, WoS/Scopus would race with no twin to attach to.
-        for (TargetSource ts : new TargetSource[]{
-                TargetSource.OPENALEX, TargetSource.WOS, TargetSource.SCOPUS, TargetSource.SCHOLAR}) {
+        for (TargetSource ts : FULL_SCRAPE_ORDER) {
             String externalId = resolveExternalId(snap, ts);
             if (externalId == null || externalId.isBlank()) {
                 skipped.add(ts.name());
@@ -216,11 +303,11 @@ public class SyncRequestOperatorController {
 
         if (!retried.isEmpty()) {
             service.updateSourceProgress(id, progress);
-            service.audit(id, operatorId, "OPERATOR", "RETRY_ALL",
+            service.audit(id, operatorId, "OPERATOR", auditAction,
                     Map.of("retried", retried, "skipped", skipped,
                             "taskType", "FULL_SCRAPE", "stagedDataReset", true));
         }
-        return Map.of("ok", true, "retried", retried, "skipped", skipped, "reset", true);
+        return Map.of("retried", retried, "skipped", skipped);
     }
 
     // ── PlumX re-enrichment ──────────────────────────────────────────
